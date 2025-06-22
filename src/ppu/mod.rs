@@ -57,6 +57,8 @@ pub struct Ppu {
     oam: [u8; 256],
     
     buffer: Vec<u8>,
+    sprite_0_hit_line: i16, // Track which scanline sprite 0 hit occurred
+    scroll_change_line: i16, // Track scroll register changes for split-screen
 }
 
 impl Ppu {
@@ -81,6 +83,8 @@ impl Ppu {
             oam: [0xFF; 256],    // Initialize OAM with 0xFF (sprites off-screen)
             
             buffer: vec![0x40; 256 * 240 * 3], // Initialize with gray instead of black
+            sprite_0_hit_line: -1,
+            scroll_change_line: -1,
         };
         
         // Set initial palette to grayscale
@@ -117,7 +121,9 @@ impl Ppu {
                 if self.cycle == 1 {
                     self.status.remove(PpuStatus::VBLANK);
                     self.status.remove(PpuStatus::SPRITE_0_HIT);
-                    // VBlank cleared at pre-render scanline
+                    // Reset split-screen tracking per frame
+                    self.sprite_0_hit_line = -1;
+                    self.scroll_change_line = -1;
                 }
                 
                 // Update vertical scroll during pre-render scanline
@@ -196,21 +202,42 @@ impl Ppu {
         let mut bg_pixel = 0;
         
         if self.mask.contains(PpuMask::BG_ENABLE) && cartridge.is_some() {
-            // Extract scroll values from PPU registers
-            let coarse_x = self.v & 0x1F;
-            let coarse_y = (self.v >> 5) & 0x1F; 
-            let fine_x = self.x as u16;
-            let fine_y = (self.v >> 12) & 0x07;
-            let nt_x = (self.v >> 10) & 0x01;
-            let nt_y = (self.v >> 11) & 0x01;
+            // Generic split-screen effect based on scroll register changes during rendering
+            let apply_scroll = if self.scroll_change_line != -1 {
+                // Split-screen detected: determine split point based on sprite 0 position or default
+                let sprite_0_y = self.oam[0];
+                let split_line = if sprite_0_y < 240 {
+                    // Use sprite 0 Y position + some margin for status area
+                    (sprite_0_y as i16 + 8).min(48)
+                } else {
+                    // Default split at 32 pixels for off-screen sprite 0
+                    32
+                };
+                y >= split_line
+            } else {
+                // No split detected: normal scrolling
+                true
+            };
             
-            // Calculate scroll offset
-            let scroll_x = (nt_x * 256) + (coarse_x * 8) + fine_x;
-            let scroll_y = (nt_y * 240) + (coarse_y * 8) + fine_y;
-            
-            // Current pixel position with scroll applied
-            let pixel_x = (x as u16 + scroll_x) % 512;
-            let pixel_y = (y as u16 + scroll_y) % 480;
+            let (pixel_x, pixel_y) = if apply_scroll {
+                // Extract scroll values from PPU registers
+                let coarse_x = self.v & 0x1F;
+                let coarse_y = (self.v >> 5) & 0x1F; 
+                let fine_x = self.x as u16;
+                let fine_y = (self.v >> 12) & 0x07;
+                let nt_x = (self.v >> 10) & 0x01;
+                let nt_y = (self.v >> 11) & 0x01;
+                
+                // Calculate scroll offset
+                let scroll_x = (nt_x * 256) + (coarse_x * 8) + fine_x;
+                let scroll_y = (nt_y * 240) + (coarse_y * 8) + fine_y;
+                
+                // Current pixel position with scroll applied
+                ((x as u16 + scroll_x) % 512, (y as u16 + scroll_y) % 480)
+            } else {
+                // No scrolling for status area
+                (x as u16, y as u16)
+            };
             
             // Determine which physical nametable to use
             let physical_nt_x = (pixel_x / 256) as u16;
@@ -431,6 +458,7 @@ impl Ppu {
     pub fn read_register(&mut self, addr: u16) -> u8 {
         match addr {
             0x2002 => {
+                
                 // Ensure game can progress by providing VBlank flag when needed
                 static mut VBLANK_READS: u32 = 0;
                 
@@ -498,6 +526,13 @@ impl Ppu {
                 self.oam_addr = self.oam_addr.wrapping_add(1);
             }
             0x2005 => {
+                // Detect scroll changes during rendering for split-screen effects
+                if self.scanline >= 0 && self.scanline < 240 {
+                    if self.scroll_change_line == -1 {
+                        self.scroll_change_line = self.scanline;
+                    }
+                }
+                
                 if !self.w {
                     self.t = (self.t & 0xFFE0) | (data as u16 >> 3);
                     self.x = data & 0x07;
