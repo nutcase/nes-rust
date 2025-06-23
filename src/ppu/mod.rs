@@ -172,17 +172,17 @@ impl Ppu {
         self.cycle += 1;
         if self.cycle >= 341 {
             self.cycle = 0;
-            let old_scanline = self.scanline;
+            let _old_scanline = self.scanline;
             self.scanline += 1;
             
-            // Track scanline progression
             
             // Handle frame completion 
             if self.scanline >= 261 {
                 self.scanline = -1;
                 self.frame += 1;
                 
-                // Track frame progression
+                // Reset split-screen detection each frame to prevent flickering
+                self.scroll_change_line = -1;
             }
         }
 
@@ -208,7 +208,8 @@ impl Ppu {
                 let sprite_0_y = self.oam[0];
                 let split_line = if sprite_0_y < 240 {
                     // Use sprite 0 Y position + some margin for status area
-                    (sprite_0_y as i16 + 8).min(48)
+                    // Stabilize the split line to prevent flickering
+                    (sprite_0_y as i16 + 8).min(48) // Use sprite 0 position with margin
                 } else {
                     // Default split at 32 pixels for off-screen sprite 0
                     32

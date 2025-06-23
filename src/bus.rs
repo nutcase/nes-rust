@@ -121,7 +121,7 @@ impl CpuBus for Bus {
             0x4017 => 0,
             0x8000..=0xFFFF => {
                 if let Some(ref cartridge) = self.cartridge {
-                    let data = cartridge.read_prg(addr - 0x8000);
+                    let data = cartridge.read_prg(addr);
                     // Reading from cartridge
                     data
                 } else {
@@ -174,7 +174,7 @@ impl CpuBus for Bus {
             },
             0x8000..=0xFFFF => {
                 if let Some(ref mut cartridge) = self.cartridge {
-                    cartridge.write_prg(addr - 0x8000, data);
+                    cartridge.write_prg(addr, data);
                 }
             },
             _ => {},

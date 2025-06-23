@@ -14,8 +14,6 @@ use sdl2::pixels::PixelFormatEnum;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::audio::AudioCallback;
-use sdl2::render::Canvas;
-use sdl2::video::Window;
 
 const CPU_CYCLES_PER_FRAME: u32 = 29830; // Increased for better compatibility
 
@@ -244,7 +242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_duration = Duration::from_nanos(16_666_667); // 60 FPS (1000ms / 60fps)
     let mut last_frame = Instant::now();
     let mut frame_count = 0;
-    let start_time = Instant::now();
+    let _start_time = Instant::now();
     
     'running: loop {
         // Handle events

@@ -482,7 +482,7 @@ impl Cpu {
     fn rts(&mut self, bus: &mut dyn CpuBus) -> u8 {
         // RTS handles PC completely by itself
         let old_pc = self.pc;
-        let old_sp = self.sp;
+        let _old_sp = self.sp;
         let low = self.pull(bus) as u16;
         let high = self.pull(bus) as u16;
         let new_pc = ((high << 8) | low).wrapping_add(1);
