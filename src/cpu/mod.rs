@@ -1,5 +1,8 @@
 use bitflags::bitflags;
 
+#[cfg(test)]
+mod tests;
+
 bitflags! {
     #[derive(Debug, Clone, Copy)]
     pub struct StatusFlags: u8 {

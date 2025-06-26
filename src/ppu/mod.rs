@@ -1,5 +1,8 @@
 use bitflags::bitflags;
 
+#[cfg(test)]
+mod tests;
+
 bitflags! {
     #[derive(Debug, Clone, Copy)]
     pub struct PpuControl: u8 {
@@ -38,22 +41,71 @@ bitflags! {
 }
 
 pub struct Ppu {
+    #[cfg(test)]
+    pub control: PpuControl,
+    #[cfg(not(test))]
     control: PpuControl,
+    
+    #[cfg(test)]
+    pub mask: PpuMask,
+    #[cfg(not(test))]
     mask: PpuMask,
+    
+    #[cfg(test)]
+    pub status: PpuStatus,
+    #[cfg(not(test))]
     status: PpuStatus,
+    
+    #[cfg(test)]
+    pub oam_addr: u8,
+    #[cfg(not(test))]
     oam_addr: u8,
     
+    #[cfg(test)]
+    pub v: u16,
+    #[cfg(not(test))]
     v: u16,
+    
+    #[cfg(test)]
+    pub t: u16,
+    #[cfg(not(test))]
     t: u16,
+    
+    #[cfg(test)]
+    pub x: u8,
+    #[cfg(not(test))]
     x: u8,
+    
+    #[cfg(test)]
+    pub w: bool,
+    #[cfg(not(test))]
     w: bool,
     
+    #[cfg(test)]
+    pub cycle: u16,
+    #[cfg(not(test))]
     cycle: u16,
+    
+    #[cfg(test)]
+    pub scanline: i16,
+    #[cfg(not(test))]
     scanline: i16,
+    
     frame: u64,
     
+    #[cfg(test)]
+    pub nametable: [[u8; 1024]; 2],
+    #[cfg(not(test))]
     nametable: [[u8; 1024]; 2],
+    
+    #[cfg(test)]
+    pub palette: [u8; 32],
+    #[cfg(not(test))]
     palette: [u8; 32],
+    
+    #[cfg(test)]
+    pub oam: [u8; 256],
+    #[cfg(not(test))]
     oam: [u8; 256],
     
     buffer: Vec<u8>,

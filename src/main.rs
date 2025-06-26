@@ -270,9 +270,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let frame_complete = nes.step();
             if frame_complete {
-                if frame_count % 60 == 0 {
-                    println!("Frame {} completed after {} steps", frame_count, step_count);
-                }
                 break;
             }
             step_count += 1;
@@ -288,14 +285,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             buffer.copy_from_slice(frame_buffer);
         })?;
         
-        // Update audio buffer
+        // Update audio buffer with improved buffering
         let audio_samples = nes.get_audio_buffer();
         if !audio_samples.is_empty() {
             if let Ok(mut buffer) = audio_buffer.lock() {
                 buffer.extend(audio_samples);
-                // Keep buffer size reasonable
-                if buffer.len() > 44100 {
-                    buffer.drain(0..22050);
+                // More conservative buffer management to prevent audio drops
+                if buffer.len() > 8192 {
+                    buffer.drain(0..2048);
                 }
             }
         }
@@ -321,8 +318,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn map_key_to_controller(key: Keycode, current: u8) -> u8 {
     match key {
-        Keycode::X => current | 0x01,      // A (bit 0)
-        Keycode::Z => current | 0x02,      // B (bit 1)
+        Keycode::X => current | 0x02,      // B (bit 1)
+        Keycode::Z => current | 0x01,      // A (bit 0)
         Keycode::Space => current | 0x04,  // Select (bit 2) - changed from RShift to Space
         Keycode::Return => current | 0x08, // Start (bit 3)
         Keycode::Up => current | 0x10,     // Up (bit 4)
@@ -335,8 +332,8 @@ fn map_key_to_controller(key: Keycode, current: u8) -> u8 {
 
 fn unmap_key_from_controller(key: Keycode, current: u8) -> u8 {
     match key {
-        Keycode::X => current & !0x01,      // A (bit 0)
-        Keycode::Z => current & !0x02,      // B (bit 1)
+        Keycode::X => current & !0x02,      // B (bit 1)
+        Keycode::Z => current & !0x01,      // A (bit 0)
         Keycode::Space => current & !0x04,  // Select (bit 2) - changed from RShift to Space
         Keycode::Return => current & !0x08, // Start (bit 3)
         Keycode::Up => current & !0x10,     // Up (bit 4)
@@ -360,20 +357,19 @@ impl AudioCallback for NesAudioCallback {
             for sample in out.iter_mut() {
                 if !buffer.is_empty() {
                     let audio_sample = buffer.remove(0);
-                    // Apply simple smoothing to reduce clicks/pops
-                    let smoothed = (audio_sample + self.phase) * 0.5;
-                    *sample = smoothed;
-                    self.phase = audio_sample * 0.1; // Simple low-pass effect
+                    // Simple, direct output
+                    *sample = audio_sample;
+                    self.phase = audio_sample;
                 } else {
                     // Gradually fade to silence to avoid clicks
-                    self.phase *= 0.95;
+                    self.phase *= 0.98;
                     *sample = self.phase;
                 }
             }
         } else {
             // If we can't lock the buffer, gradually fade to silence
             for sample in out.iter_mut() {
-                self.phase *= 0.95;
+                self.phase *= 0.98;
                 *sample = self.phase;
             }
         }

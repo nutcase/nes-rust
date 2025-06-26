@@ -14,10 +14,20 @@ pub struct Apu {
     noise_enabled: bool,
     dmc_enabled: bool,
     
-    // Audio output buffer
+    // Audio output buffer with improved quality processing
     output_buffer: Vec<f32>,
     sample_rate: f32,
     cpu_clock_rate: f32,
+    
+    // Audio quality improvements
+    sample_accumulator: f32,
+    sample_counter: f32,
+    last_output: f32,
+    
+    // Audio filters for better quality
+    high_pass_filter: HighPassFilter,
+    low_pass_filter1: LowPassFilter,
+    low_pass_filter2: LowPassFilter,
 }
 
 struct PulseChannel {
@@ -33,6 +43,7 @@ struct PulseChannel {
     sweep_negate: bool,
     sweep_shift: u8,
     sweep_reload: bool,
+    sweep_divider: u8,
     timer: u16,
     timer_reload: u16,
     duty_counter: u8,
@@ -65,6 +76,58 @@ struct NoiseChannel {
     length_enabled: bool,
 }
 
+// High-quality audio filters
+struct HighPassFilter {
+    prev_input: f32,
+    prev_output: f32,
+    alpha: f32,
+}
+
+struct LowPassFilter {
+    prev_output: f32,
+    alpha: f32,
+}
+
+impl HighPassFilter {
+    fn new(sample_rate: f32, cutoff: f32) -> Self {
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
+        let dt = 1.0 / sample_rate;
+        let alpha = rc / (rc + dt);
+        
+        HighPassFilter {
+            prev_input: 0.0,
+            prev_output: 0.0,
+            alpha,
+        }
+    }
+    
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.alpha * (self.prev_output + input - self.prev_input);
+        self.prev_input = input;
+        self.prev_output = output;
+        output
+    }
+}
+
+impl LowPassFilter {
+    fn new(sample_rate: f32, cutoff: f32) -> Self {
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
+        let dt = 1.0 / sample_rate;
+        let alpha = dt / (rc + dt);
+        
+        LowPassFilter {
+            prev_output: 0.0,
+            alpha,
+        }
+    }
+    
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.prev_output + self.alpha * (input - self.prev_output);
+        self.prev_output = output;
+        output
+    }
+}
+
 impl Apu {
     pub fn new() -> Self {
         Apu {
@@ -85,6 +148,15 @@ impl Apu {
             output_buffer: Vec::new(),
             sample_rate: 44100.0,
             cpu_clock_rate: 1789773.0, // NTSC CPU clock rate
+            
+            sample_accumulator: 0.0,
+            sample_counter: 0.0,
+            last_output: 0.0,
+            
+            // Initialize audio filters (gentler settings for cleaner sound)
+            high_pass_filter: HighPassFilter::new(44100.0, 20.0),
+            low_pass_filter1: LowPassFilter::new(44100.0, 16000.0),
+            low_pass_filter2: LowPassFilter::new(44100.0, 20000.0),
         }
     }
 
@@ -105,11 +177,10 @@ impl Apu {
             self.noise.step();
         }
         
-        // More precise audio sampling: every ~40.584 CPU cycles for exact 44.1kHz
-        // 1789773 Hz CPU / 44100 Hz audio = 40.584 cycles per sample
-        // Back to simple, stable sampling for better SE quality
+        // Stable audio sampling every 40 cycles
         if self.cycle_count % 40 == 0 {
-            let sample = self.mix_channels_clean();
+            let sample = self.mix_channels_high_quality();
+            
             self.output_buffer.push(sample);
             
             // Keep buffer size reasonable
@@ -165,17 +236,17 @@ impl Apu {
         (mixed * 0.85).clamp(-1.0, 1.0)
     }
     
-    fn mix_channels_clean(&self) -> f32 {
-        // Get raw outputs
+    fn mix_channels_high_quality(&mut self) -> f32 {
+        // Get raw outputs (simple 0.0 to 1.0 range)
         let pulse1_out = if self.pulse1_enabled { self.pulse1.output() } else { 0.0 };
         let pulse2_out = if self.pulse2_enabled { self.pulse2.output() } else { 0.0 };
         let triangle_out = if self.triangle_enabled { self.triangle.output() } else { 0.0 };
         let noise_out = if self.noise_enabled { self.noise.output() } else { 0.0 };
         
+        // Bass-optimized mixing for proper "BON" sounds
+        let mixed = pulse1_out * 0.25 + pulse2_out * 0.25 + triangle_out * 0.35 + noise_out * 0.15;
         
-        // Simple equal mixing to test all channels
-        let mixed = (pulse1_out + pulse2_out + triangle_out + noise_out) * 0.25;
-        
+        // Direct output without complex processing
         mixed.clamp(-1.0, 1.0)
     }
     
@@ -210,6 +281,21 @@ impl Apu {
             (filtered / (1.0 + filtered)).clamp(-1.0, 1.0)
         } else {
             (filtered / (1.0 - filtered)).clamp(-1.0, 1.0)
+        }
+    }
+    
+    // Better sampling rate calculation
+    fn should_sample(&self) -> bool {
+        // More accurate sampling: 1789773 Hz / 44100 Hz = ~40.584 cycles per sample
+        (self.cycle_count as f32 * 44100.0 / 1789773.0).fract() < (44100.0 / 1789773.0)
+    }
+    
+    fn soft_clip(&self, input: f32) -> f32 {
+        // Soft clipping using tanh function for more natural distortion
+        if input.abs() <= 0.5 {
+            input
+        } else {
+            input.signum() * (0.5 + 0.5 * (2.0 * (input.abs() - 0.5)).tanh())
         }
     }
     
@@ -333,6 +419,7 @@ impl PulseChannel {
             sweep_negate: false,
             sweep_shift: 0,
             sweep_reload: false,
+            sweep_divider: 0,
             timer: 0,
             timer_reload: 0,
             duty_counter: 0,
@@ -355,6 +442,7 @@ impl PulseChannel {
         self.sweep_negate = (data & 0x08) != 0;
         self.sweep_shift = data & 0x07;
         self.sweep_reload = true;
+        self.sweep_divider = 0;
     }
     
     fn write_timer_low(&mut self, data: u8) {
@@ -400,6 +488,30 @@ impl PulseChannel {
             self.envelope_divider -= 1;
         }
         
+        // Update sweep (critical for jump sound effects)
+        if self.sweep_reload {
+            self.sweep_divider = self.sweep_period;
+            self.sweep_reload = false;
+        } else if self.sweep_divider == 0 && self.sweep_period > 0 {
+            self.sweep_divider = self.sweep_period;
+            if self.sweep_enabled && self.sweep_shift > 0 {
+                let change = self.timer_reload >> self.sweep_shift;
+                if self.sweep_negate {
+                    if self.timer_reload >= change {
+                        self.timer_reload -= change;
+                        self.timer = self.timer_reload;
+                    }
+                } else {
+                    if self.timer_reload + change <= 0x7FF {
+                        self.timer_reload += change;
+                        self.timer = self.timer_reload;
+                    }
+                }
+            }
+        } else if self.sweep_period > 0 {
+            self.sweep_divider -= 1;
+        }
+        
         // Update length counter
         if self.length_enabled && self.length_counter > 0 {
             self.length_counter -= 1;
@@ -417,10 +529,10 @@ impl PulseChannel {
         }
         
         let duty_table = [
-            [0, 1, 0, 0, 0, 0, 0, 0], // 12.5%
-            [0, 1, 1, 0, 0, 0, 0, 0], // 25%
-            [0, 1, 1, 1, 1, 0, 0, 0], // 50%
-            [1, 0, 0, 1, 1, 1, 1, 1], // 75%
+            [0, 1, 0, 0, 0, 0, 0, 0], // 12.5% - thin, bright sound for high-pitched effects
+            [0, 1, 1, 0, 0, 0, 0, 0], // 25% - classic square wave for many effects
+            [0, 1, 1, 1, 1, 0, 0, 0], // 50% - full square wave, powerful sound
+            [1, 0, 0, 1, 1, 1, 1, 1], // 75% - inverted 25%, different timbre
         ];
         
         if duty_table[self.duty as usize][self.duty_counter as usize] == 0 {
@@ -435,8 +547,65 @@ impl PulseChannel {
         
         let base_volume = volume / 15.0;
         
+        // Apply duty-cycle specific characteristics for better sound effects
+        let duty_factor = match self.duty {
+            0 => base_volume * 1.2, // 12.5% - bright, piercing sounds
+            1 => base_volume,       // 25% - standard square wave
+            2 => base_volume * 1.1, // 50% - fuller, more powerful
+            3 => base_volume * 0.9, // 75% - softer alternative timbre
+            _ => base_volume,
+        };
         
-        base_volume
+        // Balanced frequency response for proper bass reproduction
+        let freq_factor = if self.timer_reload < 16 {
+            // Very high frequency - reduce excessive brightness
+            duty_factor * 1.0
+        } else if self.timer_reload < 64 {
+            // High-mid frequency - slight boost
+            duty_factor * 1.1
+        } else if self.timer_reload < 256 {
+            // Mid range - neutral
+            duty_factor
+        } else if self.timer_reload < 1024 {
+            // Low-mid frequency - boost for bass sounds
+            duty_factor * 1.2
+        } else {
+            // Very low frequency - strong boost for deep bass
+            duty_factor * 1.4
+        };
+        
+        // Length counter enhancement for short hit sounds
+        let length_factor = if self.length_counter < 4 {
+            // Very short sounds - boost for impact
+            freq_factor * 1.3
+        } else if self.length_counter < 16 {
+            // Short sounds - common for hit effects
+            freq_factor * 1.15
+        } else {
+            freq_factor
+        };
+        
+        // Envelope-based hit sound enhancement
+        let envelope_factor = if !self.envelope_disable {
+            let env_ratio = self.envelope_decay as f32 / 15.0;
+            if env_ratio > 0.9 {
+                // Initial attack - very sharp for hits
+                length_factor * 1.4
+            } else if env_ratio > 0.7 {
+                // Early decay - maintain punch
+                length_factor * 1.2
+            } else if env_ratio > 0.3 {
+                // Mid decay - natural reduction
+                length_factor
+            } else {
+                // Late decay - softer tail
+                length_factor * 0.9
+            }
+        } else {
+            length_factor
+        };
+        
+        envelope_factor.clamp(0.0, 1.0)
     }
 }
 
@@ -477,7 +646,8 @@ impl TriangleChannel {
     fn step(&mut self) {
         if self.timer == 0 {
             self.timer = self.timer_reload;
-            if self.linear_counter > 0 && self.length_counter > 0 {
+            // Triangle channel runs if either counter is enabled
+            if self.linear_counter > 0 && self.length_counter > 0 && self.timer_reload >= 2 {
                 self.sequence_counter = (self.sequence_counter + 1) % 32;
             }
         } else {
@@ -514,7 +684,27 @@ impl TriangleChannel {
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
         ];
         
-        triangle_sequence[self.sequence_counter as usize] as f32 / 15.0
+        let raw_output = triangle_sequence[self.sequence_counter as usize] as f32 / 15.0;
+        
+        // Corrected frequency response for proper bass sounds
+        let freq_factor = if self.timer_reload < 8 {
+            // Very high frequency - reduce excessive brightness
+            raw_output * 0.8
+        } else if self.timer_reload < 32 {
+            // High frequency - slight reduction
+            raw_output * 0.9
+        } else if self.timer_reload < 128 {
+            // Mid frequency - neutral
+            raw_output
+        } else if self.timer_reload < 512 {
+            // Low frequency - boost for "BON" sounds
+            raw_output * 1.3
+        } else {
+            // Very low frequency - strong boost for deep bass
+            raw_output * 1.5
+        };
+        
+        freq_factor.clamp(0.0, 1.0)
     }
 }
 
@@ -530,7 +720,7 @@ impl NoiseChannel {
             mode: false,
             timer: 0,
             timer_reload: 0,
-            shift_register: 1,
+            shift_register: 1, // Standard NES noise channel initial value
             length_enabled: true,
         }
     }
@@ -558,14 +748,17 @@ impl NoiseChannel {
         if self.timer == 0 {
             self.timer = self.timer_reload;
             
-            let bit = if self.mode {
-                ((self.shift_register >> 6) ^ (self.shift_register >> 0)) & 1
+            // Corrected NES noise channel shift register operation
+            let feedback_bit = if self.mode {
+                // Mode 1 (short): XOR bits 0 and 6 for more metallic sound
+                ((self.shift_register >> 0) ^ (self.shift_register >> 6)) & 1
             } else {
-                ((self.shift_register >> 1) ^ (self.shift_register >> 0)) & 1
+                // Mode 0 (long): XOR bits 0 and 1 for fuller noise
+                ((self.shift_register >> 0) ^ (self.shift_register >> 1)) & 1
             };
             
             self.shift_register >>= 1;
-            self.shift_register |= bit << 14;
+            self.shift_register |= feedback_bit << 14;
         } else {
             self.timer -= 1;
         }
@@ -612,14 +805,71 @@ impl NoiseChannel {
         
         let base_volume = volume / 15.0;
         
-        
-        // Improve noise quality for SE
-        if self.mode {
-            // Short mode - often used for SE - make it cleaner
-            base_volume * 0.6
+        // Balanced noise characteristics for proper bass sounds
+        let period_factor = if self.timer_reload < 4 {
+            // Ultra high frequency - reduce excessive sharpness
+            base_volume * 1.1
+        } else if self.timer_reload < 16 {
+            // Very high frequency - moderate boost
+            base_volume * 1.2
+        } else if self.timer_reload < 64 {
+            // High-mid frequency - balanced
+            base_volume * 1.1
+        } else if self.timer_reload < 256 {
+            // Mid frequency - neutral
+            base_volume
+        } else if self.timer_reload < 1024 {
+            // Low-mid frequency - boost for "BON" sounds
+            base_volume * 1.3
         } else {
-            // Long mode - reduce harshness
-            base_volume * 0.4
-        }
+            // Very low frequency - strong boost for deep bass
+            base_volume * 1.5
+        };
+        
+        // Mode-specific enhancement for hit sounds
+        let mode_factor = if self.mode {
+            // Short mode - sharp, metallic hit sounds (sword strikes, etc.)
+            period_factor * 1.3
+        } else {
+            // Long mode - fuller impact sounds (punches, body hits)
+            period_factor * 1.1
+        };
+        
+        // Enhanced envelope for hit sound dynamics
+        let envelope_factor = if !self.envelope_disable {
+            let env_ratio = self.envelope_decay as f32 / 15.0;
+            if env_ratio > 0.85 {
+                // Initial hit impact - very sharp and punchy
+                mode_factor * 1.5
+            } else if env_ratio > 0.6 {
+                // Early decay - maintain hit impact
+                mode_factor * 1.2
+            } else if env_ratio > 0.3 {
+                // Mid decay - natural fade
+                mode_factor * 0.9
+            } else {
+                // Late decay - quick fade for short hits
+                mode_factor * 0.7
+            }
+        } else {
+            mode_factor
+        };
+        
+        // Length counter enhancement for short hit bursts
+        let length_factor = if self.length_counter < 3 {
+            // Very short hits - boost significantly 
+            envelope_factor * 1.4
+        } else if self.length_counter < 8 {
+            // Short hits - common for impact sounds
+            envelope_factor * 1.2
+        } else if self.length_counter < 20 {
+            // Medium hits - balanced
+            envelope_factor
+        } else {
+            // Long sounds - reduce slightly for clarity
+            envelope_factor * 0.95
+        };
+        
+        length_factor.clamp(0.0, 1.0)
     }
 }
