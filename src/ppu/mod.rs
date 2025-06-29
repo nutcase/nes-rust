@@ -497,7 +497,6 @@ impl Ppu {
                     if tile_addr + 8 < 0x2000 {
                         // Check if this needs Goonies-specific CHR handling
                         let is_goonies = cart.mapper_number() == 87 || cart.mapper_number() == 3;
-                        let is_mario = cart.mapper_number() == 0;
                         let is_status_sprite = is_goonies && sprite_y <= 47;
                         
                         let pattern_low = if is_goonies {
