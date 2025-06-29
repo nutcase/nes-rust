@@ -1,5 +1,5 @@
 pub struct Memory {
-    ram: [u8; 0x800],
+    pub(crate) ram: [u8; 0x800],
 }
 
 impl Memory {
@@ -21,5 +21,14 @@ impl Memory {
             0x0000..=0x1FFF => self.ram[(addr & 0x7FF) as usize] = data,
             _ => {},
         }
+    }
+    
+    // Save state methods
+    pub fn get_ram(&self) -> [u8; 0x800] {
+        self.ram
+    }
+    
+    pub fn set_ram(&mut self, ram: [u8; 0x800]) {
+        self.ram = ram;
     }
 }

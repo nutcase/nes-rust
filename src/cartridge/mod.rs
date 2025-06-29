@@ -248,4 +248,21 @@ impl Cartridge {
         self.mapper
     }
     
+    // Save state methods
+    pub fn get_prg_bank(&self) -> u8 {
+        // For now, return 0 as most mappers don't have PRG bank switching
+        0
+    }
+    
+    pub fn get_chr_bank(&self) -> u8 {
+        self.chr_bank
+    }
+    
+    pub fn set_prg_bank(&mut self, _bank: u8) {
+        // For now, do nothing as most mappers don't have PRG bank switching
+    }
+    
+    pub fn set_chr_bank(&mut self, bank: u8) {
+        self.chr_bank = bank;
+    }
 }

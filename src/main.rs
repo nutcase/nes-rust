@@ -4,6 +4,7 @@ mod apu;
 mod memory;
 mod cartridge;
 mod bus;
+mod save_state;
 
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
@@ -99,6 +100,88 @@ impl Nes {
 
     pub fn set_controller(&mut self, controller: u8) {
         self.bus.set_controller(controller);
+    }
+
+    pub fn save_state(&self, slot: u8, rom_filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let save_state = save_state::SaveState {
+            // CPU state
+            cpu_a: self.cpu.a,
+            cpu_x: self.cpu.x, 
+            cpu_y: self.cpu.y,
+            cpu_pc: self.cpu.pc,
+            cpu_sp: self.cpu.sp,
+            cpu_status: self.cpu.status.bits(),
+            cpu_cycles: 0, // Could add cycle counter to CPU if needed
+            
+            // PPU state - need to expose these from PPU
+            ppu_control: self.bus.get_ppu_state().0,
+            ppu_mask: self.bus.get_ppu_state().1,
+            ppu_status: self.bus.get_ppu_state().2,
+            ppu_oam_addr: self.bus.get_ppu_state().3,
+            ppu_scroll_x: 0, // These need to be exposed from PPU
+            ppu_scroll_y: 0,
+            ppu_addr: 0,
+            ppu_data_buffer: 0,
+            ppu_w: false,
+            ppu_t: 0,
+            ppu_v: 0,
+            ppu_x: 0,
+            ppu_scanline: 0,
+            ppu_cycle: 0,
+            ppu_frame: 0,
+            
+            // PPU memory
+            ppu_palette: self.bus.get_ppu_palette(),
+            ppu_nametable: self.bus.get_ppu_nametables_flat(),
+            ppu_oam: self.bus.get_ppu_oam_flat(),
+            
+            // Main RAM
+            ram: self.bus.get_ram_flat(),
+            
+            // Cartridge state
+            cartridge_prg_bank: self.bus.get_cartridge_prg_bank(),
+            cartridge_chr_bank: self.bus.get_cartridge_chr_bank(),
+            
+            // APU state (basic)
+            apu_frame_counter: 0,
+            apu_frame_interrupt: false,
+            
+            // Metadata
+            rom_filename: rom_filename.to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        };
+        
+        let filename = format!("save_state_{}.sav", slot);
+        save_state.save_to_file(&filename)?;
+        Ok(())
+    }
+    
+    pub fn load_state(&mut self, slot: u8) -> Result<(), Box<dyn std::error::Error>> {
+        let filename = format!("save_state_{}.sav", slot);
+        let save_state = save_state::SaveState::load_from_file(&filename)?;
+        
+        // Restore CPU state
+        self.cpu.a = save_state.cpu_a;
+        self.cpu.x = save_state.cpu_x;
+        self.cpu.y = save_state.cpu_y;
+        self.cpu.pc = save_state.cpu_pc;
+        self.cpu.sp = save_state.cpu_sp;
+        self.cpu.status = cpu::StatusFlags::from_bits_truncate(save_state.cpu_status);
+        
+        // Restore system state through bus
+        self.bus.restore_state_flat(
+            save_state.ppu_palette,
+            save_state.ppu_nametable,
+            save_state.ppu_oam,
+            save_state.ram,
+            save_state.cartridge_prg_bank,
+            save_state.cartridge_chr_bank,
+        )?;
+        
+        println!("State loaded from slot {} (ROM: {})", slot, save_state.rom_filename);
+        Ok(())
     }
     
     pub fn get_controller(&self) -> u8 {
@@ -253,9 +336,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::Quit { .. } | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
                     break 'running;
                 }
-                Event::KeyDown { keycode: Some(key), .. } => {
-                    let controller = map_key_to_controller(key, nes.get_controller());
-                    nes.set_controller(controller);
+                Event::KeyDown { keycode: Some(key), keymod, .. } => {
+                    if keymod.contains(sdl2::keyboard::Mod::LCTRLMOD) || keymod.contains(sdl2::keyboard::Mod::RCTRLMOD) {
+                        // Ctrl + number keys for save/load states
+                        match key {
+                            // Save states (Ctrl + 1-4)
+                            Keycode::Num1 => {
+                                if let Err(e) = nes.save_state(1, "current_rom") {
+                                    println!("Save state error: {}", e);
+                                } else {
+                                    println!("Game saved to slot 1");
+                                }
+                            }
+                            Keycode::Num2 => {
+                                if let Err(e) = nes.save_state(2, "current_rom") {
+                                    println!("Save state error: {}", e);
+                                } else {
+                                    println!("Game saved to slot 2");
+                                }
+                            }
+                            Keycode::Num3 => {
+                                if let Err(e) = nes.save_state(3, "current_rom") {
+                                    println!("Save state error: {}", e);
+                                } else {
+                                    println!("Game saved to slot 3");
+                                }
+                            }
+                            Keycode::Num4 => {
+                                if let Err(e) = nes.save_state(4, "current_rom") {
+                                    println!("Save state error: {}", e);
+                                } else {
+                                    println!("Game saved to slot 4");
+                                }
+                            }
+                            // Load states (Ctrl + 5-8)
+                            Keycode::Num5 => {
+                                if let Err(e) = nes.load_state(1) {
+                                    println!("Load state error: {}", e);
+                                } else {
+                                    println!("Game loaded from slot 1");
+                                }
+                            }
+                            Keycode::Num6 => {
+                                if let Err(e) = nes.load_state(2) {
+                                    println!("Load state error: {}", e);
+                                } else {
+                                    println!("Game loaded from slot 2");
+                                }
+                            }
+                            Keycode::Num7 => {
+                                if let Err(e) = nes.load_state(3) {
+                                    println!("Load state error: {}", e);
+                                } else {
+                                    println!("Game loaded from slot 3");
+                                }
+                            }
+                            Keycode::Num8 => {
+                                if let Err(e) = nes.load_state(4) {
+                                    println!("Load state error: {}", e);
+                                } else {
+                                    println!("Game loaded from slot 4");
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        // Normal controller input
+                        let controller = map_key_to_controller(key, nes.get_controller());
+                        nes.set_controller(controller);
+                    }
                 }
                 Event::KeyUp { keycode: Some(key), .. } => {
                     let controller = unmap_key_from_controller(key, nes.get_controller());

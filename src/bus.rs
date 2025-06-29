@@ -186,3 +186,133 @@ impl CpuBus for Bus {
     }
 }
 
+impl Bus {
+    // Save state methods
+    pub fn get_ppu_state(&self) -> (u8, u8, u8, u8) {
+        (
+            self.ppu.get_control(),
+            self.ppu.get_mask(), 
+            self.ppu.get_status(),
+            self.ppu.get_oam_addr()
+        )
+    }
+    
+    pub fn get_ppu_palette(&self) -> [u8; 32] {
+        self.ppu.get_palette()
+    }
+    
+    pub fn get_ppu_nametables(&self) -> [[u8; 1024]; 2] {
+        self.ppu.get_nametable()
+    }
+    
+    pub fn get_ppu_oam(&self) -> [u8; 256] {
+        self.ppu.get_oam()
+    }
+    
+    pub fn get_ram(&self) -> [u8; 0x800] {
+        self.memory.get_ram()
+    }
+    
+    // Flattened versions for serialization
+    pub fn get_ppu_nametables_flat(&self) -> Vec<u8> {
+        let nametables = self.ppu.get_nametable();
+        let mut flat = Vec::with_capacity(2048);
+        flat.extend_from_slice(&nametables[0]);
+        flat.extend_from_slice(&nametables[1]);
+        flat
+    }
+    
+    pub fn get_ppu_oam_flat(&self) -> Vec<u8> {
+        self.ppu.get_oam().to_vec()
+    }
+    
+    pub fn get_ram_flat(&self) -> Vec<u8> {
+        self.memory.get_ram().to_vec()
+    }
+    
+    pub fn get_cartridge_prg_bank(&self) -> u8 {
+        if let Some(ref cartridge) = self.cartridge {
+            cartridge.get_prg_bank()
+        } else {
+            0
+        }
+    }
+    
+    pub fn get_cartridge_chr_bank(&self) -> u8 {
+        if let Some(ref cartridge) = self.cartridge {
+            cartridge.get_chr_bank()
+        } else {
+            0
+        }
+    }
+    
+    pub fn restore_state(
+        &mut self,
+        ppu_palette: [u8; 32],
+        ppu_nametable: [[u8; 1024]; 2], 
+        ppu_oam: [u8; 256],
+        ram: [u8; 0x800],
+        prg_bank: u8,
+        chr_bank: u8,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Restore PPU state
+        self.ppu.set_palette(ppu_palette);
+        self.ppu.set_nametable(ppu_nametable);
+        self.ppu.set_oam(ppu_oam);
+        
+        // Restore RAM
+        self.memory.set_ram(ram);
+        
+        // Restore cartridge state
+        if let Some(ref mut cartridge) = self.cartridge {
+            cartridge.set_prg_bank(prg_bank);
+            cartridge.set_chr_bank(chr_bank);
+        }
+        
+        Ok(())
+    }
+    
+    pub fn restore_state_flat(
+        &mut self,
+        ppu_palette: [u8; 32],
+        ppu_nametable_flat: Vec<u8>, 
+        ppu_oam_flat: Vec<u8>,
+        ram_flat: Vec<u8>,
+        prg_bank: u8,
+        chr_bank: u8,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Restore PPU state
+        self.ppu.set_palette(ppu_palette);
+        
+        // Restore nametables from flat data
+        if ppu_nametable_flat.len() == 2048 {
+            let mut nametables = [[0u8; 1024]; 2];
+            nametables[0].copy_from_slice(&ppu_nametable_flat[0..1024]);
+            nametables[1].copy_from_slice(&ppu_nametable_flat[1024..2048]);
+            self.ppu.set_nametable(nametables);
+        }
+        
+        // Restore OAM from flat data
+        if ppu_oam_flat.len() == 256 {
+            let mut oam = [0u8; 256];
+            oam.copy_from_slice(&ppu_oam_flat);
+            self.ppu.set_oam(oam);
+        }
+        
+        // Restore RAM from flat data
+        if ram_flat.len() == 0x800 {
+            let mut ram = [0u8; 0x800];
+            ram.copy_from_slice(&ram_flat);
+            self.memory.set_ram(ram);
+        }
+        
+        // Restore cartridge state
+        if let Some(ref mut cartridge) = self.cartridge {
+            cartridge.set_prg_bank(prg_bank);
+            cartridge.set_chr_bank(chr_bank);
+        }
+        
+        Ok(())
+    }
+}
+

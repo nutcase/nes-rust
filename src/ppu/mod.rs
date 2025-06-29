@@ -736,3 +736,47 @@ fn get_nes_color(index: u8) -> (u8, u8, u8) {
     
     palette.get(index as usize).copied().unwrap_or((0, 0, 0))
 }
+
+impl Ppu {
+    // Save state getters
+    pub fn get_control(&self) -> u8 {
+        self.control.bits()
+    }
+    
+    pub fn get_mask(&self) -> u8 {
+        self.mask.bits()
+    }
+    
+    pub fn get_status(&self) -> u8 {
+        self.status.bits()
+    }
+    
+    pub fn get_oam_addr(&self) -> u8 {
+        self.oam_addr
+    }
+    
+    pub fn get_palette(&self) -> [u8; 32] {
+        self.palette
+    }
+    
+    pub fn get_nametable(&self) -> [[u8; 1024]; 2] {
+        self.nametable
+    }
+    
+    pub fn get_oam(&self) -> [u8; 256] {
+        self.oam
+    }
+    
+    // Save state setters
+    pub fn set_palette(&mut self, palette: [u8; 32]) {
+        self.palette = palette;
+    }
+    
+    pub fn set_nametable(&mut self, nametable: [[u8; 1024]; 2]) {
+        self.nametable = nametable;
+    }
+    
+    pub fn set_oam(&mut self, oam: [u8; 256]) {
+        self.oam = oam;
+    }
+}
