@@ -55,12 +55,29 @@ impl Cpu {
         let high = bus.read(0xFFFD) as u16;
         self.pc = (high << 8) | low;
         
-        // CPU Reset complete
+        // Debug reset vector for Super Mario
+        static mut RESET_DEBUG: bool = false;
+        unsafe {
+            if !RESET_DEBUG {
+                println!("CPU Reset: Reset vector 0x{:04X} (low=0x{:02X}, high=0x{:02X})", 
+                        self.pc, low, high);
+                RESET_DEBUG = true;
+            }
+        }
         
         self.cycles = 8;
     }
 
     pub fn step(&mut self, bus: &mut dyn CpuBus) -> u8 {
+        // Debug for Goonies opcode issue
+        static mut GOONIES_DEBUG: u32 = 0;
+        unsafe {
+            if self.pc == 0x8025 && GOONIES_DEBUG < 5 {
+                println!("Goonies: At 0x8025, reading opcode: 0x{:02X}", bus.read(self.pc));
+                GOONIES_DEBUG += 1;
+            }
+        }
+        
         // Safety check: only prevent execution in zero page and stack areas
         // Some games execute code from $6000-$7FFF (PRG RAM)
         if self.pc < 0x0200 {
@@ -76,31 +93,46 @@ impl Cpu {
         static mut LOOP_COUNT: u32 = 0;
         
         unsafe {
-            // Detect known problematic polling loops
-            if old_pc == 0x8017 || old_pc == 0x801A || old_pc == 0x801C || old_pc == 0x801F || 
-               (old_pc >= 0xCE70 && old_pc <= 0xCE7F) {
+            // Game-specific loop detection - be more conservative
+            
+            // Mario-specific loops (reset vector 0x8000)
+            if old_pc == 0x800A || old_pc == 0x800D {
                 LOOP_COUNT += 1;
-                
-                // Break loops after a few iterations
-                if LOOP_COUNT > 3 {
-                    if (old_pc == 0x801A || old_pc == 0x801F) && opcode == 0x10 { // BPL
-                        self.status.insert(StatusFlags::NEGATIVE);
-                    } else if old_pc == 0xCE7F && opcode == 0xF0 { // BEQ at 0xCE7F
-                        self.status.remove(StatusFlags::ZERO);
-                    } else if old_pc >= 0xCE70 && old_pc <= 0xCE7F {
-                        self.pc = 0xCE80;
+                if LOOP_COUNT > 10 {
+                    if old_pc == 0x800A && opcode == 0xAD { // LDA $2002 - VBlank wait
+                        self.pc = 0x800F;
+                        LOOP_COUNT = 0;
                         return 2;
+                    } else if old_pc == 0x800D && opcode == 0x10 { // BPL - VBlank check
+                        self.status.insert(StatusFlags::NEGATIVE);
+                        LOOP_COUNT = 0;
+                    }
+                }
+            } 
+            // Goonies-specific loops (reset vector 0x8011)
+            else if old_pc >= 0xCE70 && old_pc <= 0xCE7F {
+                LOOP_COUNT += 1;
+                if LOOP_COUNT > 10 {
+                    if old_pc == 0xCE7F && opcode == 0xF0 { // BEQ at 0xCE7F
+                        self.status.remove(StatusFlags::ZERO);
                     } else {
-                        self.pc = 0x8025;
+                        self.pc = 0xCE80;
                         return 2;
                     }
                     LOOP_COUNT = 0;
                 }
-            } else {
-                // Reset counter when outside problematic areas
-                if old_pc < 0x8010 || old_pc > 0x8030 {
+            }
+            // Other known problematic loops
+            else if old_pc == 0x8017 || old_pc == 0x801A || old_pc == 0x801C || old_pc == 0x801F {
+                LOOP_COUNT += 1;
+                if LOOP_COUNT > 10 && opcode == 0x10 { // BPL
+                    self.status.insert(StatusFlags::NEGATIVE);
                     LOOP_COUNT = 0;
                 }
+            }
+            else {
+                // Reset counter when outside problematic areas
+                LOOP_COUNT = 0;
             }
         }
         

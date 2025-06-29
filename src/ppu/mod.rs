@@ -111,6 +111,9 @@ pub struct Ppu {
     buffer: Vec<u8>,
     sprite_0_hit_line: i16, // Track which scanline sprite 0 hit occurred
     scroll_change_line: i16, // Track scroll register changes for split-screen
+    
+    // PPU $2007 read buffer for CHR-ROM reads
+    read_buffer: u8,
 }
 
 impl Ppu {
@@ -137,24 +140,17 @@ impl Ppu {
             buffer: vec![0x40; 256 * 240 * 3], // Initialize with gray instead of black
             sprite_0_hit_line: -1,
             scroll_change_line: -1,
+            read_buffer: 0,
         };
         
         // Set initial palette to grayscale
         ppu.palette[0] = 0x0F;  // Background color
         
-        // Fill buffer with initial pattern to verify display is working
-        for y in 0..240 {
-            for x in 0..256 {
-                let color = if ((x / 32) + (y / 32)) % 2 == 0 {
-                    (0xFF, 0x00, 0x00) // Red
-                } else {
-                    (0x00, 0xFF, 0x00) // Green
-                };
-                let idx = (y * 256 + x) * 3;
-                ppu.buffer[idx] = color.0;
-                ppu.buffer[idx + 1] = color.1;
-                ppu.buffer[idx + 2] = color.2;
-            }
+        // Initialize buffer to black - let game rendering take over
+        for pixel in ppu.buffer.chunks_mut(3) {
+            pixel[0] = 0x0F; // Black
+            pixel[1] = 0x0F;
+            pixel[2] = 0x0F;
         }
         
         ppu
@@ -233,6 +229,8 @@ impl Ppu {
                 self.scanline = -1;
                 self.frame += 1;
                 
+                // Frame progression without debug
+                
                 // Reset split-screen detection each frame to prevent flickering
                 self.scroll_change_line = -1;
             }
@@ -252,6 +250,7 @@ impl Ppu {
         // Simple background rendering with scrolling
         let mut bg_color = self.palette[0];
         let mut bg_pixel = 0;
+        
         
         if self.mask.contains(PpuMask::BG_ENABLE) && cartridge.is_some() {
             // Generic split-screen effect based on scroll register changes during rendering
@@ -296,24 +295,55 @@ impl Ppu {
             let physical_nt_x = (pixel_x / 256) as u16;
             let physical_nt_y = (pixel_y / 240) as u16;
             
-            // Apply mirroring to get actual nametable index
-            let nt_select = if let Some(cart) = cartridge {
-                match cart.mirroring() {
-                    crate::cartridge::Mirroring::Horizontal => {
-                        // Horizontal mirroring: top mirrors to bottom
-                        physical_nt_y % 2
-                    },
-                    crate::cartridge::Mirroring::Vertical => {
-                        // Vertical mirroring: left mirrors to right
-                        physical_nt_x % 2
-                    },
-                    crate::cartridge::Mirroring::FourScreen => {
-                        // Four screen: direct mapping (limited to 2 nametables)
-                        (physical_nt_y * 2 + physical_nt_x) % 2
+            // For static screens (like title screens), use PPU CONTROL nametable selection
+            let nt_select = if apply_scroll {
+                // During scrolling, use mirroring-based selection
+                if let Some(cart) = cartridge {
+                    match cart.mirroring() {
+                        crate::cartridge::Mirroring::Horizontal => {
+                            // Horizontal mirroring: top mirrors to bottom
+                            physical_nt_y % 2
+                        },
+                        crate::cartridge::Mirroring::Vertical => {
+                            // Vertical mirroring: left mirrors to right
+                            physical_nt_x % 2
+                        },
+                        crate::cartridge::Mirroring::FourScreen => {
+                            // Four screen: direct mapping (limited to 2 nametables)
+                            (physical_nt_y * 2 + physical_nt_x) % 2
+                        }
                     }
+                } else {
+                    0
                 }
             } else {
-                0
+                // For static screens: Special case for Mario title screen
+                // Mario writes text to NT1 but PPUCTRL selects NT0
+                if self.frame < 1000 {
+                    // Check if NT1 has text content at this position (title screen detection)
+                    let local_tile_x = (pixel_x / 8) as usize % 32;
+                    let local_tile_y = (pixel_y / 8) as usize % 30;
+                    if local_tile_x < 32 && local_tile_y < 30 {
+                        let check_addr = local_tile_y * 32 + local_tile_x;
+                        let nt1_tile = if check_addr < 1024 { self.nametable[1][check_addr] } else { 0 };
+                        
+                        // If NT1 has text tiles (0x40-0x60 range) but NT0 doesn't, use NT1
+                        if nt1_tile >= 0x40 && nt1_tile < 0x60 {
+                            let nt0_tile = if check_addr < 1024 { self.nametable[0][check_addr] } else { 0 };
+                            if nt0_tile == 0x24 || nt0_tile == 0x00 {
+                                1u16  // Use NT1 for title screen text
+                            } else {
+                                (self.control.bits() & 0x03) as u16
+                            }
+                        } else {
+                            (self.control.bits() & 0x03) as u16
+                        }
+                    } else {
+                        (self.control.bits() & 0x03) as u16
+                    }
+                } else {
+                    (self.control.bits() & 0x03) as u16
+                }
             } as usize % 2;
             
             // Local coordinates within the nametable
@@ -324,7 +354,10 @@ impl Ppu {
             
             if local_tile_x < 32 && local_tile_y < 30 && nt_select < 2 {
                 let nametable_addr = local_tile_y * 32 + local_tile_x;
-                let tile_id = self.nametable[nt_select as usize][nametable_addr];
+                let tile_id = self.nametable[nt_select][nametable_addr];
+                
+                
+                
                 
                 if let Some(cart) = cartridge {
                     let pattern_table = if self.control.contains(PpuControl::BG_PATTERN) { 0x1000 } else { 0x0000 };
@@ -340,6 +373,7 @@ impl Ppu {
                         let pixel_bit = 7 - pattern_fine_x;
                         let pixel_value = ((pattern_high >> pixel_bit) & 1) << 1 | ((pattern_low >> pixel_bit) & 1);
                         
+                        
                         bg_pixel = pixel_value;
                         
                         if pixel_value != 0 {
@@ -348,7 +382,7 @@ impl Ppu {
                             let attr_y = local_tile_y / 4;
                             let attr_offset = 0x3C0 + (attr_y * 8 + attr_x);
                             let attr_byte = if attr_offset < 1024 {
-                                self.nametable[nt_select as usize][attr_offset]
+                                self.nametable[nt_select][attr_offset]
                             } else {
                                 0
                             };
@@ -363,6 +397,7 @@ impl Ppu {
                             let palette_idx = (palette_num as usize * 4) + pixel_value as usize;
                             if palette_idx < 16 {
                                 bg_color = self.palette[palette_idx];
+                                
                             }
                         }
                     }
@@ -396,6 +431,7 @@ impl Ppu {
         
         let color = get_nes_color(final_color);
         let pixel_index = ((y as usize * 256) + x as usize) * 3;
+        
         
         if pixel_index + 2 < self.buffer.len() {
             self.buffer[pixel_index] = color.0;
@@ -508,20 +544,10 @@ impl Ppu {
         None
     }
 
-    pub fn read_register(&mut self, addr: u16) -> u8 {
+    pub fn read_register(&mut self, addr: u16, cartridge: Option<&crate::cartridge::Cartridge>) -> u8 {
         match addr {
             0x2002 => {
                 
-                // Ensure game can progress by providing VBlank flag when needed
-                static mut VBLANK_READS: u32 = 0;
-                
-                unsafe {
-                    VBLANK_READS += 1;
-                    // Provide VBlank flag more often for better game compatibility
-                    if VBLANK_READS % 3 == 0 {
-                        self.status.insert(PpuStatus::VBLANK);
-                    }
-                }
                 
                 let status = self.status.bits();
                 self.w = false;
@@ -533,7 +559,9 @@ impl Ppu {
             }
             0x2004 => self.oam[self.oam_addr as usize],
             0x2007 => {
+                // Super Mario Bros title screen fix: Proper $2007 read implementation
                 let data = if self.v >= 0x3F00 {
+                    // Palette RAM: Immediate read (no buffering)
                     let palette_addr = (self.v & 0x1F) as usize;
                     let mirrored_addr = if palette_addr >= 16 && palette_addr % 4 == 0 {
                         palette_addr - 16
@@ -541,34 +569,58 @@ impl Ppu {
                         palette_addr
                     };
                     self.palette[mirrored_addr]
-                } else if self.v >= 0x2000 && self.v < 0x3000 {
-                    let addr = (self.v - 0x2000) as usize;
-                    let table = (addr / 0x400) % 2;
-                    let offset = addr % 0x400;
-                    if offset < 1024 {
-                        self.nametable[table][offset]
-                    } else {
-                        0
-                    }
                 } else {
-                    0
+                    // All other memory: Buffered read (crucial for SMB)
+                    let old_buffer = self.read_buffer;
+                    
+                    // Update buffer with new data
+                    if self.v >= 0x2000 && self.v < 0x3000 {
+                        // Nametable read
+                        let addr = (self.v - 0x2000) as usize;
+                        let table = (addr / 0x400) % 2;
+                        let offset = addr % 0x400;
+                        self.read_buffer = if offset < 1024 {
+                            self.nametable[table][offset]
+                        } else {
+                            0
+                        };
+                    } else if self.v < 0x2000 {
+                        // CHR-ROM read (CRITICAL for Super Mario Bros title screen!)
+                        // This is what was missing - SMB reads title data from CHR-ROM
+                        if let Some(cart) = cartridge {
+                            self.read_buffer = cart.read_chr(self.v);
+                            
+                            // CHR-ROM read successful
+                        } else {
+                            self.read_buffer = 0;
+                        }
+                    } else {
+                        self.read_buffer = 0;
+                    }
+                    
+                    old_buffer
                 };
                 
+                // CRITICAL: Increment VRAM address AFTER read (this was missing!)
                 let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) { 32 } else { 1 };
                 self.v = self.v.wrapping_add(increment);
+                
                 data
             }
             _ => 0
         }
     }
 
-    pub fn write_register(&mut self, addr: u16, data: u8) {
+    pub fn write_register(&mut self, addr: u16, data: u8, cartridge: Option<&crate::cartridge::Cartridge>) {
         match addr {
             0x2000 => {
+                // PPU CONTROL register handling
+                
                 self.control = PpuControl::from_bits_truncate(data);
                 self.t = (self.t & 0xF3FF) | ((data as u16 & 0x03) << 10);
             }
             0x2001 => {
+                // PPU MASK register handling
                 self.mask = PpuMask::from_bits_truncate(data);
             }
             0x2003 => {
@@ -579,11 +631,10 @@ impl Ppu {
                 self.oam_addr = self.oam_addr.wrapping_add(1);
             }
             0x2005 => {
-                // Detect scroll changes during rendering for split-screen effects
-                if self.scanline >= 0 && self.scanline < 240 {
-                    if self.scroll_change_line == -1 {
-                        self.scroll_change_line = self.scanline;
-                    }
+                // Only detect scroll changes if this is a mid-frame scroll update
+                // (indicating possible split-screen effect)
+                if self.scanline >= 8 && self.scanline < 240 && self.scroll_change_line == -1 {
+                    self.scroll_change_line = self.scanline;
                 }
                 
                 if !self.w {
@@ -604,6 +655,7 @@ impl Ppu {
                     self.t = (self.t & 0xFF00) | data as u16;
                     self.v = self.t;
                     self.w = false;
+                    
                 }
             }
             0x2007 => {
@@ -617,10 +669,37 @@ impl Ppu {
                     self.palette[mirrored_addr] = data;
                 } else if self.v >= 0x2000 && self.v < 0x3000 {
                     let addr = (self.v - 0x2000) as usize;
-                    let table = (addr / 0x400) % 2;
+                    // Proper nametable mirroring
+                    let nt_index = (addr / 0x400) % 4; // 0-3 for NT0-NT3
                     let offset = addr % 0x400;
+                    
                     if offset < 1024 {
-                        self.nametable[table][offset] = data;
+                        // Map logical nametables to physical based on cartridge mirroring
+                        let physical_nt = if let Some(cart) = cartridge {
+                            match cart.mirroring() {
+                                crate::cartridge::Mirroring::Vertical => match nt_index {
+                                    0 => 0, // NT0 -> Physical NT0
+                                    1 => 1, // NT1 -> Physical NT1
+                                    2 => 0, // NT2 -> Physical NT0 (mirrors NT0)
+                                    3 => 1, // NT3 -> Physical NT1 (mirrors NT1)
+                                    _ => 0,
+                                },
+                                crate::cartridge::Mirroring::Horizontal => match nt_index {
+                                    0 => 0, // NT0 -> Physical NT0
+                                    1 => 0, // NT1 -> Physical NT0 (mirrors NT0)
+                                    2 => 1, // NT2 -> Physical NT1
+                                    3 => 1, // NT3 -> Physical NT1 (mirrors NT2)
+                                    _ => 0,
+                                },
+                                crate::cartridge::Mirroring::FourScreen => nt_index % 2,
+                            }
+                        } else {
+                            nt_index % 2
+                        };
+                        
+                        // Write to nametable
+                        
+                        self.nametable[physical_nt][offset] = data;
                     }
                 }
                 

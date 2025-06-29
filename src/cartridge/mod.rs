@@ -51,15 +51,57 @@ impl Cartridge {
         let chr_rom_start = prg_rom_start + prg_rom_size;
 
         let prg_rom = data[prg_rom_start..prg_rom_start + prg_rom_size].to_vec();
-        let chr_rom = if chr_rom_size > 0 {
+        let mut chr_rom = if chr_rom_size > 0 {
             data[chr_rom_start..chr_rom_start + chr_rom_size].to_vec()
         } else {
+            // CHR RAM - initialize with zeros
             vec![0; 8192]
         };
+        
+        // Normal CHR ROM handling - no special processing for now
 
         let chr_banks = if chr_rom.len() > 0 { chr_rom.len() / 0x2000 } else { 0 };
         println!("Cartridge loaded - Mapper: {}, PRG ROM: {} bytes, CHR ROM: {} bytes ({} banks)", 
                  mapper, prg_rom.len(), chr_rom.len(), chr_banks);
+        println!("  iNES header: CHR size field = {} ({}*8KB = {}KB)", 
+                 chr_rom_size / 8192, chr_rom_size / 8192, chr_rom_size / 1024);
+        println!("  Mirroring: {:?}", mirroring);
+        
+        // Debug: Show CHR ROM data at specific addresses
+        println!("CHR ROM analysis:");
+        println!("  Expected CHR size for SMB: 8192 bytes");
+        
+        // Check specific problematic tile data (tile 0x18)
+        if chr_rom.len() >= 0x189 {
+            println!("  Tile 0x18 CHR data:");
+            for i in 0..16 {
+                let addr = 0x180 + i;
+                if addr < chr_rom.len() {
+                    println!("    CHR[0x{:04X}] = 0x{:02X}", addr, chr_rom[addr]);
+                }
+            }
+        }
+        println!("  Actual CHR size: {} bytes", chr_rom.len());
+        
+        if chr_rom.len() >= 0x20 {
+            println!("  Pattern table 0 samples:");
+            println!("    0x0010: 0x{:02X}, 0x0018: 0x{:02X}", chr_rom[0x0010], chr_rom[0x0018]);
+            println!("    0x0050: 0x{:02X}, 0x0058: 0x{:02X}", chr_rom[0x0050], chr_rom[0x0058]);
+        }
+        
+        if chr_rom.len() >= 0x1020 {
+            println!("  Pattern table 1 samples:");
+            println!("    0x1010: 0x{:02X}, 0x1018: 0x{:02X}", chr_rom[0x1010], chr_rom[0x1018]);
+            println!("    0x1050: 0x{:02X}, 0x1058: 0x{:02X}", chr_rom[0x1050], chr_rom[0x1058]);
+        } else {
+            println!("  Pattern table 1: NOT PRESENT (size {} < 0x1020)", chr_rom.len());
+        }
+        
+        // Show data distribution
+        let non_zero_count = chr_rom.iter().filter(|&&b| b != 0).count();
+        println!("  Non-zero bytes: {} / {} ({:.1}%)", 
+                 non_zero_count, chr_rom.len(), 
+                 100.0 * non_zero_count as f32 / chr_rom.len() as f32);
         
         // Show which mapper implementation will be used
         match mapper {
@@ -88,6 +130,8 @@ impl Cartridge {
     }
 
     pub fn read_prg(&self, addr: u16) -> u8 {
+        // Normal reset vector handling
+        
         // Convert CPU address (0x8000-0xFFFF) to PRG ROM offset
         let rom_addr = addr - 0x8000;
         
@@ -142,19 +186,42 @@ impl Cartridge {
     pub fn read_chr(&self, addr: u16) -> u8 {
         match self.mapper {
             0 => {
-                self.chr_rom[(addr & 0x1FFF) as usize]
-            },
-            3 | 87 => {
-                // Mapper 3 (CNROM) and Mapper 87 - 8KB CHR bank switching
-                let bank_addr = (self.chr_bank as usize) * 0x2000 + (addr as usize);
-                if bank_addr < self.chr_rom.len() {
-                    self.chr_rom[bank_addr]
+                // NROM mapper - 8KB CHR ROM handling
+                let chr_addr = if self.chr_rom.len() == 0x2000 {
+                    // 8KB CHR ROM: Direct mapping, no mirroring
+                    // Pattern table 0 (0x0000-0x0FFF): CHR[0x0000-0x0FFF]
+                    // Pattern table 1 (0x1000-0x1FFF): CHR[0x1000-0x1FFF]
+                    (addr & 0x1FFF) as usize
+                } else {
+                    // Larger CHR ROM: Normal access to both pattern tables
+                    (addr & 0x1FFF) as usize
+                };
+                
+                
+                if chr_addr < self.chr_rom.len() {
+                    self.chr_rom[chr_addr]
                 } else {
                     0
                 }
             },
+            3 | 87 => {
+                // Mapper 3 (CNROM) and Mapper 87 - 8KB CHR bank switching
+                let bank_addr = (self.chr_bank as usize) * 0x2000 + (addr as usize);
+                
+                if bank_addr < self.chr_rom.len() {
+                    self.chr_rom[bank_addr]
+                } else {
+                    println!("CHR read out of bounds: bank_addr=0x{:04X}, chr_len={}", bank_addr, self.chr_rom.len());
+                    0
+                }
+            },
             _ => {
-                self.chr_rom[(addr & 0x1FFF) as usize]
+                let chr_addr = (addr & 0x1FFF) as usize;
+                if chr_addr < self.chr_rom.len() {
+                    self.chr_rom[chr_addr]
+                } else {
+                    0
+                }
             }
         }
     }
@@ -164,7 +231,20 @@ impl Cartridge {
     pub fn write_chr(&mut self, addr: u16, data: u8) {
         match self.mapper {
             0 => {
-                self.chr_rom[(addr & 0x1FFF) as usize] = data;
+                // NROM mapper - 8KB CHR ROM handling
+                let chr_addr = if self.chr_rom.len() == 0x2000 {
+                    // 8KB CHR ROM: Direct mapping, no mirroring
+                    // Pattern table 0 (0x0000-0x0FFF): CHR[0x0000-0x0FFF]
+                    // Pattern table 1 (0x1000-0x1FFF): CHR[0x1000-0x1FFF]
+                    (addr & 0x1FFF) as usize
+                } else {
+                    // Larger CHR ROM: Normal access to both pattern tables
+                    (addr & 0x1FFF) as usize
+                };
+                
+                if chr_addr < self.chr_rom.len() {
+                    self.chr_rom[chr_addr] = data;
+                }
             },
             3 | 87 => {
                 // Mapper 3 (CNROM) and Mapper 87 - 8KB CHR bank switching (write)
@@ -185,5 +265,9 @@ impl Cartridge {
     
     pub fn is_goonies(&self) -> bool {
         self.is_goonies
+    }
+    
+    pub fn chr_rom_size(&self) -> usize {
+        self.chr_rom.len()
     }
 }

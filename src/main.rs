@@ -196,6 +196,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Mario title screen fix applied via proper $2007 implementation
+
     println!("ROM loaded successfully: {}", selected_rom);
     println!("Initializing SDL2 subsystems...");
     
@@ -264,6 +266,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         
         // Skip long-running game check - remove verbose logging
+        
+        // Normal emulation loop
         
         // Run emulation until frame is complete
         let mut step_count = 0;

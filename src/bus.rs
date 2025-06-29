@@ -51,6 +51,8 @@ impl Bus {
     }
 
     fn read_controller(&mut self) -> u8 {
+        // Controller read handling
+        
         // Standard controller read behavior
         // Bit 0: button state, Bit 6: always 1 for standard controllers
         let value = if self.controller_state & 0x01 != 0 { 0x41 } else { 0x40 };
@@ -108,7 +110,7 @@ impl CpuBus for Bus {
         let data = match addr {
             0x0000..=0x1FFF => self.memory.read(addr),
             0x2000..=0x2007 => {
-                let data = self.ppu.read_register(addr);
+                let data = self.ppu.read_register(addr, self.cartridge.as_ref());
                 // PPU status read
                 data
             }
@@ -137,9 +139,11 @@ impl CpuBus for Bus {
     }
 
     fn write(&mut self, addr: u16, data: u8) {
+        // Clean RAM write handling
+        
         match addr {
             0x0000..=0x1FFF => self.memory.write(addr, data),
-            0x2000..=0x2007 => self.ppu.write_register(addr, data),
+            0x2000..=0x2007 => self.ppu.write_register(addr, data, self.cartridge.as_ref()),
             0x4000..=0x4013 | 0x4015 | 0x4017 => self.apu.write_register(addr, data),
             0x4014 => {
                 let start = (data as u16) << 8;
@@ -148,7 +152,7 @@ impl CpuBus for Bus {
                 // Perform DMA transfer immediately
                 for i in 0..256 {
                     let byte = self.read(start + i);
-                    self.ppu.write_register(0x2004, byte);
+                    self.ppu.write_register(0x2004, byte, self.cartridge.as_ref());
                 }
                 
                 // Set DMA in progress with cycle count
