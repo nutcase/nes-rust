@@ -260,32 +260,14 @@ impl Ppu {
         
         
         if self.mask.contains(PpuMask::BG_ENABLE) && cartridge.is_some() {
-            // Check mapper once per pixel instead of multiple times
-            let is_goonies = cartridge.map_or(false, |cart| cart.mapper_number() == 87);
-            let is_mario = cartridge.map_or(false, |cart| cart.mapper_number() == 0);
-            
-            let apply_scroll = if is_goonies {
-                // Goonies split-screen: Check sprite 0 position for split
-                let sprite_0_y = self.oam[0] as i16;
-                if sprite_0_y >= 30 && sprite_0_y <= 50 {
-                    let split_line = sprite_0_y + 8;
-                    y > split_line
-                } else {
-                    true
-                }
-            } else if is_mario {
-                // Mario split-screen: Use sprite 0 hit detection for dynamic split
-                let sprite_0_y = self.oam[0] as i16;
-                // Mario typically places sprite 0 around Y=23-27 for status bar split
-                if sprite_0_y >= 15 && sprite_0_y <= 35 {
-                    let split_line = sprite_0_y + 8;
-                    y > split_line
-                } else {
-                    // No sprite 0 detected in status area - scroll everything
-                    true
-                }
+            // Universal sprite 0 split-screen detection (works for all games)
+            let sprite_0_y = self.oam[0] as i16;
+            let apply_scroll = if sprite_0_y >= 15 && sprite_0_y <= 50 {
+                // Sprite 0 detected in status area range - use split-screen
+                let split_line = sprite_0_y + 8;
+                y > split_line
             } else {
-                // Other games: normal scrolling
+                // No sprite 0 in status area - normal scrolling
                 true
             };
             
@@ -335,17 +317,9 @@ impl Ppu {
                     0
                 }
             } else {
-                // For non-scrolling areas: Use control register, with game-specific exceptions
-                if is_goonies && y <= 47 {
-                    0u16  // Goonies status area: force nametable 0
-                } else if is_mario {
-                    // Mario: Use sprite 0 position to determine status area  
-                    let sprite_0_y = self.oam[0] as i16;
-                    if sprite_0_y >= 15 && sprite_0_y <= 35 && y < sprite_0_y + 8 {
-                        0u16  // Mario status area: force nametable 0
-                    } else {
-                        (self.control.bits() & 0x03) as u16
-                    }  
+                // For status area: force nametable 0 for stability
+                if sprite_0_y >= 15 && sprite_0_y <= 50 && y < sprite_0_y + 8 {
+                    0u16  // Status area: force nametable 0
                 } else {
                     (self.control.bits() & 0x03) as u16
                 }
@@ -378,10 +352,8 @@ impl Ppu {
                         let pixel_bit = 7 - pattern_fine_x;
                         let pixel_value = ((pattern_high >> pixel_bit) & 1) << 1 | ((pattern_low >> pixel_bit) & 1);
                         
-                        // Skip background rendering on Mario split line to avoid black line
-                        let is_mario = cart.mapper_number() == 0;
-                        let sprite_0_y = if is_mario { self.oam[0] as i16 } else { 0 };
-                        let skip_bg = is_mario && sprite_0_y >= 15 && sprite_0_y <= 35 && y == sprite_0_y + 8;
+                        // Skip background rendering on split line to avoid black line (universal fix)
+                        let skip_bg = sprite_0_y >= 15 && sprite_0_y <= 50 && y == sprite_0_y + 8;
                         
                         if !skip_bg {
                             bg_pixel = pixel_value;
@@ -524,7 +496,7 @@ impl Ppu {
                     // Read pattern data
                     if tile_addr + 8 < 0x2000 {
                         // Check if this needs Goonies-specific CHR handling
-                        let is_goonies = cart.mapper_number() == 87;
+                        let is_goonies = cart.mapper_number() == 87 || cart.mapper_number() == 3;
                         let is_mario = cart.mapper_number() == 0;
                         let is_status_sprite = is_goonies && sprite_y <= 47;
                         

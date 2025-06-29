@@ -229,7 +229,7 @@ impl Cartridge {
     
     // Goonies-specific CHR read with status bar handling
     pub fn read_chr_goonies(&self, addr: u16, is_status_sprite: bool) -> u8 {
-        if self.mapper == 87 {
+        if self.mapper == 87 || self.mapper == 3 {
             // For Goonies status bar sprites, always use bank 1 (status data is in bank 1)
             // For game area sprites, use current bank
             let forced_bank = if is_status_sprite { 1 } else { self.chr_bank };
