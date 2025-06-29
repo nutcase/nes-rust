@@ -111,6 +111,8 @@ pub struct Ppu {
     buffer: Vec<u8>,
     sprite_0_hit_line: i16, // Track which scanline sprite 0 hit occurred
     scroll_change_line: i16, // Track scroll register changes for split-screen
+    stable_split_line: i16, // Stable split point to prevent flickering
+    frame_since_scroll_change: u16, // Frames since last mid-frame scroll change
     
     // PPU $2007 read buffer for CHR-ROM reads
     read_buffer: u8,
@@ -140,6 +142,8 @@ impl Ppu {
             buffer: vec![0x40; 256 * 240 * 3], // Initialize with gray instead of black
             sprite_0_hit_line: -1,
             scroll_change_line: -1,
+            stable_split_line: -1,
+            frame_since_scroll_change: 0,
             read_buffer: 0,
         };
         
@@ -171,7 +175,15 @@ impl Ppu {
                     self.status.remove(PpuStatus::SPRITE_0_HIT);
                     // Reset split-screen tracking per frame
                     self.sprite_0_hit_line = -1;
-                    self.scroll_change_line = -1;
+                    
+                    // Gradually decay split-screen detection to prevent stuck splits
+                    if self.frame_since_scroll_change > 0 {
+                        self.frame_since_scroll_change -= 1;
+                        if self.frame_since_scroll_change == 0 {
+                            self.scroll_change_line = -1;
+                            self.stable_split_line = -1;
+                        }
+                    }
                 }
                 
                 // Update vertical scroll during pre-render scanline
@@ -220,19 +232,14 @@ impl Ppu {
         self.cycle += 1;
         if self.cycle >= 341 {
             self.cycle = 0;
-            let _old_scanline = self.scanline;
             self.scanline += 1;
-            
             
             // Handle frame completion 
             if self.scanline >= 261 {
                 self.scanline = -1;
                 self.frame += 1;
                 
-                // Frame progression without debug
-                
-                // Reset split-screen detection each frame to prevent flickering
-                self.scroll_change_line = -1;
+                // Don't reset scroll_change_line here - let the frame counter handle it
             }
         }
 
@@ -253,21 +260,32 @@ impl Ppu {
         
         
         if self.mask.contains(PpuMask::BG_ENABLE) && cartridge.is_some() {
-            // Generic split-screen effect based on scroll register changes during rendering
-            let apply_scroll = if self.scroll_change_line != -1 {
-                // Split-screen detected: determine split point based on sprite 0 position or default
-                let sprite_0_y = self.oam[0];
-                let split_line = if sprite_0_y < 240 {
-                    // Use sprite 0 Y position + some margin for status area
-                    // Stabilize the split line to prevent flickering
-                    (sprite_0_y as i16 + 8).min(48) // Use sprite 0 position with margin
+            // Check mapper once per pixel instead of multiple times
+            let is_goonies = cartridge.map_or(false, |cart| cart.mapper_number() == 87);
+            let is_mario = cartridge.map_or(false, |cart| cart.mapper_number() == 0);
+            
+            let apply_scroll = if is_goonies {
+                // Goonies split-screen: Check sprite 0 position for split
+                let sprite_0_y = self.oam[0] as i16;
+                if sprite_0_y >= 30 && sprite_0_y <= 50 {
+                    let split_line = sprite_0_y + 8;
+                    y > split_line
                 } else {
-                    // Default split at 32 pixels for off-screen sprite 0
-                    32
-                };
-                y >= split_line
+                    true
+                }
+            } else if is_mario {
+                // Mario split-screen: Use sprite 0 hit detection for dynamic split
+                let sprite_0_y = self.oam[0] as i16;
+                // Mario typically places sprite 0 around Y=23-27 for status bar split
+                if sprite_0_y >= 15 && sprite_0_y <= 35 {
+                    let split_line = sprite_0_y + 8;
+                    y > split_line
+                } else {
+                    // No sprite 0 detected in status area - scroll everything
+                    true
+                }
             } else {
-                // No split detected: normal scrolling
+                // Other games: normal scrolling
                 true
             };
             
@@ -317,30 +335,17 @@ impl Ppu {
                     0
                 }
             } else {
-                // For static screens: Special case for Mario title screen
-                // Mario writes text to NT1 but PPUCTRL selects NT0
-                if self.frame < 1000 {
-                    // Check if NT1 has text content at this position (title screen detection)
-                    let local_tile_x = (pixel_x / 8) as usize % 32;
-                    let local_tile_y = (pixel_y / 8) as usize % 30;
-                    if local_tile_x < 32 && local_tile_y < 30 {
-                        let check_addr = local_tile_y * 32 + local_tile_x;
-                        let nt1_tile = if check_addr < 1024 { self.nametable[1][check_addr] } else { 0 };
-                        
-                        // If NT1 has text tiles (0x40-0x60 range) but NT0 doesn't, use NT1
-                        if nt1_tile >= 0x40 && nt1_tile < 0x60 {
-                            let nt0_tile = if check_addr < 1024 { self.nametable[0][check_addr] } else { 0 };
-                            if nt0_tile == 0x24 || nt0_tile == 0x00 {
-                                1u16  // Use NT1 for title screen text
-                            } else {
-                                (self.control.bits() & 0x03) as u16
-                            }
-                        } else {
-                            (self.control.bits() & 0x03) as u16
-                        }
+                // For non-scrolling areas: Use control register, with game-specific exceptions
+                if is_goonies && y <= 47 {
+                    0u16  // Goonies status area: force nametable 0
+                } else if is_mario {
+                    // Mario: Use sprite 0 position to determine status area  
+                    let sprite_0_y = self.oam[0] as i16;
+                    if sprite_0_y >= 15 && sprite_0_y <= 35 && y < sprite_0_y + 8 {
+                        0u16  // Mario status area: force nametable 0
                     } else {
                         (self.control.bits() & 0x03) as u16
-                    }
+                    }  
                 } else {
                     (self.control.bits() & 0x03) as u16
                 }
@@ -373,10 +378,16 @@ impl Ppu {
                         let pixel_bit = 7 - pattern_fine_x;
                         let pixel_value = ((pattern_high >> pixel_bit) & 1) << 1 | ((pattern_low >> pixel_bit) & 1);
                         
+                        // Skip background rendering on Mario split line to avoid black line
+                        let is_mario = cart.mapper_number() == 0;
+                        let sprite_0_y = if is_mario { self.oam[0] as i16 } else { 0 };
+                        let skip_bg = is_mario && sprite_0_y >= 15 && sprite_0_y <= 35 && y == sprite_0_y + 8;
                         
-                        bg_pixel = pixel_value;
+                        if !skip_bg {
+                            bg_pixel = pixel_value;
+                        }
                         
-                        if pixel_value != 0 {
+                        if pixel_value != 0 && !skip_bg {
                             // Get attribute byte for palette selection
                             let attr_x = local_tile_x / 4;
                             let attr_y = local_tile_y / 4;
@@ -512,8 +523,21 @@ impl Ppu {
                     
                     // Read pattern data
                     if tile_addr + 8 < 0x2000 {
-                        let pattern_low = cart.read_chr(tile_addr);
-                        let pattern_high = cart.read_chr(tile_addr + 8);
+                        // Check if this needs Goonies-specific CHR handling
+                        let is_goonies = cart.mapper_number() == 87;
+                        let is_mario = cart.mapper_number() == 0;
+                        let is_status_sprite = is_goonies && sprite_y <= 47;
+                        
+                        let pattern_low = if is_goonies {
+                            cart.read_chr_goonies(tile_addr, is_status_sprite)
+                        } else {
+                            cart.read_chr(tile_addr)
+                        };
+                        let pattern_high = if is_goonies {
+                            cart.read_chr_goonies(tile_addr + 8, is_status_sprite)
+                        } else {
+                            cart.read_chr(tile_addr + 8)
+                        };
                         
                         let pixel_bit = 7 - pixel_x;
                         let pixel_value = ((pattern_high >> pixel_bit) & 1) << 1 | ((pattern_low >> pixel_bit) & 1);
@@ -521,20 +545,33 @@ impl Ppu {
                         if pixel_value != 0 {
                             if sprite_num == 0 {
                                 *sprite_0_hit = true;
-                            }
-                            
-                            // Get sprite palette (16-31)
-                            let palette_num = attributes & 0x03;
-                            let palette_idx = 16 + palette_num * 4 + pixel_value;
-                            
-                            let color_index = if (palette_idx as usize) < 32 {
-                                self.palette[palette_idx as usize]
+                                
+                                // Normal sprite 0 rendering
+                                let palette_num = attributes & 0x03;
+                                let palette_idx = 16 + palette_num * 4 + pixel_value;
+                                
+                                let color_index = if (palette_idx as usize) < 32 {
+                                    self.palette[palette_idx as usize]
+                                } else {
+                                    self.palette[16]
+                                };
+                                
+                                let priority_behind_bg = (attributes & 0x20) != 0;
+                                return Some((color_index, priority_behind_bg));
                             } else {
-                                self.palette[16]
-                            };
-                            
-                            let priority_behind_bg = (attributes & 0x20) != 0;
-                            return Some((color_index, priority_behind_bg));
+                                // Normal sprite rendering
+                                let palette_num = attributes & 0x03;
+                                let palette_idx = 16 + palette_num * 4 + pixel_value;
+                                
+                                let color_index = if (palette_idx as usize) < 32 {
+                                    self.palette[palette_idx as usize]
+                                } else {
+                                    self.palette[16]
+                                };
+                                
+                                let priority_behind_bg = (attributes & 0x20) != 0;
+                                return Some((color_index, priority_behind_bg));
+                            }
                         }
                     }
                     }
@@ -631,10 +668,12 @@ impl Ppu {
                 self.oam_addr = self.oam_addr.wrapping_add(1);
             }
             0x2005 => {
-                // Only detect scroll changes if this is a mid-frame scroll update
-                // (indicating possible split-screen effect)
-                if self.scanline >= 8 && self.scanline < 240 && self.scroll_change_line == -1 {
+                // Mid-frame scroll detection for split-screen effects
+                // Only detect during specific scanline ranges to avoid false positives
+                if self.scanline >= 10 && self.scanline <= 50 && self.scroll_change_line == -1 {
                     self.scroll_change_line = self.scanline;
+                    // Set frame counter to maintain split detection for multiple frames
+                    self.frame_since_scroll_change = 120; // Keep split active for 2 seconds
                 }
                 
                 if !self.w {

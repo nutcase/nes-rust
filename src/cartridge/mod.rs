@@ -67,57 +67,12 @@ impl Cartridge {
                  chr_rom_size / 8192, chr_rom_size / 8192, chr_rom_size / 1024);
         println!("  Mirroring: {:?}", mirroring);
         
-        // Debug: Show CHR ROM data at specific addresses
-        println!("CHR ROM analysis:");
-        println!("  Expected CHR size for SMB: 8192 bytes");
-        
-        // Check specific problematic tile data (tile 0x18)
-        if chr_rom.len() >= 0x189 {
-            println!("  Tile 0x18 CHR data:");
-            for i in 0..16 {
-                let addr = 0x180 + i;
-                if addr < chr_rom.len() {
-                    println!("    CHR[0x{:04X}] = 0x{:02X}", addr, chr_rom[addr]);
-                }
-            }
-        }
-        println!("  Actual CHR size: {} bytes", chr_rom.len());
-        
-        if chr_rom.len() >= 0x20 {
-            println!("  Pattern table 0 samples:");
-            println!("    0x0010: 0x{:02X}, 0x0018: 0x{:02X}", chr_rom[0x0010], chr_rom[0x0018]);
-            println!("    0x0050: 0x{:02X}, 0x0058: 0x{:02X}", chr_rom[0x0050], chr_rom[0x0058]);
-        }
-        
-        if chr_rom.len() >= 0x1020 {
-            println!("  Pattern table 1 samples:");
-            println!("    0x1010: 0x{:02X}, 0x1018: 0x{:02X}", chr_rom[0x1010], chr_rom[0x1018]);
-            println!("    0x1050: 0x{:02X}, 0x1058: 0x{:02X}", chr_rom[0x1050], chr_rom[0x1058]);
-        } else {
-            println!("  Pattern table 1: NOT PRESENT (size {} < 0x1020)", chr_rom.len());
-        }
-        
-        // Show data distribution
-        let non_zero_count = chr_rom.iter().filter(|&&b| b != 0).count();
-        println!("  Non-zero bytes: {} / {} ({:.1}%)", 
-                 non_zero_count, chr_rom.len(), 
-                 100.0 * non_zero_count as f32 / chr_rom.len() as f32);
-        
-        // Show which mapper implementation will be used
-        match mapper {
-            3 => println!("Using Mapper 3 (CNROM) implementation"),
-            87 => println!("Using Mapper 87 (J87) implementation"),
-            _ => {}
-        }
         
         // Detect Goonies by ROM size and mapper
         let is_goonies = (mapper == 3 || mapper == 87) && 
                          prg_rom.len() == 32768 && 
                          chr_rom.len() == 16384;
         
-        if is_goonies {
-            println!("Detected Goonies ROM (Mapper {}) - CHR banks available: {}", mapper, chr_banks);
-        }
         
         Ok(Cartridge {
             prg_rom,
@@ -164,17 +119,14 @@ impl Cartridge {
                 // Register at $8000-$FFFF
                 // Unlike Mapper 87, CNROM has bus conflicts
                 if addr >= 0x8000 {
-                    let old_bank = self.chr_bank;
                     // CNROM uses bits 0-1 directly for CHR bank selection
                     self.chr_bank = data & 0x03; // Select one of 4 possible 8KB CHR banks
-                    // Bank switching occurred
                 }
             },
             87 => {
                 // Mapper 87 - CHR bank switching
                 // Register at $6000-$7FFF
                 if addr >= 0x6000 && addr <= 0x7FFF {
-                    let old_bank = self.chr_bank;
                     // Swap bits 0 and 1 as per nen-emulator implementation
                     self.chr_bank = ((data & 0x01) << 1) | ((data & 0x02) >> 1);
                 }
@@ -208,10 +160,10 @@ impl Cartridge {
                 // Mapper 3 (CNROM) and Mapper 87 - 8KB CHR bank switching
                 let bank_addr = (self.chr_bank as usize) * 0x2000 + (addr as usize);
                 
+                
                 if bank_addr < self.chr_rom.len() {
                     self.chr_rom[bank_addr]
                 } else {
-                    println!("CHR read out of bounds: bank_addr=0x{:04X}, chr_len={}", bank_addr, self.chr_rom.len());
                     0
                 }
             },
@@ -269,5 +221,29 @@ impl Cartridge {
     
     pub fn chr_rom_size(&self) -> usize {
         self.chr_rom.len()
+    }
+    
+    pub fn mapper_number(&self) -> u8 {
+        self.mapper
+    }
+    
+    // Goonies-specific CHR read with status bar handling
+    pub fn read_chr_goonies(&self, addr: u16, is_status_sprite: bool) -> u8 {
+        if self.mapper == 87 {
+            // For Goonies status bar sprites, always use bank 1 (status data is in bank 1)
+            // For game area sprites, use current bank
+            let forced_bank = if is_status_sprite { 1 } else { self.chr_bank };
+            let bank_addr = (forced_bank as usize) * 0x2000 + (addr as usize);
+            
+            
+            if bank_addr < self.chr_rom.len() {
+                self.chr_rom[bank_addr]
+            } else {
+                0
+            }
+        } else {
+            // Fall back to normal CHR read for other mappers
+            self.read_chr(addr)
+        }
     }
 }
