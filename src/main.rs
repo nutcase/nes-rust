@@ -338,9 +338,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Event::KeyDown { keycode: Some(key), keymod, .. } => {
                     if keymod.contains(sdl2::keyboard::Mod::LCTRLMOD) || keymod.contains(sdl2::keyboard::Mod::RCTRLMOD) {
-                        // Ctrl + number keys for save/load states
+                        // Ctrl + number keys for save states
                         match key {
-                            // Save states (Ctrl + 1-4)
                             Keycode::Num1 => {
                                 if let Err(e) = nes.save_state(1, "current_rom") {
                                     println!("Save state error: {}", e);
@@ -369,41 +368,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     println!("Game saved to slot 4");
                                 }
                             }
-                            // Load states (Ctrl + 5-8)
-                            Keycode::Num5 => {
+                            _ => {}
+                        }
+                    } else {
+                        // Number keys without Ctrl for load states
+                        match key {
+                            Keycode::Num1 => {
                                 if let Err(e) = nes.load_state(1) {
                                     println!("Load state error: {}", e);
                                 } else {
                                     println!("Game loaded from slot 1");
                                 }
                             }
-                            Keycode::Num6 => {
+                            Keycode::Num2 => {
                                 if let Err(e) = nes.load_state(2) {
                                     println!("Load state error: {}", e);
                                 } else {
                                     println!("Game loaded from slot 2");
                                 }
                             }
-                            Keycode::Num7 => {
+                            Keycode::Num3 => {
                                 if let Err(e) = nes.load_state(3) {
                                     println!("Load state error: {}", e);
                                 } else {
                                     println!("Game loaded from slot 3");
                                 }
                             }
-                            Keycode::Num8 => {
+                            Keycode::Num4 => {
                                 if let Err(e) = nes.load_state(4) {
                                     println!("Load state error: {}", e);
                                 } else {
                                     println!("Game loaded from slot 4");
                                 }
                             }
-                            _ => {}
+                            _ => {
+                                // Normal controller input
+                                let controller = map_key_to_controller(key, nes.get_controller());
+                                nes.set_controller(controller);
+                            }
                         }
-                    } else {
-                        // Normal controller input
-                        let controller = map_key_to_controller(key, nes.get_controller());
-                        nes.set_controller(controller);
                     }
                 }
                 Event::KeyUp { keycode: Some(key), .. } => {
