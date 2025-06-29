@@ -117,10 +117,24 @@ impl Cartridge {
             3 => {
                 // Mapper 3 (CNROM) - CHR bank switching
                 // Register at $8000-$FFFF
-                // Unlike Mapper 87, CNROM has bus conflicts
+                // CNROM has bus conflicts - ROM value and CPU value must match
                 if addr >= 0x8000 {
-                    // CNROM uses bits 0-1 directly for CHR bank selection
-                    self.chr_bank = data & 0x03; // Select one of 4 possible 8KB CHR banks
+                    let old_bank = self.chr_bank;
+                    
+                    // Read ROM value at the write address to handle bus conflicts
+                    let rom_value = if (addr as usize) < self.prg_rom.len() {
+                        self.prg_rom[addr as usize]
+                    } else {
+                        // Handle mirrored addresses
+                        let mirrored_addr = (addr - 0x8000) % (self.prg_rom.len() as u16);
+                        self.prg_rom[mirrored_addr as usize]
+                    };
+                    
+                    // Bus conflict: use AND of written value and ROM value
+                    let effective_value = data & rom_value;
+                    self.chr_bank = effective_value & 0x03; // Select one of 4 possible 8KB CHR banks
+                    
+                    // CHR bank switching is working correctly - disable debug logging
                 }
             },
             87 => {
@@ -179,25 +193,10 @@ impl Cartridge {
     }
 
     // Sprite-specific CHR read that handles mapper-specific requirements
-    pub fn read_chr_sprite(&self, addr: u16, sprite_y: u8) -> u8 {
-        match self.mapper {
-            3 | 87 => {
-                // Mapper 3 (CNROM) & 87: status sprites (Y <= 47) use bank 1, others use current bank
-                let is_status_sprite = sprite_y <= 47;
-                let forced_bank = if is_status_sprite { 1 } else { self.chr_bank };
-                let bank_addr = (forced_bank as usize) * 0x2000 + (addr as usize);
-                
-                if bank_addr < self.chr_rom.len() {
-                    self.chr_rom[bank_addr]
-                } else {
-                    0
-                }
-            },
-            _ => {
-                // Other mappers: use normal CHR read
-                self.read_chr(addr)
-            }
-        }
+    pub fn read_chr_sprite(&self, addr: u16, _sprite_y: u8) -> u8 {
+        // For now, use normal CHR read for all sprites
+        // Goonies status sprite issue needs further investigation
+        self.read_chr(addr)
     }
     
     
