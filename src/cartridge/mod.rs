@@ -177,6 +177,28 @@ impl Cartridge {
             }
         }
     }
+
+    // Sprite-specific CHR read that handles status sprite requirements
+    pub fn read_chr_sprite(&self, addr: u16, sprite_y: u8) -> u8 {
+        match self.mapper {
+            3 | 87 => {
+                // For Goonies games: status sprites (Y <= 47) use bank 1, others use current bank
+                let is_status_sprite = sprite_y <= 47;
+                let forced_bank = if is_status_sprite { 1 } else { self.chr_bank };
+                let bank_addr = (forced_bank as usize) * 0x2000 + (addr as usize);
+                
+                if bank_addr < self.chr_rom.len() {
+                    self.chr_rom[bank_addr]
+                } else {
+                    0
+                }
+            },
+            _ => {
+                // Other mappers: use normal CHR read
+                self.read_chr(addr)
+            }
+        }
+    }
     
     
 
@@ -227,23 +249,4 @@ impl Cartridge {
         self.mapper
     }
     
-    // Goonies-specific CHR read with status bar handling
-    pub fn read_chr_goonies(&self, addr: u16, is_status_sprite: bool) -> u8 {
-        if self.mapper == 87 || self.mapper == 3 {
-            // For Goonies status bar sprites, always use bank 1 (status data is in bank 1)
-            // For game area sprites, use current bank
-            let forced_bank = if is_status_sprite { 1 } else { self.chr_bank };
-            let bank_addr = (forced_bank as usize) * 0x2000 + (addr as usize);
-            
-            
-            if bank_addr < self.chr_rom.len() {
-                self.chr_rom[bank_addr]
-            } else {
-                0
-            }
-        } else {
-            // Fall back to normal CHR read for other mappers
-            self.read_chr(addr)
-        }
-    }
 }

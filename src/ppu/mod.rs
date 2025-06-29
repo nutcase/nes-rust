@@ -495,20 +495,9 @@ impl Ppu {
                     
                     // Read pattern data
                     if tile_addr + 8 < 0x2000 {
-                        // Check if this needs Goonies-specific CHR handling
-                        let is_goonies = cart.mapper_number() == 87 || cart.mapper_number() == 3;
-                        let is_status_sprite = is_goonies && sprite_y <= 47;
-                        
-                        let pattern_low = if is_goonies {
-                            cart.read_chr_goonies(tile_addr, is_status_sprite)
-                        } else {
-                            cart.read_chr(tile_addr)
-                        };
-                        let pattern_high = if is_goonies {
-                            cart.read_chr_goonies(tile_addr + 8, is_status_sprite)
-                        } else {
-                            cart.read_chr(tile_addr + 8)
-                        };
+                        // Use cartridge's sprite-specific CHR read
+                        let pattern_low = cart.read_chr_sprite(tile_addr, sprite_y);
+                        let pattern_high = cart.read_chr_sprite(tile_addr + 8, sprite_y);
                         
                         let pixel_bit = 7 - pixel_x;
                         let pixel_value = ((pattern_high >> pixel_bit) & 1) << 1 | ((pattern_low >> pixel_bit) & 1);
