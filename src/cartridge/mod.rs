@@ -178,11 +178,11 @@ impl Cartridge {
         }
     }
 
-    // Sprite-specific CHR read that handles status sprite requirements
+    // Sprite-specific CHR read that handles mapper-specific requirements
     pub fn read_chr_sprite(&self, addr: u16, sprite_y: u8) -> u8 {
         match self.mapper {
             3 | 87 => {
-                // For Goonies games: status sprites (Y <= 47) use bank 1, others use current bank
+                // Mapper 3 (CNROM) & 87: status sprites (Y <= 47) use bank 1, others use current bank
                 let is_status_sprite = sprite_y <= 47;
                 let forced_bank = if is_status_sprite { 1 } else { self.chr_bank };
                 let bank_addr = (forced_bank as usize) * 0x2000 + (addr as usize);
