@@ -55,33 +55,15 @@ impl Cpu {
         let high = bus.read(0xFFFD) as u16;
         self.pc = (high << 8) | low;
         
-        // Debug reset vector for Super Mario
-        static mut RESET_DEBUG: bool = false;
-        unsafe {
-            if !RESET_DEBUG {
-                println!("CPU Reset: Reset vector 0x{:04X} (low=0x{:02X}, high=0x{:02X})", 
-                        self.pc, low, high);
-                RESET_DEBUG = true;
-            }
-        }
         
         self.cycles = 8;
     }
 
     pub fn step(&mut self, bus: &mut dyn CpuBus) -> u8 {
-        // Debug for Goonies opcode issue
-        static mut GOONIES_DEBUG: u32 = 0;
-        unsafe {
-            if self.pc == 0x8025 && GOONIES_DEBUG < 5 {
-                println!("Goonies: At 0x8025, reading opcode: 0x{:02X}", bus.read(self.pc));
-                GOONIES_DEBUG += 1;
-            }
-        }
         
         // Safety check: only prevent execution in zero page and stack areas
         // Some games execute code from $6000-$7FFF (PRG RAM)
         if self.pc < 0x0200 {
-            println!("CPU attempting to execute in zero page/stack area at PC: 0x{:04X}, resetting", self.pc);
             self.reset(bus);
             return 2;
         }
@@ -153,7 +135,7 @@ impl Cpu {
     }
 
     pub fn nmi(&mut self, bus: &mut dyn CpuBus) {
-        let old_pc = self.pc;
+        let _old_pc = self.pc;
         
         self.push(bus, (self.pc >> 8) as u8);
         self.push(bus, self.pc as u8);
@@ -168,6 +150,33 @@ impl Cpu {
         self.pc = nmi_vector;
         
         // NMI executed
+        
+        self.cycles += 7;
+    }
+    
+    pub fn irq(&mut self, bus: &mut dyn CpuBus) {
+        // IRQ is maskable - check interrupt disable flag
+        if self.status.contains(StatusFlags::INTERRUPT_DISABLE) {
+            return;
+        }
+        
+        self.push(bus, (self.pc >> 8) as u8);
+        self.push(bus, self.pc as u8);
+        self.push(bus, self.status.bits() & !StatusFlags::BREAK.bits());
+        
+        self.status.insert(StatusFlags::INTERRUPT_DISABLE);
+        
+        // IRQ vector at $FFFE-$FFFF
+        let low = bus.read(0xFFFE) as u16;
+        let high = bus.read(0xFFFF) as u16;
+        let irq_vector = (high << 8) | low;
+        
+        self.pc = irq_vector;
+        
+        // Reduce IRQ debug spam
+        if self.cycles % 100000 == 0 {
+            println!("IRQ triggered: jumping to ${:04X}", irq_vector);
+        }
         
         self.cycles += 7;
     }

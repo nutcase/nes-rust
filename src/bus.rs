@@ -72,6 +72,16 @@ impl Bus {
         self.apu.get_audio_buffer()
     }
     
+    // Check if APU frame IRQ is pending
+    pub fn apu_irq_pending(&self) -> bool {
+        self.apu.frame_irq_pending()
+    }
+    
+    // Clear APU frame IRQ
+    pub fn clear_apu_irq(&mut self) {
+        self.apu.clear_frame_irq();
+    }
+    
     pub fn get_dma_cycles(&mut self) -> u32 {
         let cycles = self.dma_cycles;
         self.dma_cycles = 0; // Reset after reading
@@ -114,7 +124,10 @@ impl CpuBus for Bus {
                 // PPU status read
                 data
             }
-            0x4000..=0x4013 | 0x4015 => self.apu.read_register(addr),
+            0x4000..=0x4013 | 0x4015 => {
+                let data = self.apu.read_register(addr);
+                data
+            },
             0x4016 => {
                 let data = self.read_controller();
                 // Controller read
@@ -139,12 +152,10 @@ impl CpuBus for Bus {
     }
 
     fn write(&mut self, addr: u16, data: u8) {
-        // Clean RAM write handling
         
         match addr {
             0x0000..=0x1FFF => self.memory.write(addr, data),
             0x2000..=0x2007 => self.ppu.write_register(addr, data, self.cartridge.as_ref()),
-            0x4000..=0x4013 | 0x4015 | 0x4017 => self.apu.write_register(addr, data),
             0x4014 => {
                 let start = (data as u16) << 8;
                 // OAM DMA transfer
@@ -159,6 +170,9 @@ impl CpuBus for Bus {
                 self.dma_cycles = 513; // OAM DMA takes 513 cycles
                 self.dma_in_progress = true;
                 // DMA started
+            },
+            0x4000..=0x4013 | 0x4015 | 0x4017 => {
+                self.apu.write_register(addr, data);
             },
             0x4016 => {
                 if data & 0x01 != 0 {

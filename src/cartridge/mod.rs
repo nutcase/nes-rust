@@ -6,8 +6,9 @@ pub struct Cartridge {
     chr_rom: Vec<u8>,
     mapper: u8,
     mirroring: Mirroring,
-    // Mapper 87 specific
+    // Mapper 3 and 87 specific
     chr_bank: u8,
+    prg_bank: u8,  // Add PRG bank for proper mapper support
     // Game-specific flags
     is_goonies: bool,
 }
@@ -60,12 +61,6 @@ impl Cartridge {
         
         // Normal CHR ROM handling - no special processing for now
 
-        let chr_banks = if chr_rom.len() > 0 { chr_rom.len() / 0x2000 } else { 0 };
-        println!("Cartridge loaded - Mapper: {}, PRG ROM: {} bytes, CHR ROM: {} bytes ({} banks)", 
-                 mapper, prg_rom.len(), chr_rom.len(), chr_banks);
-        println!("  iNES header: CHR size field = {} ({}*8KB = {}KB)", 
-                 chr_rom_size / 8192, chr_rom_size / 8192, chr_rom_size / 1024);
-        println!("  Mirroring: {:?}", mirroring);
         
         
         // Detect Goonies by ROM size and mapper
@@ -80,6 +75,7 @@ impl Cartridge {
             mapper,
             mirroring,
             chr_bank: 0,
+            prg_bank: 0,
             is_goonies,
         })
     }
@@ -250,16 +246,15 @@ impl Cartridge {
     
     // Save state methods
     pub fn get_prg_bank(&self) -> u8 {
-        // For now, return 0 as most mappers don't have PRG bank switching
-        0
+        self.prg_bank
     }
     
     pub fn get_chr_bank(&self) -> u8 {
         self.chr_bank
     }
     
-    pub fn set_prg_bank(&mut self, _bank: u8) {
-        // For now, do nothing as most mappers don't have PRG bank switching
+    pub fn set_prg_bank(&mut self, bank: u8) {
+        self.prg_bank = bank;
     }
     
     pub fn set_chr_bank(&mut self, bank: u8) {

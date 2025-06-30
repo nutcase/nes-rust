@@ -7,6 +7,11 @@ pub struct Apu {
     frame_counter: u16,
     cycle_count: u64,
     
+    // Frame counter control
+    frame_mode: bool,        // false = 4-step, true = 5-step
+    irq_disable: bool,       // IRQ inhibit flag
+    frame_irq: bool,         // Frame IRQ flag
+    
     // Status register
     pulse1_enabled: bool,
     pulse2_enabled: bool,
@@ -139,6 +144,10 @@ impl Apu {
             frame_counter: 0,
             cycle_count: 0,
             
+            frame_mode: false,
+            irq_disable: true,    // Start with IRQ disabled
+            frame_irq: false,
+            
             pulse1_enabled: false,
             pulse2_enabled: false,
             triangle_enabled: false,
@@ -189,11 +198,27 @@ impl Apu {
             }
         }
         
-        // Frame counter updates every 14915 CPU cycles (240Hz, 4 times per frame)
+        // Frame counter updates (more accurate timing)
         self.frame_counter += 1;
-        if self.frame_counter >= 14915 { 
+        
+        // More accurate frame counter timing based on NESdev wiki
+        let frame_period = if self.frame_mode { 
+            18641  // 5-step mode
+        } else { 
+            29830  // 4-step mode: try doubling for slower tempo (every 2 frames)
+        };
+        
+        if self.frame_counter >= frame_period { 
             self.frame_counter = 0;
             self.update_frame_counters();
+            
+            // Generate IRQ in 4-step mode when IRQ is enabled - but not if already pending
+            if !self.frame_mode && !self.irq_disable && !self.frame_irq {
+                self.frame_irq = true;
+                if self.cycle_count % 50000 == 0 { // Reduce log spam
+                    println!("APU: Frame IRQ generated at cycle {}", self.cycle_count);
+                }
+            }
         }
     }
     
@@ -242,6 +267,7 @@ impl Apu {
         let pulse2_out = if self.pulse2_enabled { self.pulse2.output() } else { 0.0 };
         let triangle_out = if self.triangle_enabled { self.triangle.output() } else { 0.0 };
         let noise_out = if self.noise_enabled { self.noise.output() } else { 0.0 };
+        
         
         // Bass-optimized mixing for proper "BON" sounds
         let mixed = pulse1_out * 0.25 + pulse2_out * 0.25 + triangle_out * 0.35 + noise_out * 0.15;
@@ -319,16 +345,35 @@ impl Apu {
         self.output_buffer.clear();
         buffer
     }
+    
+    // Check if frame IRQ is pending
+    pub fn frame_irq_pending(&self) -> bool {
+        self.frame_irq && !self.irq_disable
+    }
+    
+    // Clear frame IRQ (called when CPU acknowledges IRQ)
+    pub fn clear_frame_irq(&mut self) {
+        self.frame_irq = false;
+    }
 
-    pub fn read_register(&self, addr: u16) -> u8 {
+    pub fn read_register(&mut self, addr: u16) -> u8 {
         match addr {
             0x4015 => {
                 let mut status = 0;
-                if self.pulse1_enabled { status |= 0x01; }
-                if self.pulse2_enabled { status |= 0x02; }
-                if self.triangle_enabled { status |= 0x04; }
-                if self.noise_enabled { status |= 0x08; }
+                if self.pulse1_enabled && self.pulse1.length_counter > 0 { status |= 0x01; }
+                if self.pulse2_enabled && self.pulse2.length_counter > 0 { status |= 0x02; }
+                if self.triangle_enabled && self.triangle.length_counter > 0 { status |= 0x04; }
+                if self.noise_enabled && self.noise.length_counter > 0 { status |= 0x08; }
                 if self.dmc_enabled { status |= 0x10; }
+                
+                // Bit 6: Frame IRQ flag (cleared after read)
+                if self.frame_irq {
+                    status |= 0x40;
+                }
+                
+                // Reading $4015 clears the frame IRQ flag
+                self.frame_irq = false;
+                
                 status
             },
             _ => 0,
@@ -336,6 +381,7 @@ impl Apu {
     }
 
     pub fn write_register(&mut self, addr: u16, data: u8) {
+        
         match addr {
             // Pulse 1
             0x4000 => self.pulse1.write_control(data),
@@ -387,7 +433,21 @@ impl Apu {
             },
             
             // Frame counter
-            0x4017 => {},
+            0x4017 => {
+                self.frame_mode = (data & 0x80) != 0;      // Bit 7: 0=4-step, 1=5-step
+                self.irq_disable = (data & 0x40) != 0;     // Bit 6: IRQ inhibit
+                
+                // Writing to $4017 immediately clears the frame IRQ flag
+                self.frame_irq = false;
+                
+                // Reset frame counter
+                self.frame_counter = 0;
+                
+                // If 5-step mode, immediately run frame sequencer
+                if self.frame_mode {
+                    self.update_frame_counters();
+                }
+            },
             _ => {},
         }
     }
@@ -520,11 +580,13 @@ impl PulseChannel {
     
     fn output(&self) -> f32 {
         if self.length_counter == 0 {
+            // Debug why length_counter is 0
             return 0.0;
         }
         
-        // More lenient frequency filtering - NES can play very high frequencies
+        // More lenient frequency filtering - NES can play very high frequencies  
         if self.timer_reload < 1 {
+            // Debug why timer_reload is 0
             return 0.0;
         }
         

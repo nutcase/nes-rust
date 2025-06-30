@@ -75,6 +75,12 @@ impl Nes {
             self.cpu.nmi(&mut self.bus);
         }
         
+        // Check for APU Frame IRQ
+        if self.bus.apu_irq_pending() {
+            self.cpu.irq(&mut self.bus);
+            // Don't clear IRQ here - let $4015 read clear it
+        }
+        
         // APU runs at CPU clock rate
         for _ in 0..total_cycles {
             self.bus.step_apu();
@@ -180,7 +186,6 @@ impl Nes {
             save_state.cartridge_chr_bank,
         )?;
         
-        println!("State loaded from slot {} (ROM: {})", slot, save_state.rom_filename);
         Ok(())
     }
     
@@ -253,7 +258,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_level(log::LevelFilter::Info)
         .init();
         
-    println!("Starting NES emulator...");
 
     // Check for command line arguments first
     let args: Vec<String> = std::env::args().collect();
@@ -281,8 +285,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Mario title screen fix applied via proper $2007 implementation
 
-    println!("ROM loaded successfully: {}", selected_rom);
-    println!("Initializing SDL2 subsystems...");
     
     // Re-initialize audio subsystem for emulation
     let audio_subsystem = sdl_context.audio()?;
@@ -311,7 +313,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio_buffer_clone = audio_buffer.clone();
     
     let audio_device = audio_subsystem.open_playback(None, &desired_spec, |spec| {
-        println!("Audio spec: {:?}", spec);
         NesAudioCallback {
             audio_buffer: audio_buffer_clone,
             phase: 0.0,
@@ -319,10 +320,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     
     audio_device.resume();
-    println!("Audio device started");
     
     let mut event_pump = sdl_context.event_pump()?;
-    println!("Starting main emulation loop...");
     
     let frame_duration = Duration::from_nanos(16_666_667); // 60 FPS (1000ms / 60fps)
     let mut last_frame = Instant::now();
@@ -341,32 +340,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Ctrl + number keys for save states
                         match key {
                             Keycode::Num1 => {
-                                if let Err(e) = nes.save_state(1, "current_rom") {
-                                    println!("Save state error: {}", e);
-                                } else {
-                                    println!("Game saved to slot 1");
-                                }
+                                let _ = nes.save_state(1, "current_rom");
                             }
                             Keycode::Num2 => {
-                                if let Err(e) = nes.save_state(2, "current_rom") {
-                                    println!("Save state error: {}", e);
-                                } else {
-                                    println!("Game saved to slot 2");
-                                }
+                                let _ = nes.save_state(2, "current_rom");
                             }
                             Keycode::Num3 => {
-                                if let Err(e) = nes.save_state(3, "current_rom") {
-                                    println!("Save state error: {}", e);
-                                } else {
-                                    println!("Game saved to slot 3");
-                                }
+                                let _ = nes.save_state(3, "current_rom");
                             }
                             Keycode::Num4 => {
-                                if let Err(e) = nes.save_state(4, "current_rom") {
-                                    println!("Save state error: {}", e);
-                                } else {
-                                    println!("Game saved to slot 4");
-                                }
+                                let _ = nes.save_state(4, "current_rom");
                             }
                             _ => {}
                         }
@@ -374,32 +357,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Number keys without Ctrl for load states
                         match key {
                             Keycode::Num1 => {
-                                if let Err(e) = nes.load_state(1) {
-                                    println!("Load state error: {}", e);
-                                } else {
-                                    println!("Game loaded from slot 1");
-                                }
+                                let _ = nes.load_state(1);
                             }
                             Keycode::Num2 => {
-                                if let Err(e) = nes.load_state(2) {
-                                    println!("Load state error: {}", e);
-                                } else {
-                                    println!("Game loaded from slot 2");
-                                }
+                                let _ = nes.load_state(2);
                             }
                             Keycode::Num3 => {
-                                if let Err(e) = nes.load_state(3) {
-                                    println!("Load state error: {}", e);
-                                } else {
-                                    println!("Game loaded from slot 3");
-                                }
+                                let _ = nes.load_state(3);
                             }
                             Keycode::Num4 => {
-                                if let Err(e) = nes.load_state(4) {
-                                    println!("Load state error: {}", e);
-                                } else {
-                                    println!("Game loaded from slot 4");
-                                }
+                                let _ = nes.load_state(4);
                             }
                             _ => {
                                 // Normal controller input
@@ -434,6 +401,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
         }
+        
+        frame_count += 1;
         
         // Update texture with frame buffer
         texture.with_lock(None, |buffer: &mut [u8], _pitch: usize| {
