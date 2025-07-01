@@ -608,7 +608,7 @@ impl Ppu {
         }
     }
 
-    pub fn write_register(&mut self, addr: u16, data: u8, cartridge: Option<&crate::cartridge::Cartridge>) {
+    pub fn write_register(&mut self, addr: u16, data: u8, cartridge: Option<&crate::cartridge::Cartridge>) -> Option<(u16, u8)> {
         match addr {
             0x2000 => {
                 // PPU CONTROL register handling
@@ -700,6 +700,13 @@ impl Ppu {
                         
                         self.nametable[physical_nt][offset] = data;
                     }
+                } else if self.v < 0x2000 {
+                    // CHR writes to cartridge (for CHR RAM)
+                    // Return CHR write info for bus to handle
+                    let chr_addr = self.v;
+                    let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) { 32 } else { 1 };
+                    self.v = self.v.wrapping_add(increment);
+                    return Some((chr_addr, data));
                 }
                 
                 let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) { 32 } else { 1 };
@@ -707,6 +714,7 @@ impl Ppu {
             }
             _ => {}
         }
+        None
     }
 
     pub fn get_buffer(&self) -> &[u8] {

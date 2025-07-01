@@ -155,7 +155,14 @@ impl CpuBus for Bus {
         
         match addr {
             0x0000..=0x1FFF => self.memory.write(addr, data),
-            0x2000..=0x2007 => self.ppu.write_register(addr, data, self.cartridge.as_ref()),
+            0x2000..=0x2007 => {
+                if let Some((chr_addr, chr_data)) = self.ppu.write_register(addr, data, self.cartridge.as_ref()) {
+                    // Handle CHR write to cartridge
+                    if let Some(ref mut cartridge) = self.cartridge {
+                        cartridge.write_chr(chr_addr, chr_data);
+                    }
+                }
+            },
             0x4014 => {
                 let start = (data as u16) << 8;
                 // OAM DMA transfer
@@ -163,7 +170,12 @@ impl CpuBus for Bus {
                 // Perform DMA transfer immediately
                 for i in 0..256 {
                     let byte = self.read(start + i);
-                    self.ppu.write_register(0x2004, byte, self.cartridge.as_ref());
+                    if let Some((chr_addr, chr_data)) = self.ppu.write_register(0x2004, byte, self.cartridge.as_ref()) {
+                        // Handle CHR write during DMA (unlikely but possible)
+                        if let Some(ref mut cartridge) = self.cartridge {
+                            cartridge.write_chr(chr_addr, chr_data);
+                        }
+                    }
                 }
                 
                 // Set DMA in progress with cycle count
