@@ -57,66 +57,6 @@ impl Memory {
                     // Monitor zero page variables for game state changes
                     static mut CRITICAL_WRITE_COUNT: u32 = 0;
                     static mut LAST_GAME_STATE: [u8; 16] = [0xFF; 16]; // Track first 16 bytes
-                    unsafe {
-                        CRITICAL_WRITE_COUNT += 1;
-                        // Completely disable DQ3 monitoring - let ROM run natively
-                        // if CRITICAL_WRITE_COUNT <= 50 || LAST_GAME_STATE[effective_addr] != data {
-                        //     // Disabled DQ3 game state monitoring - let ROM run natively
-                        //     // Monitor critical game state changes for DQ3 title screen progression
-                        //     // if effective_addr <= 0x05 && LAST_GAME_STATE[effective_addr] != data {
-                        //     //     println!("DQ3: Game state change ${:02X}: ${:02X} -> ${:02X}", 
-                        //     //              effective_addr, LAST_GAME_STATE[effective_addr], data);
-                        //         
-                        //         // Disabled all DQ3 auto-transition logic
-                        //         // Enhanced title screen loop detection and auto-transition
-                        //         // static mut TITLE_LOOP_COUNT: u32 = 0;
-                        //         // static mut AUTO_TRANSITION_TRIGGERED: bool = false;
-                        //         // static mut TITLE_STABLE_COUNT: u32 = 0;
-                        //         // 
-                        //         // // Detect stable title screen state (indicates ready for transition)
-                        //         // if effective_addr == 0x01 {
-                        //         //     if LAST_GAME_STATE[1] == 0x07 && data == 0x00 {
-                        //         //         TITLE_LOOP_COUNT += 1;
-                        //         //         println!("DQ3: Title screen loop #{} completed", TITLE_LOOP_COUNT);
-                        //         //     }
-                        //         //     
-                        //         //     // Enhanced stability detection
-                        //         //     if data == 0x00 || data == 0x07 {
-                        //         //         TITLE_STABLE_COUNT += 1;
-                        //         //     } else {
-                        //         //         TITLE_STABLE_COUNT = 0;
-                        //         //     }
-                        //         // }
-                        //         // 
-                        //         // // Re-enable DQ3 transition assistance when START is pressed
-                        //         // // Check if START button causes state change but gets stuck
-                        //         // Disabled all forced state changes
-                        //         // if effective_addr == 0x04 && TITLE_LOOP_COUNT > 3 && !AUTO_TRANSITION_TRIGGERED {
-                        //         //     // Force DQ3 to progress if stuck in title loop
-                        //         //     AUTO_TRANSITION_TRIGGERED = true;
-                        //         //     println!("DQ3: Title screen stuck in loop, forcing adventure book transition");
-                        //         //     
-                        //         //     // Set DQ3 to adventure book selection state
-                        //         //     // This mimics what would happen after successful START button processing
-                        //         //     self.ram[0x01] = 0x08;  // Adventure book menu state
-                        //         //     self.ram[0x04] = 0x20;  // Adventure book selection screen ID
-                        //         //     self.ram[0x05] = 0x00;  // Clear any conflicting state
-                        //         //     
-                        //         //     println!("DQ3: Forced state: $01=0x08, $04=0x20 (adventure book screen)");
-                        //         // }
-                        //     // }
-                        //     // LAST_GAME_STATE[effective_addr] = data;
-                        // }
-                        
-                        // Special attention to specific addresses that might control screen flow
-                        match effective_addr {
-                            0x00 | 0x01 => {
-                            }
-                            0x10..=0x13 => {
-                            }
-                            _ => {}
-                        }
-                    }
                 } else if effective_addr <= 0x03 || (effective_addr >= 0x10 && effective_addr <= 0x13) || 
                    (effective_addr >= 0x20 && effective_addr <= 0x23) || (effective_addr >= 0x30 && effective_addr <= 0x33) ||
                    (effective_addr >= 0x40 && effective_addr <= 0x5F) {

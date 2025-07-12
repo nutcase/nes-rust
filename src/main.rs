@@ -140,69 +140,6 @@ impl Nes {
         self.bus.set_controller(controller);
     }
     
-    // New fine-grained step method for DQ3 compatibility
-    fn step_fine_grained(&mut self) -> bool {
-        // DMA handling in fine-grained mode
-        if self.bus.is_dma_in_progress() {
-            let dma_completed = self.bus.step_dma();
-            if dma_completed {
-                // DMA completed
-            }
-            // Still need to advance frame timing
-            self.cpu_cycles += 1;
-        } else {
-            // Execute one CPU instruction with immediate bus synchronization
-            self.bus.set_debug_pc(self.cpu.pc);
-            let instruction_executed = self.cpu.step_with_tick(&mut self.bus);
-            
-            if !instruction_executed {
-                // Fallback to regular step method for unhandled opcodes
-                self.bus.set_debug_pc(self.cpu.pc);
-                let cpu_cycles = self.cpu.step(&mut self.bus);
-                if cpu_cycles == 0 {
-                    return false;
-                }
-                
-                // Step PPU for the CPU cycles executed
-                for _ in 0..(cpu_cycles * 3) {
-                    let nmi = self.bus.step_ppu();
-                    if nmi {
-                        // Debug: Log PPU NMI generation for Goonies
-                        if self.bus.is_goonies() {
-                            static mut PPU_NMI_COUNT: u32 = 0;
-                            unsafe {
-                                PPU_NMI_COUNT += 1;
-                                if PPU_NMI_COUNT <= 5 {
-                                    println!("MAIN: PPU generated NMI #{} - calling CPU NMI handler", PPU_NMI_COUNT);
-                                }
-                            }
-                        }
-                        self.cpu.nmi(&mut self.bus);
-                    }
-                }
-                
-                self.cpu_cycles += cpu_cycles as u32;
-            } else {
-                // Advance frame timing - assume average 2-4 cycles per instruction
-                // Step PPU for assumed cycles
-                for _ in 0..(3 * 3) { // 3 CPU cycles * 3 PPU cycles per CPU cycle
-                    let nmi = self.bus.step_ppu();
-                    if nmi {
-                        self.cpu.nmi(&mut self.bus);
-                    }
-                }
-                self.cpu_cycles += 3;
-            }
-        }
-        
-        // Check for frame completion based on cycle count
-        if self.cpu_cycles >= CPU_CYCLES_PER_FRAME {
-            self.cpu_cycles -= CPU_CYCLES_PER_FRAME;
-            true
-        } else {
-            false
-        }
-    }
 
     pub fn save_state(&self, slot: u8, rom_filename: &str) -> Result<(), Box<dyn std::error::Error>> {
         let save_state = save_state::SaveState {
