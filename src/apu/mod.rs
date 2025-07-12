@@ -215,9 +215,7 @@ impl Apu {
             // Generate IRQ in 4-step mode when IRQ is enabled - but not if already pending
             if !self.frame_mode && !self.irq_disable && !self.frame_irq {
                 self.frame_irq = true;
-                if self.cycle_count % 50000 == 0 { // Reduce log spam
-                    println!("APU: Frame IRQ generated at cycle {}", self.cycle_count);
-                }
+                // APU Frame IRQ generated (logging disabled)
             }
         }
     }
@@ -263,17 +261,19 @@ impl Apu {
     
     fn mix_channels_high_quality(&mut self) -> f32 {
         // Get raw outputs (simple 0.0 to 1.0 range)
-        let pulse1_out = if self.pulse1_enabled { self.pulse1.output() } else { 0.0 };
-        let pulse2_out = if self.pulse2_enabled { self.pulse2.output() } else { 0.0 };
-        let triangle_out = if self.triangle_enabled { self.triangle.output() } else { 0.0 };
-        let noise_out = if self.noise_enabled { self.noise.output() } else { 0.0 };
+        let pulse1_out = if self.pulse1_enabled && self.pulse1.length_counter > 0 { self.pulse1.output() } else { 0.0 };
+        let pulse2_out = if self.pulse2_enabled && self.pulse2.length_counter > 0 { self.pulse2.output() } else { 0.0 };
+        let triangle_out = if self.triangle_enabled && self.triangle.length_counter > 0 { self.triangle.output() } else { 0.0 };
+        let noise_out = if self.noise_enabled && self.noise.length_counter > 0 { self.noise.output() } else { 0.0 };
         
+        // Much quieter mixing to prevent audio artifacts
+        let mixed = pulse1_out * 0.08 + pulse2_out * 0.08 + triangle_out * 0.12 + noise_out * 0.06;
         
-        // Bass-optimized mixing for proper "BON" sounds
-        let mixed = pulse1_out * 0.25 + pulse2_out * 0.25 + triangle_out * 0.35 + noise_out * 0.15;
+        // Apply gentle low-pass filtering to reduce harshness
+        let filtered = mixed * 0.7;
         
-        // Direct output without complex processing
-        mixed.clamp(-1.0, 1.0)
+        // Gentle clipping to prevent distortion
+        filtered.clamp(-0.5, 0.5)
     }
     
     fn mix_channels_improved(&self) -> f32 {

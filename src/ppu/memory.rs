@@ -72,6 +72,14 @@ impl PpuMemory {
             crate::cartridge::Mirroring::FourScreen => {
                 // All four nametables are separate (but we only have 2)
                 (table % 2) as usize
+            },
+            crate::cartridge::Mirroring::OneScreenLower => {
+                // All nametables map to nametable 0
+                0
+            },
+            crate::cartridge::Mirroring::OneScreenUpper => {
+                // All nametables map to nametable 1
+                1
             }
         }
     }

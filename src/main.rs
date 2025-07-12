@@ -5,6 +5,7 @@ mod memory;
 mod cartridge;
 mod bus;
 mod save_state;
+mod sram;
 
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,7 @@ pub struct Nes {
     cpu: Cpu,
     bus: Bus,
     cpu_cycles: u32,
+    current_rom_path: Option<String>,
 }
 
 impl Nes {
@@ -30,18 +32,46 @@ impl Nes {
             cpu: Cpu::new(),
             bus: Bus::new(),
             cpu_cycles: 0,
+            current_rom_path: None,
         }
     }
 
     pub fn load_rom(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let cartridge = Cartridge::load(path)?;
+        let mut cartridge = Cartridge::load(path)?;
+        
+        // Load SRAM data if exists
+        if cartridge.has_battery_save() {
+            if let Ok(Some(sram_data)) = sram::load_sram(path) {
+                cartridge.set_sram_data(sram_data);
+            } else {
+                // No existing save data found - initialize DQ3 save data if needed
+                if path.to_lowercase().contains("dragon") || path.to_lowercase().contains("quest") || path.to_lowercase().contains("dq3") {
+                    cartridge.init_dq3_save_data();
+                }
+            }
+        }
+        
         self.bus.load_cartridge(cartridge);
         self.cpu.reset(&mut self.bus);
+        self.current_rom_path = Some(path.to_string());
+        Ok(())
+    }
+    
+    pub fn save_sram(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(ref rom_path) = self.current_rom_path {
+            if let Some(sram_data) = self.bus.get_sram_data() {
+                sram::save_sram(rom_path, &sram_data)?;
+                println!("SRAM saved successfully");
+            } else {
+                // No valid save data yet - this is normal for fresh start
+            }
+        }
         Ok(())
     }
 
     pub fn step(&mut self) -> bool {
-        let mut total_cycles = 0u32;
+        
+        let total_cycles: u32;
         
         // If DMA is in progress, don't execute CPU instruction
         if self.bus.is_dma_in_progress() {
@@ -53,6 +83,7 @@ impl Nes {
             }
         } else {
             // Normal CPU execution
+            self.bus.set_debug_pc(self.cpu.pc);
             let cpu_cycles = self.cpu.step(&mut self.bus);
             
             // Safety check for zero cycles
@@ -61,18 +92,60 @@ impl Nes {
             }
             
             total_cycles = cpu_cycles as u32;
-        }
-        
-        let mut nmi_triggered = false;
-        for _ in 0..total_cycles * 3 {
-            let nmi = self.bus.step_ppu();
-            if nmi {
-                nmi_triggered = true;
+            
+            // For DQ3 mode: Enhanced timing synchronization for title screen progression
+            if self.bus.is_dq3_mode() {
+                // Process title screen state and handle automatic transitions
+                self.bus.process_dq3_title_screen_logic();
+                
+                let nmi_triggered = self.bus.tick(cpu_cycles);
+                if nmi_triggered {
+                    self.cpu.nmi(&mut self.bus);
+                }
+                // Continue to normal PPU/APU stepping for DQ3 screen display
+                // Don't skip PPU steps - this was preventing screen rendering!
             }
         }
         
+        let mut nmi_triggered = false;
+        let mut _nmi_count = 0;
+        let ppu_cycles = total_cycles * 3;
+        
+        // Enhanced DQ3 timing: Process PPU cycles with proper NMI timing for title screen
+        if self.bus.is_dq3_mode() {
+            // DQ3-specific PPU processing with enhanced title screen support
+            for _cycle in 0..ppu_cycles {
+                let nmi = self.bus.step_ppu();
+                if nmi {
+                    // Enhanced NMI handling for DQ3 title screen timing
+                    nmi_triggered = true;
+                    _nmi_count += 1;
+                    
+                    // Process title screen state on each NMI for precise timing
+                    self.bus.on_nmi_title_screen_check();
+                }
+            }
+        } else {
+            // Normal mode: process all PPU cycles at once
+            for _cycle in 0..ppu_cycles {
+                let nmi = self.bus.step_ppu();
+                if nmi {
+                    nmi_triggered = true;
+                    _nmi_count += 1;
+                }
+            }
+        }
+        
+        // Only process one NMI per CPU instruction (prevent double NMI)
         if nmi_triggered {
+            // Enhanced DQ3 NMI processing with title screen state tracking
+            if self.bus.is_dq3_mode() {
+                self.bus.pre_nmi_dq3_processing();
+            }
             self.cpu.nmi(&mut self.bus);
+            if self.bus.is_dq3_mode() {
+                self.bus.post_nmi_dq3_processing();
+            }
         }
         
         // Check for APU Frame IRQ
@@ -106,6 +179,70 @@ impl Nes {
 
     pub fn set_controller(&mut self, controller: u8) {
         self.bus.set_controller(controller);
+    }
+    
+    // New fine-grained step method for DQ3 compatibility
+    fn step_fine_grained(&mut self) -> bool {
+        // DMA handling in fine-grained mode
+        if self.bus.is_dma_in_progress() {
+            let dma_completed = self.bus.step_dma();
+            if dma_completed {
+                // DMA completed
+            }
+            // Still need to advance frame timing
+            self.cpu_cycles += 1;
+        } else {
+            // Execute one CPU instruction with immediate bus synchronization
+            self.bus.set_debug_pc(self.cpu.pc);
+            let instruction_executed = self.cpu.step_with_tick(&mut self.bus);
+            
+            if !instruction_executed {
+                // Fallback to regular step method for unhandled opcodes
+                self.bus.set_debug_pc(self.cpu.pc);
+                let cpu_cycles = self.cpu.step(&mut self.bus);
+                if cpu_cycles == 0 {
+                    return false;
+                }
+                
+                // Step PPU for the CPU cycles executed
+                for _ in 0..(cpu_cycles * 3) {
+                    let nmi = self.bus.step_ppu();
+                    if nmi {
+                        // Debug: Log PPU NMI generation for Goonies
+                        if self.bus.is_goonies() {
+                            static mut PPU_NMI_COUNT: u32 = 0;
+                            unsafe {
+                                PPU_NMI_COUNT += 1;
+                                if PPU_NMI_COUNT <= 5 {
+                                    println!("MAIN: PPU generated NMI #{} - calling CPU NMI handler", PPU_NMI_COUNT);
+                                }
+                            }
+                        }
+                        self.cpu.nmi(&mut self.bus);
+                    }
+                }
+                
+                self.cpu_cycles += cpu_cycles as u32;
+            } else {
+                // Advance frame timing - assume average 2-4 cycles per instruction
+                // Step PPU for assumed cycles
+                for _ in 0..(3 * 3) { // 3 CPU cycles * 3 PPU cycles per CPU cycle
+                    let nmi = self.bus.step_ppu();
+                    if nmi {
+                        self.cpu.nmi(&mut self.bus);
+                    }
+                }
+                self.cpu_cycles += 3;
+            }
+        }
+        
+        // Check for frame completion based on cycle count
+        if self.cpu_cycles >= CPU_CYCLES_PER_FRAME {
+            self.cpu_cycles -= CPU_CYCLES_PER_FRAME;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn save_state(&self, slot: u8, rom_filename: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -199,7 +336,6 @@ fn show_rom_selection() -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
     use std::io::{self, Write};
     
-    println!("=== NES Emulator ROM Selection ===");
     
     // Scan roms directory for .nes files
     let roms_path = Path::new("roms");
@@ -229,9 +365,9 @@ fn show_rom_selection() -> Result<String, Box<dyn std::error::Error>> {
     
     rom_files.sort_by(|a, b| a.0.cmp(&b.0));
     
-    println!("Available ROM files:");
+    println!("Available ROMs:");
     for (i, (name, _)) in rom_files.iter().enumerate() {
-        println!("  {}. {}", i + 1, name);
+        println!("{}. {}", i + 1, name);
     }
     
     loop {
@@ -243,12 +379,10 @@ fn show_rom_selection() -> Result<String, Box<dyn std::error::Error>> {
         
         if let Ok(choice) = input.trim().parse::<usize>() {
             if choice >= 1 && choice <= rom_files.len() {
-                println!("Selected: {}", rom_files[choice - 1].0);
                 return Ok(rom_files[choice - 1].1.clone());
             }
         }
         
-        println!("Invalid selection. Please enter a number between 1 and {}", rom_files.len());
     }
 }
 
@@ -278,9 +412,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let mut nes = Nes::new();
     
-    if let Err(e) = nes.load_rom(&selected_rom) {
-        eprintln!("Failed to load ROM: {}", e);
+    if let Err(_e) = nes.load_rom(&selected_rom) {
         std::process::exit(1);
+    }
+    
+    // Debug: Check if Goonies was loaded
+    if nes.bus.is_goonies() {
+        println!("MAIN: Goonies ROM loaded successfully");
     }
 
     // Mario title screen fix applied via proper $2007 implementation
@@ -297,6 +435,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     
     let mut canvas = window.into_canvas().build()?;
+    // Set canvas clear color to black instead of default (cyan)
+    canvas.set_draw_color(sdl2::pixels::Color::RGB(5, 5, 5));
     let texture_creator = canvas.texture_creator();
     
     let mut texture = texture_creator
@@ -312,7 +452,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio_buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
     let audio_buffer_clone = audio_buffer.clone();
     
-    let audio_device = audio_subsystem.open_playback(None, &desired_spec, |spec| {
+    let audio_device = audio_subsystem.open_playback(None, &desired_spec, |_spec| {
         NesAudioCallback {
             audio_buffer: audio_buffer_clone,
             phase: 0.0,
@@ -325,14 +465,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let frame_duration = Duration::from_nanos(16_666_667); // 60 FPS (1000ms / 60fps)
     let mut last_frame = Instant::now();
-    let mut frame_count = 0;
+    let mut _frame_count = 0;
     let _start_time = Instant::now();
+    let mut frames_since_save = 0u32;
     
     'running: loop {
-        // Handle events
+        // Handle events  
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
+                    // Save SRAM before quitting
+                    if let Err(e) = nes.save_sram() {
+                        eprintln!("Failed to save SRAM: {}", e);
+                    }
                     break 'running;
                 }
                 Event::KeyDown { keycode: Some(key), keymod, .. } => {
@@ -369,7 +514,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = nes.load_state(4);
                             }
                             _ => {
-                                // Normal controller input
                                 let controller = map_key_to_controller(key, nes.get_controller());
                                 nes.set_controller(controller);
                             }
@@ -402,7 +546,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        frame_count += 1;
+        _frame_count += 1;
+        frames_since_save += 1;
+        
+        // Save SRAM every 30 seconds (1800 frames at 60 FPS) - reduced frequency
+        if frames_since_save >= 1800 {
+            let _ = nes.save_sram(); // Only save if valid save data exists
+            frames_since_save = 0;
+        }
         
         // Update texture with frame buffer
         texture.with_lock(None, |buffer: &mut [u8], _pitch: usize| {
@@ -426,8 +577,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         canvas.clear();
         canvas.copy(&texture, None, None)?;
         canvas.present();
-        
-        frame_count += 1;
         
         // Frame timing
         let now = Instant::now();
