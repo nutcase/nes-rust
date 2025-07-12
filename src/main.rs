@@ -43,11 +43,6 @@ impl Nes {
         if cartridge.has_battery_save() {
             if let Ok(Some(sram_data)) = sram::load_sram(path) {
                 cartridge.set_sram_data(sram_data);
-            } else {
-                // No existing save data found - initialize DQ3 save data if needed
-                if path.to_lowercase().contains("dragon") || path.to_lowercase().contains("quest") || path.to_lowercase().contains("dq3") {
-                    cartridge.init_dq3_save_data();
-                }
             }
         }
         
@@ -92,60 +87,24 @@ impl Nes {
             }
             
             total_cycles = cpu_cycles as u32;
-            
-            // For DQ3 mode: Enhanced timing synchronization for title screen progression
-            if self.bus.is_dq3_mode() {
-                // Process title screen state and handle automatic transitions
-                self.bus.process_dq3_title_screen_logic();
-                
-                let nmi_triggered = self.bus.tick(cpu_cycles);
-                if nmi_triggered {
-                    self.cpu.nmi(&mut self.bus);
-                }
-                // Continue to normal PPU/APU stepping for DQ3 screen display
-                // Don't skip PPU steps - this was preventing screen rendering!
-            }
         }
         
         let mut nmi_triggered = false;
         let mut _nmi_count = 0;
         let ppu_cycles = total_cycles * 3;
         
-        // Enhanced DQ3 timing: Process PPU cycles with proper NMI timing for title screen
-        if self.bus.is_dq3_mode() {
-            // DQ3-specific PPU processing with enhanced title screen support
-            for _cycle in 0..ppu_cycles {
-                let nmi = self.bus.step_ppu();
-                if nmi {
-                    // Enhanced NMI handling for DQ3 title screen timing
-                    nmi_triggered = true;
-                    _nmi_count += 1;
-                    
-                    // Process title screen state on each NMI for precise timing
-                    self.bus.on_nmi_title_screen_check();
-                }
-            }
-        } else {
-            // Normal mode: process all PPU cycles at once
-            for _cycle in 0..ppu_cycles {
-                let nmi = self.bus.step_ppu();
-                if nmi {
-                    nmi_triggered = true;
-                    _nmi_count += 1;
-                }
+        // Process all PPU cycles
+        for _cycle in 0..ppu_cycles {
+            let nmi = self.bus.step_ppu();
+            if nmi {
+                nmi_triggered = true;
+                _nmi_count += 1;
             }
         }
         
         // Only process one NMI per CPU instruction (prevent double NMI)
         if nmi_triggered {
-            // Enhanced DQ3 NMI processing with title screen state tracking
-            if self.bus.is_dq3_mode() {
-                self.bus.pre_nmi_dq3_processing();
-            }
             self.cpu.nmi(&mut self.bus);
-            if self.bus.is_dq3_mode() {
-                self.bus.post_nmi_dq3_processing();
-            }
         }
         
         // Check for APU Frame IRQ

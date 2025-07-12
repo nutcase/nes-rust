@@ -845,6 +845,11 @@ impl Cartridge {
         self.mapper_number() == 1 && self.prg_rom_size() == 256 * 1024
     }
     
+    pub fn should_load_dq3_adventure_book_graphics(&self) -> bool {
+        // Load adventure book graphics when DQ3 is detected and CHR-RAM needs initialization
+        self.is_dq3_detected() && self.chr_ram.len() > 0 && self.chr_ram.iter().all(|&b| b == 0)
+    }
+    
     pub fn get_chr_data(&self) -> &Vec<u8> {
         &self.chr_ram
     }

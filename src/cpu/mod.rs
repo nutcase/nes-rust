@@ -60,22 +60,6 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut dyn CpuBus) -> u8 {
-        // DQ3 Advanced Title Screen Progression System
-        // Implements CPU instruction-level intervention for automatic progression
-        static mut PC_HISTORY: [u16; 10] = [0; 10];
-        static mut PC_HISTORY_INDEX: usize = 0;
-        static mut DQ3_TITLE_LOOP_DETECTED: bool = false;
-        static mut DQ3_TITLE_LOOP_COUNT: u32 = 0;
-        static mut DQ3_INTERVENTION_TRIGGERED: bool = false;
-        
-        unsafe {
-            // Update PC history for loop detection
-            PC_HISTORY[PC_HISTORY_INDEX] = self.pc;
-            PC_HISTORY_INDEX = (PC_HISTORY_INDEX + 1) % 10;
-            
-            // Conservative DQ3 monitoring - disabled aggressive detection to preserve title screen
-            // Only rely on simple PC-based loop counting for minimal interference
-        }
         
         // Read opcode first for stack protection logic
         let opcode = bus.read(self.pc);
@@ -117,72 +101,10 @@ impl Cpu {
         //     // Stack protection code disabled for Goonies compatibility
         // }
         
-        // DISABLED: Low PC safety check was preventing DQ3's natural title→adventure book transition
-        // DQ3 may legitimately use low addresses during screen transitions
-        // if self.pc < 0x0020 && self.pc != 0x0021 {
-        //     self.reset(bus);
-        //     return 2;
-        // }
-        
-        // DQ3 Critical Path Analysis: Monitor key execution points
-        
-        // DQ3 title loop detection disabled - let game handle natural flow
-        // if self.pc == 0x0021 {
-        //     // Detection disabled to allow proper save screen display
-        // }
-        
-        // DISABLED: $FFFF recovery was potentially interfering with DQ3's transition logic
-        // if self.pc == 0xFFFF {
-        //     self.reset(bus);
-        //     return 2;
-        // }
         
         
         let _old_pc = self.pc;
         
-        
-        // Disabled all DQ3 intervention - let ROM run natively
-        // DQ3 Instruction-Level Intervention Point
-        // unsafe {
-        //     if DQ3_TITLE_LOOP_DETECTED && !DQ3_INTERVENTION_TRIGGERED {
-        //         // Check if we should trigger intervention based on game state
-        //         let game_state_1 = bus.read(0x0001);
-        //         let game_state_4 = bus.read(0x0004);
-        //         
-        //         // DISABLED: CPU-level intervention may be interfering with title screen display
-        //         // if DQ3_TITLE_LOOP_COUNT > 30 {
-        //         //     DQ3_INTERVENTION_TRIGGERED = true;
-        //         //     println!("DQ3: CRITICAL CPU INTERVENTION - Breaking title loop after {} iterations", DQ3_TITLE_LOOP_COUNT);
-        //         //     
-        //         //     // Execute the most aggressive intervention
-        //         //     self.execute_dq3_title_intervention(bus);
-        //         //     println!("DQ3: CPU-level intervention executed - forcing adventure book progression");
-        //         // }
-        //     }
-        // }
-        
-        // Disabled all DQ3 debug tracking - let ROM run natively
-        // Debug: Track where DQ3 execution stops after title screen
-        // static mut DEBUG_COUNT: u32 = 0;
-        // static mut LAST_PC: u16 = 0;
-        // unsafe {
-        //     DEBUG_COUNT += 1;
-        //     
-        //     // Check for infinite loops
-        //     if self.pc == LAST_PC && DEBUG_COUNT > 1000 {
-        //         static mut LOOP_COUNT: u32 = 0;
-        //         LOOP_COUNT += 1;
-        //         if LOOP_COUNT % 10000 == 0 {
-        //             println!("DQ3 LOOP: Stuck at PC=${:04X} opcode=${:02X} (loop #{})", self.pc, opcode, LOOP_COUNT);
-        //         }
-        //     }
-        //     
-        //     if DEBUG_COUNT % 1000 == 0 && DEBUG_COUNT <= 50000 {
-        //         println!("DQ3 CPU: PC=${:04X} opcode=${:02X} #{}", self.pc, opcode, DEBUG_COUNT);
-        //     }
-        //     
-        //     LAST_PC = self.pc;
-        // }
         
         // Increment PC for most instructions - special ones handle it themselves
         self.pc = self.pc.wrapping_add(1);

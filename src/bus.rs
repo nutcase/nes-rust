@@ -399,22 +399,6 @@ impl Bus {
         Ok(())
     }
     
-    pub fn schedule_dq3_graphics_loading(&mut self) {
-        // Disabled - no special graphics loading
-    }
-    
-    pub fn check_dq3_graphics_loading(&mut self) {
-        // Disabled - no special processing
-    }
-    
-    // DQ3-specific methods (disabled)
-    pub fn is_dq3_mode(&self) -> bool {
-        if let Some(ref cartridge) = self.cartridge {
-            cartridge.mapper_number() == 1 && cartridge.prg_rom_size() == 256 * 1024
-        } else {
-            false
-        }
-    }
     
     pub fn get_sram_data(&self) -> Option<Vec<u8>> {
         if let Some(ref cartridge) = self.cartridge {
@@ -424,32 +408,6 @@ impl Bus {
         }
     }
     
-    pub fn process_dq3_title_screen_logic(&mut self) {
-        // DISABLED: Don't load adventure book fonts that overwrite DRAGON tiles
-        // Original DRAGON text uses tile IDs 0x0E, 0x1C, 0x0B, 0x11, 0x19, 0x18
-        // which are the same as adventure book tiles, causing corruption
-        if false && self.ppu.dq3_font_load_needed {
-            if let Some(ref mut cartridge) = self.cartridge {
-                cartridge.load_dq3_adventure_book_tiles();
-                self.ppu.dq3_font_load_needed = false;
-            }
-        }
-        
-        // DISABLED: Don't force reload DRAGON fonts - use natural ROM state
-        // Let ROM data remain in its original state for proper title screen display
-    }
-    
-    pub fn on_nmi_title_screen_check(&mut self) {
-        // Disabled
-    }
-    
-    pub fn pre_nmi_dq3_processing(&mut self) {
-        // Disabled
-    }
-    
-    pub fn post_nmi_dq3_processing(&mut self) {
-        // Disabled
-    }
 }
 
 // Implement the new tick-enabled trait
