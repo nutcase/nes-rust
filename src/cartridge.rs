@@ -1,0 +1,483 @@
+#![cfg_attr(not(feature = "dev"), allow(dead_code))]
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct CartridgeHeader {
+    pub title: String,
+    pub mapper_type: MapperType,
+    pub rom_size: usize,
+    pub ram_size: usize,
+    pub country: u8,
+    pub developer: u8,
+    pub version: u8,
+    pub checksum: u16,
+    pub checksum_complement: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MapperType {
+    LoRom,
+    HiRom,
+    ExHiRom,
+    SuperFx,
+    Sa1,
+    DragonQuest3, // ドラクエ3専用マッパー（エンハンスメントチップ0x30対応）
+}
+
+#[allow(dead_code)]
+pub struct Cartridge {
+    pub rom: Vec<u8>,
+    pub header: CartridgeHeader,
+    pub has_header: bool,
+}
+
+impl Cartridge {
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let mut file = File::open(path).map_err(|e| format!("Failed to open ROM file: {}", e))?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .map_err(|e| format!("Failed to read ROM file: {}", e))?;
+
+        Self::load_from_bytes(data)
+    }
+
+    pub fn load_from_bytes(mut data: Vec<u8>) -> Result<Self, String> {
+        if data.is_empty() {
+            return Err("ROM file is empty".to_string());
+        }
+
+        let has_header = data.len() % 1024 == 512;
+
+        if has_header {
+            data.drain(0..512);
+        }
+
+        let header = Self::parse_header(&data)?;
+
+        Ok(Cartridge {
+            rom: data,
+            header,
+            has_header,
+        })
+    }
+
+    fn parse_header(rom: &[u8]) -> Result<CartridgeHeader, String> {
+        // Try both HiROM and LoROM locations and pick the one with best score
+        let (header_offset, detected_mapper) = Self::detect_mapper_and_location(rom)?;
+
+        if rom.len() <= header_offset + 0x2F {
+            return Err("ROM too small to contain header".to_string());
+        }
+
+        // Extract and validate title (21 characters max)
+        // Title starts at header base + 0x10 (LoROM: 0x7FC0, HiROM: 0xFFC0)
+        let title_bytes = &rom[header_offset + 0x10..header_offset + 0x10 + 21];
+        let title = Self::extract_title(title_bytes);
+
+        // Validate title contains printable ASCII
+        if !Self::is_valid_title(&title) && !crate::debug_flags::quiet() {
+            println!(
+                "Warning: ROM title contains non-printable characters: {:?}",
+                title
+            );
+        }
+
+        // Parse ROM type (a.k.a. cartridge type)
+        // Cartridge type is at header base + 0x15 (relative to 0x7FC0/0xFFC0).
+        // Our header base is 0x7FB0/0xFFB0, so offset is +0x25 from this base.
+        let rom_type = rom[header_offset + 0x25];
+        let mapper_type = Self::determine_mapper_type(rom_type, detected_mapper);
+
+        // Enhanced mapper validation
+        Self::validate_mapper_compatibility(rom_type, &mapper_type)?;
+
+        // Parse and validate ROM size
+        let rom_size_code = rom[header_offset + 0x27];
+        let rom_size = Self::decode_rom_size(rom_size_code)?;
+
+        // Validate ROM size against actual file size
+        Self::validate_rom_size(rom.len(), rom_size)?;
+
+        // Parse and validate RAM size
+        let ram_size_code = rom[header_offset + 0x28];
+        let ram_size = Self::decode_ram_size(ram_size_code);
+
+        let country = rom[header_offset + 0x29];
+        let developer = rom[header_offset + 0x2A];
+        let version = rom[header_offset + 0x2B];
+
+        // Parse checksums
+        let checksum_complement =
+            ((rom[header_offset + 0x2D] as u16) << 8) | (rom[header_offset + 0x2C] as u16);
+        let checksum =
+            ((rom[header_offset + 0x2F] as u16) << 8) | (rom[header_offset + 0x2E] as u16);
+
+        // Validate checksums
+        Self::validate_checksums(checksum, checksum_complement)?;
+
+        // Calculate and verify actual ROM checksum
+        let calculated_checksum = Self::calculate_rom_checksum(rom);
+        if calculated_checksum != checksum && !crate::debug_flags::quiet() {
+            println!(
+                "Warning: Stored checksum (0x{:04X}) doesn't match calculated checksum (0x{:04X})",
+                checksum, calculated_checksum
+            );
+        }
+
+        Ok(CartridgeHeader {
+            title,
+            mapper_type,
+            rom_size,
+            ram_size,
+            country,
+            developer,
+            version,
+            checksum,
+            checksum_complement,
+        })
+    }
+
+    fn detect_mapper_and_location(rom: &[u8]) -> Result<(usize, MapperType), String> {
+        if rom.len() < 0x10000 {
+            return Err("ROM too small for SNES format".to_string());
+        }
+
+        // Special-case: Dragon Quest III (ROM type 0x31) — prefer the header location
+        // that actually contains 0x31 and use the dedicated mapper.
+        let lo_hdr = 0x7FB0;
+        let hi_hdr = 0xFFB0;
+        if rom.len() > hi_hdr + 0x30 {
+            let lo_type = rom[lo_hdr + 0x25];
+            let hi_type = rom[hi_hdr + 0x25];
+            if hi_type == 0x31 {
+                return Ok((hi_hdr, MapperType::DragonQuest3));
+            }
+            if lo_type == 0x31 {
+                return Ok((lo_hdr, MapperType::DragonQuest3));
+            }
+        }
+
+        // ROM type 0x31 はLoROMのヘッダ位置を優先（標準LoROM検出を使う）
+
+        let lorom_score = Self::score_header(rom, lo_hdr);
+        let hirom_score = Self::score_header(rom, hi_hdr);
+        let exhirom_score = if rom.len() >= 0x40FFB0 + 0x30 {
+            Self::score_header(rom, 0x40FFB0)
+        } else {
+            0
+        };
+
+        // Determine best match
+        if exhirom_score >= hirom_score && exhirom_score >= lorom_score && exhirom_score > 6 {
+            Ok((0x40FFB0, MapperType::ExHiRom))
+        } else if hirom_score > lorom_score && hirom_score > 4 {
+            Ok((0xFFB0, MapperType::HiRom))
+        } else if lorom_score > 4 {
+            Ok((0x7FB0, MapperType::LoRom))
+        } else {
+            // Fallback to LoROM if scores are low
+            if !crate::debug_flags::quiet() {
+                println!("Warning: Low header scores, defaulting to LoROM");
+            }
+            Ok((0x7FB0, MapperType::LoRom))
+        }
+    }
+
+    fn extract_title(title_bytes: &[u8]) -> String {
+        // Convert to string, handling both ASCII and Shift-JIS
+        let mut title = String::new();
+        for &byte in title_bytes {
+            if byte == 0x00 {
+                break; // Null terminator
+            } else if (0x20..=0x7E).contains(&byte) {
+                title.push(byte as char); // ASCII printable
+            } else if byte >= 0x80 {
+                title.push('?'); // Non-ASCII, replace with placeholder
+            }
+        }
+        title.trim().to_string()
+    }
+
+    fn is_valid_title(title: &str) -> bool {
+        !title.is_empty() && title.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+    }
+
+    fn determine_mapper_type(rom_type: u8, detected: MapperType) -> MapperType {
+        // Use detected mapper as base, but check for special cases
+        let chip_type = rom_type & 0x0F;
+        let _enhancement_chip = rom_type & 0xF0;
+
+        // 可能な限りヘッダスコアの検出結果（detected）を優先し、
+        // 強制的なマッピング上書きは避ける。
+        // Special-case full type byte first
+        if rom_type == 0x31 {
+            return MapperType::DragonQuest3;
+        }
+
+        match chip_type {
+            0x1A => MapperType::SuperFx, // Super FX chip
+            0x34 => MapperType::Sa1,     // SA-1 chip
+            0x05 => MapperType::ExHiRom, // 一部拡張HiROM
+            _ => detected,               // それ以外はスコア検出に従う
+        }
+    }
+
+    fn validate_mapper_compatibility(rom_type: u8, mapper_type: &MapperType) -> Result<(), String> {
+        let has_enhancement_chip = rom_type & 0xF0 != 0x00;
+
+        match mapper_type {
+            MapperType::SuperFx => {
+                if rom_type != 0x1A {
+                    return Err("SuperFX mapper requires ROM type 0x1A".to_string());
+                }
+            }
+            MapperType::Sa1 => {
+                if rom_type != 0x34 {
+                    return Err("SA-1 mapper requires ROM type 0x34".to_string());
+                }
+            }
+            _ => {
+                if has_enhancement_chip && !crate::debug_flags::quiet() {
+                    println!("Warning: ROM has enhancement chip (type: 0x{:02X}) but using standard mapper", rom_type);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn decode_rom_size(size_code: u8) -> Result<usize, String> {
+        match size_code {
+            0x08 => Ok(256 * 1024),  // 256KB
+            0x09 => Ok(512 * 1024),  // 512KB
+            0x0A => Ok(1024 * 1024), // 1MB
+            0x0B => Ok(2048 * 1024), // 2MB
+            0x0C => Ok(4096 * 1024), // 4MB
+            0x0D => Ok(8192 * 1024), // 8MB
+            _ => {
+                if size_code <= 0x0F {
+                    // Try standard formula: 1KB << size_code
+                    Ok(1024 << size_code)
+                } else {
+                    Err(format!("Invalid ROM size code: 0x{:02X}", size_code))
+                }
+            }
+        }
+    }
+
+    fn decode_ram_size(size_code: u8) -> usize {
+        match size_code {
+            0x00 => 0,
+            0x01 => 2 * 1024,    // 2KB
+            0x02 => 8 * 1024,    // 8KB
+            0x03 => 32 * 1024,   // 32KB
+            0x04 => 128 * 1024,  // 128KB
+            0x05 => 256 * 1024,  // 256KB
+            0x06 => 512 * 1024,  // 512KB
+            0x07 => 1024 * 1024, // 1MB
+            _ => {
+                if size_code <= 0x0C {
+                    1024 << size_code // Standard formula
+                } else {
+                    8 * 1024 // Default to 8KB for unknown values
+                }
+            }
+        }
+    }
+
+    fn validate_rom_size(actual_size: usize, header_size: usize) -> Result<(), String> {
+        // Allow some tolerance for header variations
+        let tolerance = 0x200; // 512 bytes tolerance
+
+        if (actual_size + tolerance < header_size || actual_size > header_size + tolerance)
+            && !crate::debug_flags::quiet()
+        {
+            println!(
+                "Warning: ROM file size ({} bytes) doesn't match header size ({} bytes)",
+                actual_size, header_size
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_checksums(checksum: u16, checksum_complement: u16) -> Result<(), String> {
+        if checksum ^ checksum_complement != 0xFFFF {
+            return Err(format!(
+                "Invalid checksums: 0x{:04X} ^ 0x{:04X} != 0xFFFF",
+                checksum, checksum_complement
+            ));
+        }
+        Ok(())
+    }
+
+    fn calculate_rom_checksum(rom: &[u8]) -> u16 {
+        let mut sum = 0u32;
+
+        // Calculate checksum of entire ROM
+        for &byte in rom.iter() {
+            sum = sum.wrapping_add(byte as u32);
+        }
+
+        (sum & 0xFFFF) as u16
+    }
+
+    // Legacy function - now using detect_mapper_and_location instead
+    fn detect_hirom(rom: &[u8]) -> bool {
+        if rom.len() < 0x10000 {
+            return false;
+        }
+
+        let lorom_score = Self::score_header(rom, 0x7FB0);
+        let hirom_score = Self::score_header(rom, 0xFFB0);
+
+        hirom_score > lorom_score
+    }
+
+    fn score_header(rom: &[u8], offset: usize) -> u32 {
+        if offset + 0x2F >= rom.len() {
+            return 0;
+        }
+
+        let mut score: u32 = 0;
+
+        let checksum = ((rom[offset + 0x2F] as u16) << 8) | (rom[offset + 0x2E] as u16);
+        let checksum_complement = ((rom[offset + 0x2D] as u16) << 8) | (rom[offset + 0x2C] as u16);
+
+        if checksum ^ checksum_complement == 0xFFFF {
+            score += 8;
+        }
+
+        // Cartridge type is at header base + 0x15; our base (0x7FB0/0xFFB0) is 0x10 bytes earlier
+        let rom_type = rom[offset + 0x25];
+        if rom_type <= 0x37 {
+            score += 2;
+        }
+
+        let rom_size = rom[offset + 0x27];
+        if (0x08..=0x0D).contains(&rom_size) {
+            score += 2;
+
+            // Bonus if ROM size roughly matches file size
+            let expected_size = 1024usize << rom_size;
+            if rom.len() >= expected_size / 2 && rom.len() <= expected_size * 2 {
+                score += 2;
+            }
+        }
+
+        let ram_size = rom[offset + 0x28];
+        if ram_size <= 0x08 || ram_size == 0xFF {
+            score += 1;
+        }
+
+        let country = rom[offset + 0x29];
+        if country <= 0x0D || country == 0xFF {
+            score += 1;
+        }
+
+        // Check title for valid ASCII characters (title starts at base + 0x10)
+        let title_valid = rom[offset + 0x10..offset + 0x10 + 21]
+            .iter()
+            .all(|&b| (0x20..=0x7E).contains(&b) || b == 0x00);
+        if title_valid {
+            score += 2;
+        }
+
+        // Penalize obviously invalid values
+        if rom[offset + 0x26] == 0xFF || rom[offset + 0x2A] == 0xFF {
+            score = score.saturating_sub(3);
+        }
+
+        score
+    }
+
+    pub fn read(&self, addr: u32, mapper: MapperType) -> u8 {
+        let rom_addr = match mapper {
+            MapperType::LoRom => self.map_lorom_address(addr),
+            MapperType::HiRom => self.map_hirom_address(addr),
+            MapperType::ExHiRom => self.map_exhirom_address(addr),
+            _ => addr as usize,
+        };
+
+        if rom_addr < self.rom.len() {
+            self.rom[rom_addr]
+        } else {
+            0xFF
+        }
+    }
+
+    fn map_lorom_address(&self, addr: u32) -> usize {
+        let bank = (addr >> 16) & 0xFF;
+        let offset = addr & 0xFFFF;
+
+        match bank {
+            0x00..=0x7D => {
+                if offset >= 0x8000 {
+                    ((bank & 0x7F) as usize) * 0x8000 + (offset as usize) - 0x8000
+                } else {
+                    0
+                }
+            }
+            0x80..=0xFF => {
+                if offset >= 0x8000 {
+                    ((bank & 0x7F) as usize) * 0x8000 + (offset as usize) - 0x8000
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn map_hirom_address(&self, addr: u32) -> usize {
+        let bank = (addr >> 16) & 0xFF;
+        let offset = addr & 0xFFFF;
+
+        match bank {
+            0x00..=0x3F => {
+                if offset >= 0x8000 {
+                    (bank as usize) * 0x10000 + (offset as usize)
+                } else {
+                    0
+                }
+            }
+            0x40..=0x7D => (bank as usize) * 0x10000 + (offset as usize),
+            0x80..=0xBF => {
+                if offset >= 0x8000 {
+                    ((bank - 0x80) as usize) * 0x10000 + (offset as usize)
+                } else {
+                    0
+                }
+            }
+            0xC0..=0xFF => ((bank - 0xC0) as usize) * 0x10000 + (offset as usize),
+            _ => 0,
+        }
+    }
+
+    fn map_exhirom_address(&self, addr: u32) -> usize {
+        let bank = (addr >> 16) & 0xFF;
+        let offset = addr & 0xFFFF;
+
+        match bank {
+            0x00..=0x3F => {
+                if offset >= 0x8000 {
+                    0x400000 + (bank as usize) * 0x10000 + (offset as usize)
+                } else {
+                    0
+                }
+            }
+            0x40..=0x7D => (bank as usize) * 0x10000 + (offset as usize),
+            0x80..=0xBF => {
+                if offset >= 0x8000 {
+                    0x400000 + ((bank - 0x80) as usize) * 0x10000 + (offset as usize)
+                } else {
+                    0
+                }
+            }
+            0xC0..=0xFF => ((bank - 0xC0) as usize) * 0x10000 + (offset as usize),
+            _ => 0,
+        }
+    }
+}
