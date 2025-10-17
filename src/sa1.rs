@@ -129,11 +129,33 @@ impl<'a> CpuBus for Sa1BusAdapter<'a> {
     }
 
     fn poll_irq(&mut self) -> bool {
-        false // SA-1 external IRQ routing not yet modelled
+        unsafe {
+            let bus = self.bus();
+            let sa1 = bus.sa1();
+            // Check S-CPU IRQ request (SCNT bit 5)
+            let scpu_irq_request = (sa1.registers.scnt & 0x20) != 0;
+            if scpu_irq_request {
+                return true;
+            }
+            // Check if SA-1 IRQ is enabled (control bit 0)
+            let irq_enabled = (sa1.registers.control & 0x01) != 0;
+            if !irq_enabled {
+                return false;
+            }
+            // Check if any timer interrupt is pending
+            let irq_pending = sa1.registers.timer_pending != 0
+                || (sa1.registers.interrupt_pending & 0x80) != 0;
+            irq_pending
+        }
     }
 
     fn poll_nmi(&mut self) -> bool {
-        false
+        unsafe {
+            let bus = self.bus();
+            let sa1 = bus.sa1();
+            // Check S-CPU NMI request (SCNT bit 4)
+            (sa1.registers.scnt & 0x10) != 0
+        }
     }
 
     fn opcode_memory_penalty(&mut self, addr: u32) -> u8 {
@@ -549,7 +571,20 @@ impl Sa1 {
                 self.registers.irq_vector =
                     (self.registers.irq_vector & 0x00FF) | ((value as u16) << 8);
             }
-            0x09 => self.registers.scnt = value,
+            0x09 => {
+                if std::env::var_os("TRACE_SA1_BOOT").is_some()
+                    || std::env::var_os("DEBUG_SA1_SCHEDULER").is_some()
+                {
+                    println!(
+                        "SA-1 $2209 write: scnt=0x{:02X} (NMI_REQ={} IRQ_REQ={} RST={})",
+                        value,
+                        (value & 0x10) >> 4,
+                        (value & 0x20) >> 5,
+                        (value & 0x80) >> 7
+                    );
+                }
+                self.registers.scnt = value;
+            }
             0x0A => self.write_cie(value),
             0x0B => {
                 self.registers.cic = value;

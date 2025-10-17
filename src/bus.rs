@@ -283,6 +283,7 @@ impl Bus {
         });
 
         let mut steps = 0usize;
+        let mut total_sa1_cycles = 0u32;
         while self.sa1_cycle_deficit >= SA1_RATIO_DEN && steps < SA1_MAX_STEPS {
             let sa1_cycles = unsafe {
                 let bus_ptr = self as *mut Bus;
@@ -299,6 +300,8 @@ impl Bus {
                 }
                 break;
             }
+
+            total_sa1_cycles = total_sa1_cycles.saturating_add(sa1_cycles as u32);
 
             // Check if SA-1 is in WAI or STP state - if so, break early to avoid spinning
             if self.sa1.cpu.core.state.waiting_for_irq || self.sa1.cpu.core.state.stopped {
@@ -317,6 +320,11 @@ impl Bus {
 
             self.sa1_cycle_deficit -= sa1_cycles * SA1_RATIO_DEN;
             steps += 1;
+        }
+
+        // Tick SA-1 timers with accumulated cycles
+        if total_sa1_cycles > 0 {
+            self.sa1.tick_timers(total_sa1_cycles);
         }
 
         // Log statistics every 1000 steps
