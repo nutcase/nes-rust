@@ -238,6 +238,35 @@
    - **README追加**: CI/CDバッジ、Continuous Integrationセクション
    - **効果**: 継続的な品質保証、自動化されたコードレビュー補助
 
+24. **SA-1割り込み処理基本実装** (`src/sa1.rs:131-159`, `src/bus.rs:286-328`)
+   - **目的**: SA-1の割り込みシステムを実装し、S-CPUとの通信を確立
+   - **実装内容**:
+     - **poll_irq()** (src/sa1.rs:131-150):
+       - SCNT bit 5 (S-CPU IRQ request)チェック追加
+       - control bit 0 (SA-1 IRQ enable)チェック
+       - timer_pending / interrupt_pending チェック
+     - **poll_nmi()** (src/sa1.rs:152-159):
+       - SCNT bit 4 (S-CPU NMI request)チェック実装
+     - **tick_timers()統合** (src/bus.rs:325-328):
+       - run_sa1_scheduler()でtotal_sa1_cycles累積
+       - ループ後にsa1.tick_timers()呼び出し
+       - H-timer/V-timer割り込み生成可能に
+     - **SCNT書き込みログ** (src/sa1.rs:574-587):
+       - NMI_REQ/IRQ_REQ/RSTビット状態を表示
+       - TRACE_SA1_BOOT/DEBUG_SA1_SCHEDULER環境変数で制御
+   - **テスト結果**:
+     - ✅ ビルド成功、コンパイラwarning 0個維持
+     - ✅ DQ3実行時にSCNT=0x95書き込み確認（NMI_REQ=1）
+     - ⚠️ グラフィックス表示は44%のまま（改善なし）
+   - **判明した問題**:
+     - SA-1が$00:FFA0でループ（割り込みベクタテーブル付近）
+     - reset_vector=0x0000（DQ3が設定していない）
+     - DQ3はNMIベースでSA-1を起動する方式を使用している可能性
+   - **次の課題**:
+     - SA-1メモリマッピングの調査（$00:FFFA NMI vectorへのアクセス）
+     - DQ3のSA-1起動シーケンス解析
+     - ROM bankingとinterrupt vectorの関係を確認
+
 ---
 
 ### 現在の状況（2025-10-05 更新4 - グラフィックス表示成功！）
