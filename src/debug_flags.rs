@@ -759,3 +759,9 @@ pub fn debug_pixel_found() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("DEBUG_PIXEL_FOUND", false))
 }
+
+// Log periodic "graphics detected" messages (can be noisy; off by default).
+pub fn debug_graphics_detected() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("DEBUG_GRAPHICS_DETECTED", false))
+}
