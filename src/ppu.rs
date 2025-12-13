@@ -2736,6 +2736,7 @@ impl Ppu {
         let map_entry = ((map_entry_hi as u16) << 8) | (map_entry_lo as u16);
 
         let mut tile_id = map_entry & 0x03FF;
+        let palette = ((map_entry >> 10) & 0x07) as u8;
         let flip_x = (map_entry & 0x4000) != 0;
         let flip_y = (map_entry & 0x8000) != 0;
         let priority = (map_entry & 0x2000) != 0;
@@ -2808,10 +2809,33 @@ impl Ppu {
             return (0, 0);
         }
 
-        let palette_index = self.get_bg_palette_index(0, color_index, 8);
-        let color = self.cgram_to_rgb(palette_index);
+        // Direct color mode (CGWSEL bit0) for 256-color BGs (Modes 3/4/7, BG1 only).
+        let use_direct_color =
+            bg_num == 0 && (self.cgwsel & 0x01) != 0 && matches!(self.bg_mode, 3 | 4 | 7);
+        let color = if use_direct_color {
+            self.direct_color_to_rgb(palette, color_index)
+        } else {
+            let palette_index = self.get_bg_palette_index(0, color_index, 8);
+            self.cgram_to_rgb(palette_index)
+        };
         let priority_value = if priority { 1 } else { 0 };
         (color, priority_value)
+    }
+
+    #[inline]
+    fn direct_color_to_rgb(&self, palette: u8, pixel: u8) -> u32 {
+        // Direct Color (MMIO $2130 bit0):
+        // - Pixel value is interpreted as BBGGGRRR (8bpp character data).
+        // - Tilemap palette bits ppp are interpreted as bgr (one extra bit per component).
+        // Final RGB555: 0bbbbbgggggrrrrr, where LSB of each component is 0 (RGB443).
+        let r5 = (((pixel & 0x07) as u32) << 2) | (((palette & 0x01) as u32) << 1);
+        let g5 = ((((pixel >> 3) & 0x07) as u32) << 2) | ((((palette >> 1) & 0x01) as u32) << 1);
+        let b5 = ((((pixel >> 6) & 0x03) as u32) << 3) | ((((palette >> 2) & 0x01) as u32) << 2);
+
+        let r = (r5 << 3) | (r5 >> 2);
+        let g = (g5 << 3) | (g5 >> 2);
+        let b = (b5 << 3) | (b5 >> 2);
+        0xFF000000 | (r << 16) | (g << 8) | b
     }
 
     fn render_mode7_with_layer(&mut self, x: u16, y: u16) -> (u32, u8, u8) {
@@ -3614,16 +3638,16 @@ impl Ppu {
                 && CGRAM_ACCESS_COUNT[index as usize] <= 3
                 && (index <= 16 || index == 0 || color != 0)
             {
-                let r = (color >> 10) & 0x1F;
+                let r = color & 0x1F;
                 let g = (color >> 5) & 0x1F;
-                let b = color & 0x1F;
+                let b = (color >> 10) & 0x1F;
                 println!(
-                    "🎨 CGRAM[{}]: color=0x{:04X} BGR(5,5,5)=({},{},{}) RGB=0x{:02X}{:02X}{:02X}",
+                    "🎨 CGRAM[{}]: color=0x{:04X} RGB555=({},{},{}) RGB888=0x{:02X}{:02X}{:02X}",
                     index,
                     color,
-                    b,
-                    g,
                     r,
+                    g,
+                    b,
                     ((r << 3) | (r >> 2)) as u8,
                     ((g << 3) | (g >> 2)) as u8,
                     ((b << 3) | (b >> 2)) as u8
@@ -3631,11 +3655,10 @@ impl Ppu {
             }
         }
 
-        // SNESの15ビットカラーは BGR555（bit0-4: Blue, 5-9: Green, 10-14: Red）
-        // NOTE: SNES uses BGR format, not RGB!
-        let b5 = (color & 0x001F) as u32;
+        // SNES CGRAM is 15-bit RGB555 in little-endian (bit0-4: Red, 5-9: Green, 10-14: Blue).
+        let r5 = (color & 0x001F) as u32;
         let g5 = ((color >> 5) & 0x001F) as u32;
-        let r5 = ((color >> 10) & 0x001F) as u32;
+        let b5 = ((color >> 10) & 0x001F) as u32;
 
         // 5ビットから8ビットへ拡張
         let r = (r5 << 3) | (r5 >> 2);
@@ -5061,14 +5084,26 @@ impl Ppu {
             }
             0x32 => {
                 // 固定色データ設定
-                let component = (value >> 5) & 0x07; // RGB成分選択
                 let intensity = value & 0x1F; // 強度（0-31）
                 let mut next = self.fixed_color;
-                match component {
-                    0x04 => next = (next & 0x03E0) | (intensity as u16), // Blue
-                    0x02 => next = (next & 0x7C1F) | ((intensity as u16) << 5), // Green
-                    0x01 => next = (next & 0x03FF) | ((intensity as u16) << 10), // Red
-                    _ => {}
+
+                // COLDATA ($2132): bits7/6/5 are enable flags for B/G/R components.
+                // When set, the corresponding component of the fixed color is updated to INTENSITY.
+                // Multiple components may be updated in a single write.
+                //
+                // The fixed color uses the same RGB555 layout as CGRAM:
+                // bit0-4: Red, bit5-9: Green, bit10-14: Blue.
+                if (value & 0x20) != 0 {
+                    // Red: bits0-4
+                    next = (next & !0x001F) | (intensity as u16);
+                }
+                if (value & 0x40) != 0 {
+                    // Green: bits5-9
+                    next = (next & !0x03E0) | ((intensity as u16) << 5);
+                }
+                if (value & 0x80) != 0 {
+                    // Blue: bits10-14
+                    next = (next & !0x7C00) | ((intensity as u16) << 10);
                 }
                 if crate::debug_flags::strict_ppu_timing() && self.in_active_display() {
                     self.latched_fixed_color = Some(next);
@@ -5739,9 +5774,9 @@ impl Ppu {
     }
 
     fn fixed_color_to_rgb(&self) -> u32 {
-        let r = ((self.fixed_color >> 10) & 0x1F) as u8;
+        let r = (self.fixed_color & 0x1F) as u8;
         let g = ((self.fixed_color >> 5) & 0x1F) as u8;
-        let b = (self.fixed_color & 0x1F) as u8;
+        let b = ((self.fixed_color >> 10) & 0x1F) as u8;
 
         // 5bitから8bitに拡張
         let r = (r << 3) | (r >> 2);
@@ -6541,8 +6576,8 @@ impl Ppu {
         self.cgram[1] = 0x00; // Color 0: Black (transparent)
         self.cgram[2] = 0xFF;
         self.cgram[3] = 0x7F; // Color 1: White
-        self.cgram[4] = 0x00;
-        self.cgram[5] = 0x7C; // Color 2: Red
+        self.cgram[4] = 0x1F;
+        self.cgram[5] = 0x00; // Color 2: Red
         self.cgram[6] = 0xE0;
         self.cgram[7] = 0x03; // Color 3: Green
 
@@ -6567,5 +6602,48 @@ impl Ppu {
             "PPU: Test pattern applied (brightness={}, layers=0x{:02X}) with VRAM test data",
             self.brightness, self.main_screen_designation
         );
+    }
+}
+
+// --------------------------- tests ---------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cgram_rgb555_to_rgb888_mapping() {
+        let mut ppu = Ppu::new();
+        // RGB555 (SNES): bit0-4=R, 5-9=G, 10-14=B.
+        ppu.write_cgram_color(0, 0x001F); // red
+        ppu.write_cgram_color(1, 0x03E0); // green
+        ppu.write_cgram_color(2, 0x7C00); // blue
+        ppu.write_cgram_color(3, 0x7FFF); // white
+
+        assert_eq!(ppu.cgram_to_rgb(0), 0xFFFF0000);
+        assert_eq!(ppu.cgram_to_rgb(1), 0xFF00FF00);
+        assert_eq!(ppu.cgram_to_rgb(2), 0xFF0000FF);
+        assert_eq!(ppu.cgram_to_rgb(3), 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn coldata_updates_fixed_color_components() {
+        let mut ppu = Ppu::new();
+        // Set R=31, G=0, B=0
+        ppu.write(0x32, 0x20 | 0x1F); // R enable + intensity
+        ppu.write(0x32, 0x40 | 0x00); // G enable + intensity
+        ppu.write(0x32, 0x80 | 0x00); // B enable + intensity
+        assert_eq!(ppu.fixed_color_to_rgb(), 0xFFFF0000);
+
+        // Set R=0, G=31, B=0
+        ppu.write(0x32, 0x20 | 0x00);
+        ppu.write(0x32, 0x40 | 0x1F);
+        ppu.write(0x32, 0x80 | 0x00);
+        assert_eq!(ppu.fixed_color_to_rgb(), 0xFF00FF00);
+
+        // Set R=0, G=0, B=31
+        ppu.write(0x32, 0x20 | 0x00);
+        ppu.write(0x32, 0x40 | 0x00);
+        ppu.write(0x32, 0x80 | 0x1F);
+        assert_eq!(ppu.fixed_color_to_rgb(), 0xFF0000FF);
     }
 }
