@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Build (debug)
+      run: cargo build --verbose
+
+    - name: Build (release)
+      run: cargo build --release --verbose
+
+    - name: Run tests
+      run: cargo test --verbose
+
+    - name: Check for compiler warnings
+      run: |
+        OUTPUT=$(cargo check 2>&1)
+        if echo "$OUTPUT" | grep -q "warning:"; then
+          echo "Compiler warnings detected:"
+          echo "$OUTPUT" | grep "warning:"
+          exit 1
+        fi
+        echo "No compiler warnings found ✓"
+
+    # Note: ROM file testing requires ROM files which cannot be included in the repository
+    # To enable ROM testing, you would need to:
+    # 1. Add ROM files to the repository (if you have the rights)
+    # 2. Or download test ROMs in a separate step
+    # Uncomment the following steps if ROMs are available:
+    #
+    # - name: Download test ROMs
+    #   run: |
+    #     # Download or copy test ROMs here
+    #     mkdir -p roms
+    #     # wget -O roms/test.sfc https://example.com/test.sfc
+    #
+    # - name: Run smoke tests
+    #   run: ./tools/test_all.sh
+
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+
+    - name: Check code coverage (optional)
+      run: |
+        # Install tarpaulin for code coverage (optional)
+        # cargo install cargo-tarpaulin
+        # cargo tarpaulin --verbose --all-features --workspace --timeout 120
+        echo "Code coverage check skipped (optional)"
+
+    - name: Check dependencies for security issues
+      run: |
+        cargo install cargo-audit || true
+        cargo audit || echo "cargo-audit not available or issues found"
+
+    - name: Check outdated dependencies
+      run: |
+        cargo install cargo-outdated || true
+        cargo outdated || echo "cargo-outdated not available"

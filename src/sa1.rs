@@ -44,6 +44,10 @@ pub struct Registers {
     pub bwram_protect: u8,     // $2228 BW-RAM write-protected area (low nibble)
     pub iram_wp_snes: u8,      // $2229 SNES I-RAM write protection mask
     pub iram_wp_sa1: u8,       // $222A SA-1 I-RAM write protection mask
+    pub mmc_bank_c: u8,        // $2220 (mirrored in bus)
+    pub mmc_bank_d: u8,        // $2221
+    pub mmc_bank_e: u8,        // $2222
+    pub mmc_bank_f: u8,        // $2223
 
     pub sfr: u8, // $2300 SA-1 status flags
     #[allow(dead_code)]
@@ -53,12 +57,18 @@ pub struct Registers {
     pub ccdma_pending: bool,
     pub ccdma_buffer_ready: bool,
     pub handshake_state: u8,
+
+    // Character conversion buffer ($2240-$224F) and bookkeeping for type2
+    pub brf: [u8; 16],
+    pub brf_pos: usize,       // next write position (0-15)
+    pub brf_tile_offset: u32, // offset from dma_dest for successive tiles
 }
 
 impl Default for Registers {
     fn default() -> Self {
         Self {
-            control: 0,
+            // snes9x/hardware default: CONTROL = 0x20 (NMI vector select high)
+            control: 0x20,
             sie: 0,
             sic: 0,
             reset_vector: 0,
@@ -88,12 +98,20 @@ impl Default for Registers {
             bwram_protect: 0,
             iram_wp_snes: 0xFF,
             iram_wp_sa1: 0xFF,
+            // SA-1 MMC default mapping: C=0, D=1, E=2, F=3 (1MB chunks)
+            mmc_bank_c: 0,
+            mmc_bank_d: 1,
+            mmc_bank_e: 2,
+            mmc_bank_f: 3,
             sfr: 0,
             status: 0,
             dma_pending: false,
             ccdma_pending: false,
             ccdma_buffer_ready: false,
             handshake_state: 0,
+            brf: [0u8; 16],
+            brf_pos: 0,
+            brf_tile_offset: 0,
         }
     }
 }
@@ -132,20 +150,21 @@ impl<'a> CpuBus for Sa1BusAdapter<'a> {
         unsafe {
             let bus = self.bus();
             let sa1 = bus.sa1();
-            // Check S-CPU IRQ request (SCNT bit 5)
-            let scpu_irq_request = (sa1.registers.scnt & 0x20) != 0;
-            if scpu_irq_request {
+            // SNES->SA1 IRQ request (CONTROL bit7) masked by CIE bit7
+            if (sa1.registers.control & 0x80) != 0 && (sa1.registers.cie & 0x80) != 0 {
                 return true;
             }
-            // Check if SA-1 IRQ is enabled (control bit 0)
-            let irq_enabled = (sa1.registers.control & 0x01) != 0;
-            if !irq_enabled {
-                return false;
+            // Timer IRQ (CIE bit6)
+            if sa1.registers.timer_pending != 0 && (sa1.registers.cie & 0x40) != 0 {
+                return true;
             }
-            // Check if any timer interrupt is pending
-            let irq_pending = sa1.registers.timer_pending != 0
-                || (sa1.registers.interrupt_pending & 0x80) != 0;
-            irq_pending
+            // DMA/CC-DMA completion to SA-1 CPU (CIE bit5)
+            if (sa1.registers.interrupt_pending & Sa1::IRQ_DMA_FLAG) != 0
+                && (sa1.registers.cie & 0x20) != 0
+            {
+                return true;
+            }
+            false
         }
     }
 
@@ -153,8 +172,8 @@ impl<'a> CpuBus for Sa1BusAdapter<'a> {
         unsafe {
             let bus = self.bus();
             let sa1 = bus.sa1();
-            // Check S-CPU NMI request (SCNT bit 4)
-            (sa1.registers.scnt & 0x10) != 0
+            // SNES->SA1 NMI request (CONTROL bit4) masked by CIE bit4
+            (sa1.registers.control & 0x10) != 0 && (sa1.registers.cie & 0x10) != 0
         }
     }
 
@@ -168,13 +187,20 @@ pub struct Sa1 {
     pub cpu: Cpu,
     pub registers: Registers,
     pub(crate) boot_vector_applied: bool,
+    pub(crate) boot_pb: u8,
+    pub(crate) pending_reset: bool,
+    pub(crate) ipl_ran: bool,
+    /// One-shot flag: assert S-CPU IRQ line once after boot (DQ3 IPL replacement)
+    pub(crate) boot_irq_once: bool,
     h_timer_accum: u32,
     v_timer_accum: u32,
 }
 
 impl Sa1 {
-    pub(crate) const IRQ_DMA_BIT: u8 = 0x20;
-    pub(crate) const IRQ_CCDMA_BIT: u8 = 0x20;
+    // IRQ line bit (S-CPU sees via SFR bit7)
+    pub(crate) const IRQ_LINE_BIT: u8 = 0x80;
+    // DMA/CC-DMA completion flag (SFR/CFR bit5 equivalent)
+    pub(crate) const IRQ_DMA_FLAG: u8 = 0x20;
 
     pub fn new() -> Self {
         let mut cpu = Cpu::new();
@@ -185,6 +211,10 @@ impl Sa1 {
             cpu,
             registers: Registers::default(),
             boot_vector_applied: false,
+            boot_pb: 0x00,
+            pending_reset: false,
+            ipl_ran: false,
+            boot_irq_once: false,
             h_timer_accum: 0,
             v_timer_accum: 0,
         }
@@ -200,14 +230,39 @@ impl Sa1 {
             .reset(StatusFlags::from_bits_truncate(0x34), false);
         self.registers = Registers::default();
         self.boot_vector_applied = false;
+        self.boot_pb = 0;
+        self.pending_reset = false;
+        self.ipl_ran = false;
+        self.boot_irq_once = false;
         self.h_timer_accum = 0;
         self.v_timer_accum = 0;
     }
 
     pub fn step(&mut self, bus: &mut crate::bus::Bus) -> u8 {
-        if !self.boot_vector_applied && self.registers.reset_vector != 0 {
+        if self.pending_reset {
+            // Apply reset vector requested by S-CPU (SCNT bit7)
+            let vector = if self.registers.reset_vector != 0 {
+                self.registers.reset_vector
+            } else {
+                0x0000
+            };
+            self.cpu.reset(vector);
+            self.cpu.emulation_mode = false;
+            self.cpu.p = StatusFlags::from_bits_truncate(0x34);
+            self.cpu
+                .core
+                .reset(StatusFlags::from_bits_truncate(0x34), false);
+            self.cpu.pc = vector;
+            self.cpu.pb = self.boot_pb;
+            self.cpu.sync_core_from_cpu();
+            self.boot_vector_applied = true;
+            self.pending_reset = false;
+            self.ipl_ran = true;
+            self.boot_irq_once = false;
+        } else if !self.boot_vector_applied && self.registers.reset_vector != 0 {
             self.cpu.pc = self.registers.reset_vector;
-            self.cpu.pb = 0xC0; // SA-1 boot ROM bank heuristic
+            // Use the boot program bank detected/overridden by the mapper.
+            self.cpu.pb = self.boot_pb;
             self.boot_vector_applied = true;
         }
 
@@ -219,22 +274,28 @@ impl Sa1 {
 
     #[inline]
     fn update_interrupt_mask(&mut self) {
-        self.registers.interrupt_enable = self.registers.sie | self.registers.cie;
+        // S-CPU side IRQ mask (SIE). CIE is for SA-1 CPU.
+        self.registers.interrupt_enable = self.registers.sie;
     }
 
     #[inline]
     fn ccdma_enabled(&self) -> bool {
-        (self.registers.dma_control & 0x20) != 0
+        // CC mode (M bit) and enable (C bit)
+        (self.registers.dma_control & 0xA0) == 0xA0
     }
 
     #[inline]
+    /// CC-DMA type selector.
+    /// 0: linear copy (bitmap as-is)
+    /// 1: bitmap -> tile conversion (default)
+    /// 2: extended conversion (type2 / semi-automatic)
     pub(crate) fn ccdma_type(&self) -> Option<u8> {
         if !self.ccdma_enabled() {
             None
         } else if (self.registers.dma_control & 0x10) != 0 {
-            Some(1)
+            Some(1) // type1
         } else {
-            Some(0)
+            Some(0) // type0 (default when T=0)
         }
     }
 
@@ -253,32 +314,28 @@ impl Sa1 {
     #[inline]
     pub(crate) fn ccdma_color_code(&self) -> Option<u8> {
         match self.registers.ccdma_control & 0x03 {
-            0 => Some(0),
-            1 => Some(1),
+            // CCNT bits0-1: 0=8bpp, 1=4bpp, 2=2bpp, 3=reserved (treat as 4bpp)
+            0 => Some(8),
+            1 => Some(4),
             2 => Some(2),
-            3 => Some(1),
+            3 => Some(4),
             _ => None,
         }
     }
 
     #[inline]
     pub(crate) fn ccdma_color_depth_bits(&self) -> Option<u8> {
-        self.ccdma_color_code().map(|code| match code {
-            0 => 8,
-            1 => 4,
-            2 => 2,
-            _ => unreachable!(),
-        })
+        self.ccdma_color_code()
     }
 
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn ccdma_dmacb(&self) -> Option<u8> {
-        self.ccdma_color_code().map(|code| match code {
-            0 => 0,
-            1 => 1,
+        self.ccdma_color_depth_bits().map(|depth| match depth {
+            8 => 0,
+            4 => 1,
             2 => 2,
-            _ => unreachable!(),
+            _ => 1,
         })
     }
 
@@ -310,6 +367,9 @@ impl Sa1 {
         self.registers.ccdma_pending = false;
         self.registers.ccdma_buffer_ready = false;
         self.registers.handshake_state = 0;
+        self.registers.brf_pos = 0;
+        self.registers.brf.fill(0);
+        self.registers.brf_tile_offset = 0;
     }
 
     fn maybe_queue_ccdma(&mut self, reason: &str) {
@@ -322,7 +382,9 @@ impl Sa1 {
         if self.registers.ccdma_pending {
             return;
         }
-        if self.registers.dma_length == 0 {
+        let typ = self.ccdma_type();
+        // Type2 (BRF-driven) doesn't rely on dma_length; allow queuing even when length=0.
+        if self.registers.dma_length == 0 && typ != Some(2) && !self.registers.ccdma_buffer_ready {
             return;
         }
         self.registers.ccdma_pending = true;
@@ -339,6 +401,33 @@ impl Sa1 {
 
     pub fn is_ccdma_pending(&self) -> bool {
         self.registers.ccdma_pending
+    }
+
+    /// Whether SA-1 is currently asserting an IRQ to the S-CPU.
+    pub fn scpu_irq_asserted(&self) -> bool {
+        let asserted = (self.registers.interrupt_pending & self.registers.interrupt_enable) != 0;
+        if std::env::var_os("TRACE_SA1_IRQ").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                println!(
+                    "[SA1-IRQ] asserted={} pend=0x{:02X} ien=0x{:02X}",
+                    asserted, self.registers.interrupt_pending, self.registers.interrupt_enable
+                );
+            }
+        }
+        asserted
+    }
+
+    /// Expose DMA mode to callers.
+    pub fn dma_is_normal_public(&self) -> bool {
+        self.dma_is_normal()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn trace_ccdma_transfer(&self, _stage: &str) {
+        // Stub trace to keep bus logging happy; real tracing is gated elsewhere.
     }
 
     pub(crate) fn log_ccdma_state(&self, reason: &str) {
@@ -401,46 +490,48 @@ impl Sa1 {
     pub fn complete_dma(&mut self) -> bool {
         self.registers.dma_pending = false;
         self.registers.dma_control &= !0x80;
-        let irq_enabled = (self.registers.interrupt_enable & Self::IRQ_DMA_BIT) != 0;
+        // Flag for status (SFR/CFR bit5)
+        self.registers.interrupt_pending |= Self::IRQ_DMA_FLAG;
+        // Raise IRQ line for S-CPU
+        let irq_enabled = (self.registers.interrupt_enable & Self::IRQ_LINE_BIT) != 0;
+        if irq_enabled {
+            self.registers.interrupt_pending |= Self::IRQ_LINE_BIT;
+        }
         if crate::debug_flags::trace_sa1_dma() {
             println!(
-                "TRACE_SA1_DMA: complete irq_enabled={} ctrl=0x{:02X} enable=0x{:02X}",
-                irq_enabled, self.registers.dma_control, self.registers.interrupt_enable
+                "TRACE_SA1_DMA: complete irq_enabled={} ctrl=0x{:02X} enable=0x{:02X} pending=0x{:02X}",
+                irq_enabled,
+                self.registers.dma_control,
+                self.registers.interrupt_enable,
+                self.registers.interrupt_pending
             );
         }
-        if irq_enabled {
-            self.registers.interrupt_pending |= Self::IRQ_DMA_BIT;
-            true
-        } else {
-            false
-        }
+        irq_enabled
     }
 
     pub fn complete_ccdma(&mut self) -> bool {
         self.registers.ccdma_pending = false;
         self.registers.sfr |= 0x20;
         self.registers.ccdma_control &= !0x80;
-        let irq_enabled = (self.registers.interrupt_enable & Self::IRQ_CCDMA_BIT) != 0;
+        // Flag DMA done
+        self.registers.interrupt_pending |= Self::IRQ_DMA_FLAG;
+        let irq_enabled = (self.registers.interrupt_enable & Self::IRQ_LINE_BIT) != 0;
+        if irq_enabled {
+            self.registers.interrupt_pending |= Self::IRQ_LINE_BIT;
+        }
         if crate::debug_flags::trace_sa1_dma() {
             println!(
                 "TRACE_SA1_DMA: CC-DMA complete irq_enabled={} cctrl=0x{:02X} enable=0x{:02X}",
                 irq_enabled, self.registers.ccdma_control, self.registers.interrupt_enable
             );
         }
-        if irq_enabled {
-            self.registers.interrupt_pending |= Self::IRQ_CCDMA_BIT;
-            true
-        } else {
-            false
-        }
+        irq_enabled
     }
 
     fn clear_scpu_irq_pending(&mut self, mask: u8) {
         let before = self.registers.interrupt_pending;
         self.registers.interrupt_pending &= !mask;
-        if before != self.registers.interrupt_pending
-            && mask & (Self::IRQ_DMA_BIT | Self::IRQ_CCDMA_BIT) != 0
-        {
+        if before != self.registers.interrupt_pending && mask & Self::IRQ_DMA_FLAG != 0 {
             self.registers.handshake_state = 0;
         }
     }
@@ -466,7 +557,29 @@ impl Sa1 {
 
     pub fn read_register(&mut self, offset: u16) -> u8 {
         match offset {
-            0x00 => self.registers.control,
+            0x00 => {
+                // SFR (as seen by S-CPU at $2300). Layout: I V D N mmmm
+                // mmmm : message nibble written by SA-1 CPU via SCNT ($2209)
+                let mut sfr = self.registers.scnt & 0x0F;
+                // Bit7: SA-1 -> S-CPU IRQ line asserted
+                if self.scpu_irq_asserted() {
+                    sfr |= 0x80;
+                }
+                // Bit6: S-CPU IRQ vector select (1 = use SIV register)
+                // Mirror SCNT bit6 (SIV enable)
+                if (self.registers.scnt & 0x40) != 0 {
+                    sfr |= 0x40;
+                }
+                // Bit5: DMA/CC-DMA completion flag
+                if (self.registers.interrupt_pending & Self::IRQ_DMA_FLAG) != 0 {
+                    sfr |= 0x20;
+                }
+                // Bit4: S-CPU NMI vector select (1 = use SNV register)
+                if (self.registers.scnt & 0x20) != 0 {
+                    sfr |= 0x10;
+                }
+                sfr
+            }
             0x01 => self.registers.sie,
             0x02 => self.registers.interrupt_pending,
             0x03 => (self.registers.reset_vector & 0xFF) as u8,
@@ -505,7 +618,45 @@ impl Sa1 {
             0x37 => ((self.registers.dma_dest >> 16) & 0xFF) as u8,
             0x38 => (self.registers.dma_length & 0xFF) as u8,
             0x39 => (self.registers.dma_length >> 8) as u8,
-            0x100 => self.registers.sfr,
+            0x100 => {
+                // Mirror of SFR for SA-1 side reads (rare). Keep same layout.
+                let mut sfr = self.registers.control & 0x0F;
+                if self.scpu_irq_asserted() {
+                    sfr |= 0x80;
+                }
+                if (self.registers.scnt & 0x02) != 0 {
+                    sfr |= 0x40;
+                }
+                if (self.registers.interrupt_pending & Self::IRQ_DMA_FLAG) != 0 {
+                    sfr |= 0x20;
+                }
+                if (self.registers.scnt & 0x10) != 0 {
+                    sfr |= 0x10;
+                }
+                sfr
+            }
+            0x101 => {
+                // CFR: SA-1 CPU status (ITDNmmmm) as seen by SA-1
+                // Lower nibble: messages from S-CPU (SCNT low nibble)
+                let mut cfr = self.registers.scnt & 0x0F;
+                // Bit7: IRQ request from S-CPU (CONTROL bit7)
+                if (self.registers.control & 0x80) != 0 {
+                    cfr |= 0x80;
+                }
+                // Bit6: Timer IRQ pending (H/V timers)
+                if self.registers.timer_pending != 0 {
+                    cfr |= 0x40;
+                }
+                // Bit5: DMA/CC-DMA completion flag
+                if (self.registers.interrupt_pending & Self::IRQ_DMA_FLAG) != 0 {
+                    cfr |= 0x20;
+                }
+                // Bit4: NMI vector select (CONTROL bit4)
+                if (self.registers.control & 0x10) != 0 {
+                    cfr |= 0x10;
+                }
+                cfr
+            }
             0x10E => self.registers.timer_pending,
             _ => 0,
         }
@@ -572,22 +723,47 @@ impl Sa1 {
                     (self.registers.irq_vector & 0x00FF) | ((value as u16) << 8);
             }
             0x09 => {
+                // SCNT: S-CPU control register (written by SA-1 CPU)
+                // Layout (IS-Nmmmm):
+                //  bit7 I : request IRQ to S-CPU
+                //  bit6 S : use SIV (IRQ vector select) when set
+                //  bit5 N : use SNV (NMI vector select) when set
+                //  bit4 - : reserved
+                //  bits3-0 : message nibble readable via SFR ($2300)
                 if std::env::var_os("TRACE_SA1_BOOT").is_some()
                     || std::env::var_os("DEBUG_SA1_SCHEDULER").is_some()
                 {
                     println!(
-                        "SA-1 $2209 write: scnt=0x{:02X} (NMI_REQ={} IRQ_REQ={} RST={})",
+                        "SA-1 $2209 write: scnt=0x{:02X} (SCPU_IRQ={} IRQ_VEC_SEL={} NMI_VEC_SEL={} msg=0x{:X})",
                         value,
-                        (value & 0x10) >> 4,
-                        (value & 0x20) >> 5,
-                        (value & 0x80) >> 7
+                        (value & 0x80) != 0,
+                        (value & 0x40) != 0,
+                        (value & 0x20) != 0,
+                        value & 0x0F
                     );
                 }
                 self.registers.scnt = value;
+
+                // Bit7: assert SA-1 -> S-CPU IRQ line (subject to SIE mask)
+                if (value & 0x80) != 0 {
+                    self.registers.interrupt_pending |= Self::IRQ_LINE_BIT;
+                }
+                // Bit5/6 merely influence SFR bits; they are reflected when read.
             }
             0x0A => self.write_cie(value),
             0x0B => {
                 self.registers.cic = value;
+                // Clear pending flags per bits
+                if (value & 0x80) != 0 {
+                    self.registers.control &= !0x80;
+                    self.registers.interrupt_pending &= !Self::IRQ_LINE_BIT;
+                }
+                if (value & 0x40) != 0 {
+                    self.registers.timer_pending = 0;
+                }
+                if (value & 0x20) != 0 {
+                    self.registers.interrupt_pending &= !Self::IRQ_DMA_FLAG;
+                }
                 self.clear_scpu_irq_pending(value);
             }
             0x0C => self.registers.snv = (self.registers.snv & 0xFF00) | (value as u16),
@@ -604,6 +780,10 @@ impl Sa1 {
             0x15 => {
                 self.registers.v_timer = (self.registers.v_timer & 0x00FF) | ((value as u16) << 8)
             }
+            0x20 => self.registers.mmc_bank_c = value & 0x07,
+            0x21 => self.registers.mmc_bank_d = value & 0x07,
+            0x22 => self.registers.mmc_bank_e = value & 0x07,
+            0x23 => self.registers.mmc_bank_f = value & 0x07,
             0x24 => self.registers.bwram_select_snes = value & 0x1F,
             0x25 => {
                 let masked = if (value & 0x80) != 0 {
@@ -618,6 +798,23 @@ impl Sa1 {
                         "📝 SA-1 $2225 write: value=0x{:02X} (masked=0x{:02X})",
                         value, masked
                     );
+                }
+            }
+            // $2240-$224F: Bitmap Register File (CC-DMA type2 source)
+            0x40..=0x4F => {
+                let idx = (offset - 0x40) as usize;
+                self.registers.brf[idx] = value;
+                self.registers.brf_pos = idx + 1;
+                // When 16 bytes are written in type2 mode, mark buffer ready
+                if self.ccdma_type() == Some(2)
+                    && self.ccdma_enabled()
+                    && self.registers.brf_pos == 16
+                {
+                    self.registers.ccdma_pending = true;
+                    self.registers.ccdma_buffer_ready = true;
+                }
+                if std::env::var_os("TRACE_SA1_REG").is_some() {
+                    println!("SA1 BRF W ${:04X} = {:02X}", 0x2240 + idx as u16, value);
                 }
             }
             0x26 => {
@@ -656,19 +853,31 @@ impl Sa1 {
             0x30 => {
                 let previous = self.registers.dma_control;
                 self.registers.dma_control = value;
-                if self.dma_is_normal() {
-                    self.registers.dma_pending = (value & 0x80) != 0;
-                    self.reset_ccdma_state();
-                } else {
-                    self.registers.dma_pending = false;
-                    if self.ccdma_type() == Some(0) {
-                        println!("⚠️ SA-1 CC-DMA type 2 not fully modelled");
-                    }
-                    if self.is_ccdma_terminated() {
-                        self.reset_ccdma_state();
-                    } else if (value & 0x80) != 0 || (previous & 0x20) == 0 {
-                        self.maybe_queue_ccdma("dcnt");
-                    }
+                // Log first few DCNT writes regardless of verbosity to see who programs CC-DMA
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static DCNT_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+                let log_idx = DCNT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if log_idx < 32 {
+                    println!(
+                        "[SA1] $2230 DCNT write #{}: value=0x{:02X} prev=0x{:02X} len=0x{:04X} src=0x{:06X} dest=0x{:06X} pending={} ccdma_en={} type={:?}",
+                        log_idx + 1,
+                        value,
+                        previous,
+                        self.registers.dma_length,
+                        self.registers.dma_source,
+                        self.registers.dma_dest,
+                        self.registers.dma_pending as u8,
+                        (value & 0x20) != 0,
+                        self.ccdma_type()
+                    );
+                }
+                let cc_mode = (value & 0x20) != 0;
+                // この時点では開始しない。宛先レジスタ書き込み（$2236/$2237）で開始する。
+                self.registers.dma_pending = false;
+                self.registers.ccdma_pending = false;
+                self.registers.ccdma_buffer_ready = false;
+                if cc_mode {
+                    self.registers.handshake_state = 0;
                 }
                 if crate::debug_flags::trace_sa1_dma() {
                     println!(
@@ -686,28 +895,49 @@ impl Sa1 {
             0x31 => {
                 let previous = self.registers.ccdma_control;
                 self.registers.ccdma_control = value;
-                let terminate = (value & 0x80) != 0;
+                let end_flag = (value & 0x80) != 0;
+                // Log first few CCDMA control writes to understand start/stop sequence
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static CCDMA_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+                let log_idx = CCDMA_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if log_idx < 32 {
+                    println!(
+                        "[SA1] $2231 CCDMA write #{}: value=0x{:02X} prev=0x{:02X} start/end={} buf_ready={} len=0x{:04X} type={:?}",
+                        log_idx + 1,
+                        value,
+                        previous,
+                        end_flag,
+                        self.registers.ccdma_buffer_ready as u8,
+                        self.registers.dma_length,
+                        self.ccdma_type()
+                    );
+                }
                 if self.ccdma_enabled() {
-                    if terminate {
-                        if previous & 0x80 == 0 && !crate::debug_flags::quiet() {
-                            println!("🛑 SA-1 CC-DMA terminate request");
+                    match self.ccdma_type() {
+                        Some(1) => {
+                            // Type1: S-CPU sets bit7 after its DMA finished to signal completion
+                            if end_flag && self.registers.ccdma_pending {
+                                self.complete_ccdma();
+                            }
                         }
-                        self.reset_ccdma_state();
-                        self.registers.sfr &= !0x20;
-                        self.registers.interrupt_pending &= !Self::IRQ_CCDMA_BIT;
-                    } else {
-                        self.maybe_queue_ccdma("ccdma_ctrl");
+                        Some(2) => {
+                            // Type2: treat bit7 as a start trigger for safety
+                            if end_flag {
+                                self.registers.ccdma_pending = true;
+                                self.registers.ccdma_buffer_ready = true;
+                                self.registers.handshake_state = 1;
+                            }
+                        }
+                        _ => {}
                     }
-                } else if terminate {
-                    self.reset_ccdma_state();
                 }
                 if crate::debug_flags::trace_sa1_dma() {
                     println!(
-                        "TRACE_SA1_DMA: $2231 write ctrl=0x{:02X}→0x{:02X} pending={} terminate={} buf_ready={} len=0x{:04X}",
+                        "TRACE_SA1_DMA: $2231 write ctrl=0x{:02X}→0x{:02X} pending={} start={} buf_ready={} len=0x{:04X}",
                         previous,
                         self.registers.ccdma_control,
                         self.registers.ccdma_pending,
-                        terminate,
+                        end_flag,
                         self.registers.ccdma_buffer_ready,
                         self.registers.dma_length
                     );
@@ -730,10 +960,70 @@ impl Sa1 {
             0x36 => {
                 self.registers.dma_dest =
                     (self.registers.dma_dest & 0xFF00FF) | ((value as u32) << 8);
+                // D=0 (IRAM宛て) の場合、ここでDMA/CC-DMAを起動
+                let dest_is_bwram = ((self.registers.dma_control >> 2) & 0x01) != 0;
+                if !dest_is_bwram && (self.registers.dma_control & 0x80) != 0 {
+                    if self.ccdma_enabled() {
+                        if !self.registers.ccdma_pending {
+                            self.registers.ccdma_pending = true;
+                            self.registers.handshake_state = 1;
+                            if crate::debug_flags::trace_sa1_dma() {
+                                println!(
+                                    "SA1_DMA: start CC-DMA (dest IRAM) dcnt=0x{:02X} src=0x{:06X} dest=0x{:06X} len=0x{:04X}",
+                                    self.registers.dma_control,
+                                    self.registers.dma_source,
+                                    self.registers.dma_dest,
+                                    self.registers.dma_length
+                                );
+                            }
+                        }
+                    } else {
+                        self.registers.dma_pending = true;
+                        if crate::debug_flags::trace_sa1_dma() {
+                            println!(
+                                "SA1_DMA: start normal DMA (dest IRAM) dcnt=0x{:02X} src=0x{:06X} dest=0x{:06X} len=0x{:04X}",
+                                self.registers.dma_control,
+                                self.registers.dma_source,
+                                self.registers.dma_dest,
+                                self.registers.dma_length
+                            );
+                        }
+                    }
+                }
             }
             0x37 => {
                 self.registers.dma_dest =
                     (self.registers.dma_dest & 0x00FFFF) | ((value as u32) << 16);
+                // D=1 (BW-RAM宛て) の場合、ここでDMA/CC-DMAを起動
+                let dest_is_bwram = ((self.registers.dma_control >> 2) & 0x01) != 0;
+                if dest_is_bwram && (self.registers.dma_control & 0x80) != 0 {
+                    if self.ccdma_enabled() {
+                        if !self.registers.ccdma_pending {
+                            self.registers.ccdma_pending = true;
+                            self.registers.handshake_state = 1;
+                            if crate::debug_flags::trace_sa1_dma() {
+                                println!(
+                                    "SA1_DMA: start CC-DMA (dest BWRAM) dcnt=0x{:02X} src=0x{:06X} dest=0x{:06X} len=0x{:04X}",
+                                    self.registers.dma_control,
+                                    self.registers.dma_source,
+                                    self.registers.dma_dest,
+                                    self.registers.dma_length
+                                );
+                            }
+                        }
+                    } else {
+                        self.registers.dma_pending = true;
+                        if crate::debug_flags::trace_sa1_dma() {
+                            println!(
+                                "SA1_DMA: start normal DMA (dest BWRAM) dcnt=0x{:02X} src=0x{:06X} dest=0x{:06X} len=0x{:04X}",
+                                self.registers.dma_control,
+                                self.registers.dma_source,
+                                self.registers.dma_dest,
+                                self.registers.dma_length
+                            );
+                        }
+                    }
+                }
             }
             0x38 => {
                 self.registers.dma_length = (self.registers.dma_length & 0xFF00) | (value as u16);

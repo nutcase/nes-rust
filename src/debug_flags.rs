@@ -23,6 +23,61 @@ pub fn dma_reg() -> bool {
     *ON.get_or_init(|| env_flag("DEBUG_DMA_REG", false))
 }
 
+// Trace all APU port reads/writes (very verbose)
+pub fn trace_apu_port_all() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_APU_PORT_ALL", false))
+}
+
+// Trace only port0 writes/reads (lightweight handshake debug)
+pub fn trace_apu_port0() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_APU_PORT0", false))
+}
+
+// Force APU port0/1 to fixed values (HLE debug: APU_PORT0_VAL/APU_PORT1_VAL)
+pub fn apu_force_port0() -> Option<u8> {
+    static VAL: OnceLock<Option<u8>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("APU_FORCE_PORT0").ok().and_then(|v| {
+            u8::from_str_radix(v.trim_start_matches("0x"), 16)
+                .ok()
+                .or_else(|| v.parse().ok())
+        })
+    })
+    .clone()
+}
+
+pub fn apu_force_port1() -> Option<u8> {
+    static VAL: OnceLock<Option<u8>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("APU_FORCE_PORT1").ok().and_then(|v| {
+            u8::from_str_radix(v.trim_start_matches("0x"), 16)
+                .ok()
+                .or_else(|| v.parse().ok())
+        })
+    })
+    .clone()
+}
+
+// CPU テスト専用の簡易HLE（VBlank/JOY/4210 を強制値で返す）
+pub fn cpu_test_hle() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("CPUTEST_HLE", false))
+}
+
+// CPUテストHLE: VBlank中に必ず $4210=0x82 を返し、VBlank外では 0x02 を返す
+pub fn cpu_test_hle_strict_vblank() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("CPUTEST_HLE_STRICT_VBL", false))
+}
+
+// CPUテストHLE: さらに強制的に常時 $4210=0x82 / $4212=0x80 / JOY1L=0x7F を返す
+pub fn cpu_test_hle_force() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("CPUTEST_HLE_FORCE", false))
+}
+
 pub fn mapper() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("DEBUG_MAPPER", false))
@@ -62,10 +117,310 @@ pub fn quiet() -> bool {
     *ON.get_or_init(|| env_flag("QUIET", false))
 }
 
+// Trace long jumps/returns (JSL/RTL) for DQ3 investigation
+pub fn trace_jsl() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_JSL", false))
+}
+
+pub fn trace_rtl() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_RTL", false))
+}
+
+// Watch S-CPU PC for specific addresses (comma-separated hex, bank:addr or addr)
+pub fn watch_pc_list() -> Option<&'static [u32]> {
+    static LIST: OnceLock<Option<Vec<u32>>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        if let Ok(val) = std::env::var("WATCH_PC") {
+            let mut pcs = Vec::new();
+            for part in val.split(',') {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                if let Some((b, a)) = p.split_once(':') {
+                    if let (Ok(bank), Ok(addr)) =
+                        (u8::from_str_radix(b, 16), u16::from_str_radix(a, 16))
+                    {
+                        pcs.push(((bank as u32) << 16) | addr as u32);
+                    }
+                } else if let Ok(addr) = u32::from_str_radix(p, 16) {
+                    pcs.push(addr);
+                }
+            }
+            Some(pcs)
+        } else {
+            None
+        }
+    })
+    .as_deref()
+}
+
+// Dump CPU ring buffer when S-CPU PC hits specific addresses (env: DUMP_ON_PC)
+// Accepts comma-separated hex, bank:addr or addr (same format as WATCH_PC).
+pub fn dump_on_pc_list() -> Option<&'static [u32]> {
+    static LIST: OnceLock<Option<Vec<u32>>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        if let Ok(val) = std::env::var("DUMP_ON_PC") {
+            let mut pcs = Vec::new();
+            for part in val.split(',') {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                if let Some((b, a)) = p.split_once(':') {
+                    if let (Ok(bank), Ok(addr)) =
+                        (u8::from_str_radix(b, 16), u16::from_str_radix(a, 16))
+                    {
+                        pcs.push(((bank as u32) << 16) | addr as u32);
+                    }
+                } else if let Ok(addr) = u32::from_str_radix(p, 16) {
+                    pcs.push(addr);
+                }
+            }
+            Some(pcs)
+        } else {
+            None
+        }
+    })
+    .as_deref()
+}
+
+// Dump CPU ring buffer when the fetched opcode matches (env: DUMP_ON_OPCODE=DB)
+pub fn dump_on_opcode() -> Option<u8> {
+    static VAL: OnceLock<Option<u8>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("DUMP_ON_OPCODE").ok().and_then(|v| {
+            u8::from_str_radix(v.trim_start_matches("0x"), 16)
+                .ok()
+                .or_else(|| v.parse().ok())
+        })
+    })
+    .clone()
+}
+
+// Filter for ring buffer dumps (env: DUMP_ON_TEST_IDX=000C or 0x000C).
+pub fn dump_on_test_idx() -> Option<u16> {
+    static VAL: OnceLock<Option<u16>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("DUMP_ON_TEST_IDX").ok().and_then(|v| {
+            u16::from_str_radix(v.trim_start_matches("0x"), 16)
+                .ok()
+                .or_else(|| v.parse().ok())
+        })
+    })
+    .clone()
+}
+
+// Watch SA-1 PC (env: WATCH_SA1_PC, comma separated list, bank:addr or addr)
+pub fn watch_sa1_pc_list() -> Option<Vec<u32>> {
+    static LIST: OnceLock<Option<Vec<u32>>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        if let Ok(val) = std::env::var("WATCH_SA1_PC") {
+            let mut pcs = Vec::new();
+            for part in val.split(',') {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                if let Some((b, a)) = p.split_once(':') {
+                    if let (Ok(bank), Ok(addr)) =
+                        (u8::from_str_radix(b, 16), u16::from_str_radix(a, 16))
+                    {
+                        pcs.push(((bank as u32) << 16) | addr as u32);
+                    }
+                } else if let Ok(addr) = u32::from_str_radix(p, 16) {
+                    pcs.push(addr);
+                }
+            }
+            Some(pcs)
+        } else {
+            None
+        }
+    })
+    .clone()
+}
+
+// Trace the first N SA-1 steps (env TRACE_SA1_STEPS=N)
+pub fn trace_sa1_steps() -> Option<usize> {
+    static VAL: OnceLock<Option<usize>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("TRACE_SA1_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    })
+    .clone()
+}
+
+// Trace first N S-CPU instructions (env TRACE_PC_STEPS=N)
+pub fn trace_pc_steps() -> Option<usize> {
+    static VAL: OnceLock<Option<usize>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("TRACE_PC_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    })
+    .clone()
+}
+
+// TRACE_PC_FILE: PCトレースを指定ファイルへ出力（標準出力がノイジーな場合の代替）
+pub fn trace_pc_file() -> Option<String> {
+    static VAL: OnceLock<Option<String>> = OnceLock::new();
+    VAL.get_or_init(|| std::env::var("TRACE_PC_FILE").ok())
+        .clone()
+}
+
+// Trace SA-1 PC for first N instructions after a forced IRQ (env TRACE_SA1_WAKE_STEPS=N)
+pub fn trace_sa1_wake_steps() -> Option<usize> {
+    static VAL: OnceLock<Option<usize>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("TRACE_SA1_WAKE_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    })
+    .clone()
+}
+
+// Watch a single WRAM/BWRAM address on S-CPU side (env WATCH_ADDR like "7F:7DC0")
+pub fn watch_addr() -> Option<u32> {
+    static VAL: OnceLock<Option<u32>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("WATCH_ADDR").ok().and_then(|s| {
+            if let Some((b, a)) = s.split_once(':') {
+                let bank = u8::from_str_radix(b, 16).ok()?;
+                let addr = u16::from_str_radix(a, 16).ok()?;
+                Some(((bank as u32) << 16) | addr as u32)
+            } else {
+                u32::from_str_radix(&s, 16).ok()
+            }
+        })
+    })
+    .clone()
+}
+
+// Watch a single S-CPU write address (env WATCH_ADDR_W)
+pub fn watch_addr_write() -> Option<u32> {
+    static VAL: OnceLock<Option<u32>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("WATCH_ADDR_W").ok().and_then(|s| {
+            if let Some((b, a)) = s.split_once(':') {
+                let bank = u8::from_str_radix(b, 16).ok()?;
+                let addr = u16::from_str_radix(a, 16).ok()?;
+                Some(((bank as u32) << 16) | addr as u32)
+            } else {
+                u32::from_str_radix(&s, 16).ok()
+            }
+        })
+    })
+    .clone()
+}
+
+// WATCH_WRAM_W: watch WRAM writes (7E/7F banks) with simple logging
+pub fn watch_wram_write() -> Option<u32> {
+    static VAL: OnceLock<Option<u32>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("WATCH_WRAM_W").ok().and_then(|s| {
+            if let Some((b, a)) = s.split_once(':') {
+                let bank = u8::from_str_radix(b, 16).ok()?;
+                let addr = u16::from_str_radix(a, 16).ok()?;
+                Some(((bank as u32) << 16) | addr as u32)
+            } else {
+                u32::from_str_radix(&s, 16).ok()
+            }
+        })
+    })
+    .clone()
+}
+
+// WATCH_WRAM_W_FORCE: 指定アドレスへの書き込みを強制値に置き換える（デバッグ用）
+// 形式: WATCH_WRAM_W_FORCE=7E:E95C:01
+pub fn watch_wram_write_force() -> Option<(u32, u8)> {
+    static VAL: OnceLock<Option<(u32, u8)>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("WATCH_WRAM_W_FORCE").ok().and_then(|s| {
+            let mut parts = s.split(':');
+            let b = parts.next()?;
+            let a = parts.next()?;
+            let v = parts.next()?;
+            let bank = u8::from_str_radix(b, 16).ok()?;
+            let addr = u16::from_str_radix(a, 16).ok()?;
+            let val = u8::from_str_radix(v, 16).ok()?;
+            Some((((bank as u32) << 16) | addr as u32, val))
+        })
+    })
+    .clone()
+}
+
+// Force S-CPU IRQ for first N frames (env FORCE_SCPU_IRQ_FRAMES=N)
+pub fn force_scpu_irq_frames() -> Option<u32> {
+    static VAL: OnceLock<Option<u32>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("FORCE_SCPU_IRQ_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+    })
+    .clone()
+}
+
+// Force a repeated SA-1 IRQ every frame (debug; uses IRQ_DMA_BIT)
+pub fn sa1_force_irq_each_frame() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("SA1_FORCE_IRQ_EACH_FRAME", false))
+}
+
+// Force a one-shot SA-1 IRQ to S-CPU early in boot (debug)
+pub fn sa1_force_irq_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("SA1_FORCE_IRQ_ONCE", false))
+}
+
+// Force SA-1 to start executing (DQ3 workaround)
+pub fn dq3_force_sa1_boot() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("DQ3_FORCE_SA1_BOOT", false))
+}
+
+// DQ3専用: SA-1を任意のエントリに飛ばす簡易ハック
+pub fn dq3_sa1_hack() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("DQ3_SA1_HACK", false))
+}
+
+// DQ3専用: SA-1 内蔵IPLを最小限スタブする
+pub fn dq3_sa1_ipl_stub() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("DQ3_SA1_IPL_STUB", false))
+}
+
+// DQ3デバッグ: SA-1のBRKをNOPに差し替えて実行継続を試す
+pub fn dq3_sa1_brk_to_nop() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("DQ3_SA1_BRK_TO_NOP", false))
+}
+
+// DQ3デバッグ: SA-1→S-CPU ハンドシェイクを強制 (初期IRQ/NMI要求)
+pub fn dq3_sa1_handshake_stub() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("DQ3_SA1_HANDSHAKE_STUB", false))
+}
+
+// SA-1待機ループ観察用: 特定PCでレジスタダンプ
+pub fn trace_sa1_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_SA1_WAIT", false))
+}
+
 // Enable enhanced APU handshake shim ($2140-$2143)
 pub fn apu_handshake_plus() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("APU_HANDSHAKE_PLUS", false))
+}
+
+// Trace concise APU handshake (ports $2140-$2143) reads/writes
+pub fn trace_apu_handshake() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_APU_HANDSHAKE", false))
 }
 
 // Enable coarse memory timing (SlowROM penalty unless $420D FastROM)
@@ -119,6 +474,18 @@ pub fn force_display() -> bool {
     *ON.get_or_init(|| env_flag("FORCE_DISPLAY", false))
 }
 
+// Ignore CPU writes to INIDISP (keep HDMA/MDMA). Debug aid for DQ3.
+pub fn ignore_inidisp_cpu() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("IGNORE_INIDISP_CPU", false))
+}
+
+// Block DMA/HDMA writes to INIDISP (debug)
+pub fn block_inidisp_dma() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("BLOCK_INIDISP_DMA", false))
+}
+
 #[allow(dead_code)]
 pub fn trace_sa1_regs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -129,6 +496,30 @@ pub fn trace_sa1_regs() -> bool {
 pub fn strict_ppu_timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("STRICT_PPU_TIMING", false))
+}
+
+// Debug: treat DMA size=0 as zero bytes instead of 65536 (to bypass runaway DMAs)
+pub fn dma_zero_is_zero() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("DMA_ZERO_IS_ZERO", false))
+}
+
+// Mode7: use full 16x16 signed multiply for $2134-2136 (default: 16x8)
+pub fn m7_mul_full16() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("M7_MUL_FULL16", false))
+}
+
+// Mode7: force product value for $2134-2136 (hex up to 6 hex digits)
+pub fn force_m7_product() -> Option<u32> {
+    static VAL: OnceLock<Option<u32>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("FORCE_M7_PRODUCT")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .map(|v| v & 0x00FF_FFFF)
+    })
+    .clone()
 }
 // Aggregate per-frame render metrics (color window/black clip/color math counts)
 pub fn render_metrics() -> bool {

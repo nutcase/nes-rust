@@ -1,472 +1,545 @@
-#![cfg_attr(not(feature = "dev"), allow(dead_code))]
+//! APU wrapper using the external `snes-apu` crate (SPC700 + DSP).
+//! 現状: 精度よりも動作優先の簡易統合。セーブステートはダミー。
+use snes_apu::apu::Apu as SpcApu;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootState {
+    /// 初期シグネチャ (AA/BB) をCPUに見せる段階
+    ReadySignature,
+    /// CPUからのキック(0xCC)を待ち、転送中
+    Uploading,
+    /// APUプログラム稼働中。以降は実ポート値をそのまま返す
+    Running,
+}
+
 pub struct Apu {
-    ram: Vec<u8>,
-    ports: [u8; 4],
-    dsp_registers: Vec<u8>,
-    timers: [Timer; 3],
-    cycle_counter: u64,
-
-    // サウンド生成関連
-    channels: [SoundChannel; 8],
-    master_volume_left: u8,
-    master_volume_right: u8,
-    echo_volume_left: u8,
-    echo_volume_right: u8,
+    pub(crate) inner: Box<SpcApu>,
     sample_rate: u32,
-    // Simple CPU<->APU handshake shim to unblock games that poll $2140-$2143.
-    handshake_enabled: bool,
-    handshake_state: HandshakeState,
-    handshake_reads: u32,
-    last_host_write: Option<(u8, u8)>,
+    // Fractional SPC700 cycles accumulator (scaled from S-CPU cycles).
+    cycle_accum: f64,
+    // CPU<-APU方向のホストポート（CPUが読み取る値）
+    apu_to_cpu_ports: [u8; 4],
+    // CPU->APU方向の直近値（SMP側が$F4-$F7で読む値）
+    pub(crate) port_latch: [u8; 4],
+    boot_state: BootState,
+    boot_hle_enabled: bool,
+    fast_upload: bool,
+    fast_upload_bytes: u64,
+    zero_write_seen: bool,
+    last_port1: u8,
+    upload_addr: u16,
+    expected_index: u8,
+    block_active: bool,
+    pending_idx: Option<u8>,
+    data_ready: bool,
+    upload_done_count: u64,
+    upload_bytes: u64,
+    last_upload_idx: u8,
+    end_zero_streak: u8,
+    // Last value written to port0 during boot; echoed until next write.
+    boot_port0_echo: u8,
+    // Optional hard override for port0 echo (debug)
+    force_port0: Option<u8>,
+    // Whether skip-boot was requested (for consistent init)
+    skip_boot: bool,
+    // Debug: echo last CPU-written port values even after boot (SMW workaround)
+    smw_apu_echo: bool,
+    // SMW用: HLEハンドシェイクを継続して走らせるか
+    smw_apu_hle_handshake: bool,
+    smw_hle_end_zero_streak: u8,
+    // SMW用: ポートreadは常に直近CPU書き込み(latch)を返す強制モード
+    smw_apu_port_echo_strict: bool,
+    // Debug/HLE: skip actual SPC upload and jump to running state
+    fake_upload: bool,
 }
 
-#[derive(Debug, Clone)]
-struct SoundChannel {
-    // チャンネル制御
-    volume_left: u8,
-    volume_right: u8,
-    pitch: u16,        // 周波数
-    sample_start: u16, // サンプル開始アドレス
-    sample_loop: u16,  // ループポイント
-    envelope: Envelope,
-
-    // 現在の状態
-    enabled: bool,
-    current_sample: u16,
-    phase: u32,
-    amplitude: i16,
-}
-
-#[derive(Debug, Clone)]
-struct Envelope {
-    attack_rate: u8,
-    decay_rate: u8,
-    sustain_level: u8,
-    release_rate: u8,
-    current_level: u16,
-    state: EnvelopeState,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum EnvelopeState {
-    Attack,
-    Decay,
-    Sustain,
-    Release,
-}
-
-impl SoundChannel {
-    fn new() -> Self {
-        Self {
-            volume_left: 0,
-            volume_right: 0,
-            pitch: 0,
-            sample_start: 0,
-            sample_loop: 0,
-            envelope: Envelope::new(),
-            enabled: false,
-            current_sample: 0,
-            phase: 0,
-            amplitude: 0,
-        }
-    }
-
-    fn key_on(&mut self) {
-        self.enabled = true;
-        self.envelope.state = EnvelopeState::Attack;
-        self.envelope.current_level = 0;
-        self.phase = 0;
-    }
-
-    fn key_off(&mut self) {
-        self.envelope.state = EnvelopeState::Release;
-    }
-}
-
-impl Envelope {
-    fn new() -> Self {
-        Self {
-            attack_rate: 0,
-            decay_rate: 0,
-            sustain_level: 0,
-            release_rate: 0,
-            current_level: 0,
-            state: EnvelopeState::Release,
-        }
-    }
-
-    fn step(&mut self) {
-        match self.state {
-            EnvelopeState::Attack => {
-                if self.current_level < 0x7FF {
-                    self.current_level += (self.attack_rate as u16 + 1) * 8;
-                    if self.current_level >= 0x7FF {
-                        self.current_level = 0x7FF;
-                        self.state = EnvelopeState::Decay;
-                    }
-                }
-            }
-            EnvelopeState::Decay => {
-                let sustain_target = (self.sustain_level as u16) << 8;
-                if self.current_level > sustain_target {
-                    let decay_amount = (self.decay_rate as u16 + 1) * 4;
-                    self.current_level = self.current_level.saturating_sub(decay_amount);
-                    if self.current_level <= sustain_target {
-                        self.current_level = sustain_target;
-                        self.state = EnvelopeState::Sustain;
-                    }
-                }
-            }
-            EnvelopeState::Sustain => {
-                // サステインレベル維持
-            }
-            EnvelopeState::Release => {
-                if self.current_level > 0 {
-                    let release_amount = (self.release_rate as u16 + 1) * 4;
-                    self.current_level = self.current_level.saturating_sub(release_amount);
-                }
-            }
-        }
-    }
-}
-
-struct Timer {
-    enabled: bool,
-    target: u8,
-    counter: u8,
-    divider: u16,
-    divider_target: u16,
-}
-
-impl Timer {
-    fn new(divider_target: u16) -> Self {
-        Self {
-            enabled: false,
-            target: 0,
-            counter: 0,
-            divider: 0,
-            divider_target,
-        }
-    }
-
-    fn step(&mut self, cycles: u16) {
-        if !self.enabled {
-            return;
-        }
-
-        self.divider += cycles;
-        while self.divider >= self.divider_target {
-            self.divider -= self.divider_target;
-            self.counter = self.counter.wrapping_add(1);
-            if self.counter == self.target {
-                self.counter = 0;
-            }
-        }
-    }
-}
+unsafe impl Send for Apu {}
+unsafe impl Sync for Apu {}
 
 impl Apu {
     pub fn new() -> Self {
-        Self {
-            ram: vec![0; 0x10000],
-            ports: [0; 4],
-            dsp_registers: vec![0; 128],
-            timers: [Timer::new(128), Timer::new(128), Timer::new(16)],
-            cycle_counter: 0,
-            channels: [
-                SoundChannel::new(),
-                SoundChannel::new(),
-                SoundChannel::new(),
-                SoundChannel::new(),
-                SoundChannel::new(),
-                SoundChannel::new(),
-                SoundChannel::new(),
-                SoundChannel::new(),
-            ],
-            master_volume_left: 127,
-            master_volume_right: 127,
-            echo_volume_left: 0,
-            echo_volume_right: 0,
-            sample_rate: 32000, // 32kHz
-            handshake_enabled: crate::debug_flags::apu_handshake_plus(),
-            handshake_state: HandshakeState::Booting,
-            handshake_reads: 0,
-            last_host_write: None,
-        }
-    }
-
-    pub fn step(&mut self, cycles: u8) {
-        self.cycle_counter += cycles as u64;
-
-        for timer in &mut self.timers {
-            timer.step(cycles as u16);
-        }
-
-        // サウンドチャンネルの更新
-        self.update_sound_channels(cycles);
-    }
-
-    fn update_sound_channels(&mut self, cycles: u8) {
-        for channel in &mut self.channels {
-            if channel.enabled {
-                // エンベロープ更新
-                channel.envelope.step();
-
-                // 位相更新（簡易実装）
-                channel.phase = channel
-                    .phase
-                    .wrapping_add(channel.pitch as u32 * cycles as u32);
-
-                // 波形生成（簡易な矩形波）
-                let wave_position = (channel.phase >> 16) & 0xFFFF;
-                channel.amplitude = if wave_position < 0x8000 {
-                    (channel.envelope.current_level as i16) >> 3
-                } else {
-                    -((channel.envelope.current_level as i16) >> 3)
-                };
+        let inner = SpcApu::new(); // comes with default IPL
+        let boot_hle_enabled = std::env::var("APU_BOOT_HLE")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false); // デフォルト: HLE無効（実IPLで正確さ優先）
+                              // 正確さ優先: デフォルトではフルサイズ転送を行う。
+                              // 速さが欲しい場合のみ APU_FAST_UPLOAD=1 を明示する。
+        let fast_upload = std::env::var("APU_FAST_UPLOAD")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false);
+        let fast_upload_bytes = std::env::var("APU_FAST_BYTES")
+            .ok()
+            .and_then(|v| {
+                u64::from_str_radix(v.trim_start_matches("0x"), 16)
+                    .ok()
+                    .or_else(|| v.parse().ok())
+            })
+            .unwrap_or(0x10000);
+        let skip_boot = std::env::var("APU_SKIP_BOOT")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false); // trueなら即実行開始（デバッグ用）
+        let fake_upload = std::env::var("APU_FAKE_UPLOAD")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false); // CPUが書き始めたら即実行状態にする簡易HLE
+        let force_port0 = std::env::var("APU_FORCE_PORT0").ok().and_then(|v| {
+            u8::from_str_radix(v.trim_start_matches("0x"), 16)
+                .ok()
+                .or_else(|| v.parse().ok())
+        });
+        let smw_apu_echo = std::env::var("SMW_APU_ECHO")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false);
+        let smw_apu_hle_handshake = std::env::var("SMW_APU_HLE_HANDSHAKE")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false); // SMW専用。既定では無効（他ROMへの副作用回避）
+        let smw_apu_port_echo_strict = std::env::var("SMW_APU_PORT_ECHO_STRICT")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false);
+        let mut apu = Self {
+            inner,
+            sample_rate: 32000,
+            cycle_accum: 0.0,
+            apu_to_cpu_ports: [0; 4],
+            port_latch: [0; 4],
+            boot_state: if skip_boot || !boot_hle_enabled {
+                BootState::Running
             } else {
-                channel.amplitude = 0;
-            }
+                BootState::ReadySignature
+            }, // AA/BBを必ず経由
+            boot_hle_enabled,
+            fast_upload,
+            fast_upload_bytes,
+            zero_write_seen: false,
+            last_port1: 0,
+            upload_addr: 0x0200,
+            expected_index: 0,
+            block_active: false,
+            pending_idx: None,
+            data_ready: false,
+            upload_done_count: 0,
+            upload_bytes: 0,
+            last_upload_idx: 0,
+            end_zero_streak: 0,
+            boot_port0_echo: 0xAA,
+            force_port0,
+            skip_boot,
+            smw_apu_echo,
+            smw_apu_hle_handshake,
+            smw_hle_end_zero_streak: 0,
+            smw_apu_port_echo_strict,
+            fake_upload,
+        };
+        apu.init_boot_ports();
+        if std::env::var_os("TRACE_APU_BOOTSTATE").is_some() {
+            println!(
+                "[APU-BOOTSTATE] init: boot_hle_enabled={} skip_boot={} fast_upload={} boot_state={:?}",
+                boot_hle_enabled, skip_boot, fast_upload, apu.boot_state
+            );
         }
-    }
-
-    pub fn read(&mut self, addr: u8) -> u8 {
-        if self.handshake_enabled {
-            match self.handshake_state {
-                HandshakeState::Booting => {
-                    // Return a simple toggling pattern per port to indicate life
-                    let base = if addr & 1 == 0 { 0xAA } else { 0x55 };
-                    let resp = if (self.handshake_reads & 1) == 0 {
-                        base
-                    } else {
-                        base ^ 0xFF
-                    };
-                    self.handshake_reads = self.handshake_reads.saturating_add(1);
-                    // Expedite READY transition — many titles poll a handful of times only
-                    if self.handshake_reads >= 16 {
-                        self.handshake_state = HandshakeState::Ready;
-                    }
-                    return resp;
-                }
-                HandshakeState::Ready => {
-                    return 0x00;
-                }
-            }
+        // skip_bootでも AA/BB を見せてから CC エコーを開始する
+        if skip_boot {
+            apu.apu_to_cpu_ports = [0xAA, 0xBB, 0x00, 0x00];
+            apu.boot_port0_echo = 0xAA;
+            apu.finish_upload_and_start_with_ack(0xCC);
+            apu.boot_port0_echo = 0xCC;
+            apu.apu_to_cpu_ports[0] = 0xCC;
+            apu.apu_to_cpu_ports[1] = 0xBB;
         }
-        match addr {
-            0x00..=0x03 => self.ports[addr as usize],
-            _ => 0,
-        }
-    }
-
-    pub fn write(&mut self, addr: u8, value: u8) {
-        if let 0x00..=0x03 = addr {
-            self.ports[addr as usize] = value;
-            if self.handshake_enabled {
-                // Simple pattern-based unlocks commonly used by boot code
-                // Any of these values indicate host has poked APU and is ready to proceed.
-                match value {
-                    0x00 | 0xCC | 0xAA | 0x55 => {
-                        self.handshake_state = HandshakeState::Ready;
-                    }
-                    _ => {}
-                }
-                // Any direct host write to APUIO signifies liveness — remember last write
-                self.last_host_write = Some((addr, value));
-            }
-        }
-    }
-
-    pub fn read_ram(&self, addr: u16) -> u8 {
-        self.ram[addr as usize]
-    }
-
-    pub fn write_ram(&mut self, addr: u16, value: u8) {
-        self.ram[addr as usize] = value;
-    }
-
-    pub fn read_dsp(&self, addr: u8) -> u8 {
-        if (addr as usize) < self.dsp_registers.len() {
-            self.dsp_registers[addr as usize]
-        } else {
-            0
-        }
-    }
-
-    pub fn write_dsp(&mut self, addr: u8, value: u8) {
-        if (addr as usize) < self.dsp_registers.len() {
-            self.dsp_registers[addr as usize] = value;
-
-            // DSPレジスタに基づいてサウンドチャンネルを更新
-            self.update_channel_from_dsp(addr, value);
-        }
-    }
-
-    fn update_channel_from_dsp(&mut self, addr: u8, value: u8) {
-        let channel_num = (addr & 0x0F) as usize;
-
-        if channel_num >= 8 {
-            return;
-        }
-
-        match addr & 0xF0 {
-            0x00 => {
-                // 各チャンネルのボリューム (左)
-                match addr & 0x0F {
-                    0x00 => self.channels[0].volume_left = value,
-                    0x01 => self.channels[0].volume_right = value,
-                    0x02 => {
-                        self.channels[0].pitch = (self.channels[0].pitch & 0xFF00) | value as u16
-                    }
-                    0x03 => {
-                        self.channels[0].pitch =
-                            (self.channels[0].pitch & 0x00FF) | ((value as u16) << 8)
-                    }
-                    0x04 => self.channels[0].sample_start = value as u16,
-                    0x05 => {
-                        // ADSR設定
-                        self.channels[0].envelope.attack_rate = value & 0x0F;
-                        self.channels[0].envelope.decay_rate = (value >> 4) & 0x07;
-                    }
-                    0x06 => {
-                        self.channels[0].envelope.sustain_level = value >> 5;
-                        self.channels[0].envelope.release_rate = value & 0x1F;
-                    }
-                    _ => {}
-                }
-            }
-            0x10 => {
-                // チャンネル 1
-                self.apply_channel_register(1, addr & 0x0F, value);
-            }
-            0x20 => {
-                // チャンネル 2
-                self.apply_channel_register(2, addr & 0x0F, value);
-            }
-            0x30 => {
-                // チャンネル 3
-                self.apply_channel_register(3, addr & 0x0F, value);
-            }
-            0x40 => {
-                // チャンネル 4
-                self.apply_channel_register(4, addr & 0x0F, value);
-            }
-            0x50 => {
-                // チャンネル 5
-                self.apply_channel_register(5, addr & 0x0F, value);
-            }
-            0x60 => {
-                // チャンネル 6
-                self.apply_channel_register(6, addr & 0x0F, value);
-            }
-            0x70 => {
-                // チャンネル 7
-                self.apply_channel_register(7, addr & 0x0F, value);
-            }
-            _ => {}
-        }
-
-        // グローバル制御
-        match addr {
-            0x0C => self.master_volume_left = value,
-            0x1C => self.master_volume_right = value,
-            0x2C => self.echo_volume_left = value,
-            0x3C => self.echo_volume_right = value,
-            0x4C => {
-                // Key On
-                for i in 0..8 {
-                    if value & (1 << i) != 0 {
-                        self.channels[i].key_on();
-                    }
-                }
-            }
-            0x5C => {
-                // Key Off
-                for i in 0..8 {
-                    if value & (1 << i) != 0 {
-                        self.channels[i].key_off();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn apply_channel_register(&mut self, channel: usize, reg: u8, value: u8) {
-        if channel >= 8 {
-            return;
-        }
-
-        match reg {
-            0x00 => self.channels[channel].volume_left = value,
-            0x01 => self.channels[channel].volume_right = value,
-            0x02 => {
-                self.channels[channel].pitch =
-                    (self.channels[channel].pitch & 0xFF00) | value as u16
-            }
-            0x03 => {
-                self.channels[channel].pitch =
-                    (self.channels[channel].pitch & 0x00FF) | ((value as u16) << 8)
-            }
-            0x04 => self.channels[channel].sample_start = value as u16,
-            0x05 => {
-                self.channels[channel].envelope.attack_rate = value & 0x0F;
-                self.channels[channel].envelope.decay_rate = (value >> 4) & 0x07;
-            }
-            0x06 => {
-                self.channels[channel].envelope.sustain_level = value >> 5;
-                self.channels[channel].envelope.release_rate = value & 0x1F;
-            }
-            _ => {}
-        }
+        apu
     }
 
     pub fn reset(&mut self) {
-        self.ram.fill(0);
-        self.ports = [0; 4];
-        self.dsp_registers.fill(0);
-        self.cycle_counter = 0;
-
-        for timer in &mut self.timers {
-            timer.enabled = false;
-            timer.counter = 0;
-            timer.divider = 0;
+        self.inner.reset();
+        self.fast_upload = std::env::var("APU_FAST_UPLOAD")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false);
+        self.fast_upload_bytes = std::env::var("APU_FAST_BYTES")
+            .ok()
+            .and_then(|v| {
+                u64::from_str_radix(v.trim_start_matches("0x"), 16)
+                    .ok()
+                    .or_else(|| v.parse().ok())
+            })
+            .unwrap_or(0x10000);
+        self.skip_boot = std::env::var("APU_SKIP_BOOT")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false);
+        self.smw_apu_echo = std::env::var("SMW_APU_ECHO")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(self.smw_apu_echo);
+        self.smw_apu_hle_handshake = std::env::var("SMW_APU_HLE_HANDSHAKE")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(false);
+        self.smw_apu_port_echo_strict = std::env::var("SMW_APU_PORT_ECHO_STRICT")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(self.smw_apu_port_echo_strict);
+        self.smw_hle_end_zero_streak = 0;
+        self.boot_state = if self.skip_boot || !self.boot_hle_enabled {
+            BootState::Running
+        } else {
+            BootState::ReadySignature
+        };
+        self.zero_write_seen = false;
+        self.last_port1 = 0;
+        self.cycle_accum = 0.0;
+        self.port_latch = [0; 4];
+        self.upload_addr = 0x0200;
+        self.expected_index = 0;
+        self.block_active = false;
+        self.pending_idx = None;
+        self.data_ready = false;
+        self.upload_done_count = 0;
+        self.upload_bytes = 0;
+        self.last_upload_idx = 0;
+        self.end_zero_streak = 0;
+        self.boot_port0_echo = 0xAA;
+        self.init_boot_ports();
+        if self.skip_boot {
+            self.apu_to_cpu_ports = [0xAA, 0xBB, 0x00, 0x00];
+            self.boot_port0_echo = 0xAA;
+            self.finish_upload_and_start_with_ack(0xCC);
+            self.boot_port0_echo = 0xCC;
+            self.apu_to_cpu_ports[0] = 0xCC;
+            self.apu_to_cpu_ports[1] = 0xBB;
         }
-
-        for channel in &mut self.channels {
-            *channel = SoundChannel::new();
-        }
-
-        self.master_volume_left = 127;
-        self.master_volume_right = 127;
-        self.echo_volume_left = 0;
-        self.echo_volume_right = 0;
     }
 
-    // オーディオサンプル生成（ステレオ）
-    pub fn generate_audio_samples(&self, samples: &mut [(i16, i16)]) {
-        for sample in samples {
-            let mut left_sum: i32 = 0;
-            let mut right_sum: i32 = 0;
+    fn init_boot_ports(&mut self) {
+        // Even when we skip the real IPL, seed ports with AA/BB so S-CPU handshake loops pass.
+        if self.boot_state == BootState::ReadySignature || self.fast_upload {
+            self.apu_to_cpu_ports = [0xAA, 0xBB, 0x00, 0x00];
+            // CPU側から読む値（APUIO）は APU->CPU ラッチ。実機ではIPLが書くが、HLE時は先に用意する。
+            self.inner.write_u8(0x00F4, 0xAA);
+            self.inner.write_u8(0x00F5, 0xBB);
+            self.inner.write_u8(0x00F6, 0x00);
+            self.inner.write_u8(0x00F7, 0x00);
+            // CPU->APU ラッチ（SMPが読む側）は既定で 0。
+            self.port_latch = [0; 4];
+            self.boot_port0_echo = 0xAA;
+        } else {
+            self.apu_to_cpu_ports = [0; 4];
+        }
+    }
 
-            // 全チャンネルをミックス
-            for channel in &self.channels {
-                if channel.enabled {
-                    let amplitude = channel.amplitude as i32;
-                    left_sum += (amplitude * channel.volume_left as i32) >> 7;
-                    right_sum += (amplitude * channel.volume_right as i32) >> 7;
+    /// CPUサイクルに合わせてSPC700を回す。
+    /// 仮想周波数: S-CPU 3.58MHz / SPC700 1.024MHz ⇒ およそ 1 : 3.5 で遅らせる。
+    pub fn step(&mut self, cpu_cycles: u8) {
+        // 比率調整。必要に応じて環境変数 APU_CYCLE_SCALE で上書き可。
+        // `snes-apu` crate の内部サイクルは 2.048MHz 基準で、DSPサンプル(32kHz)は 64cycle ごとに生成される。
+        // したがって S-CPU(3.579545MHz) からの比率は 2.048MHz / 3.579545MHz ≈ 0.572。
+        let scale: f64 = std::env::var("APU_CYCLE_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.572);
+
+        self.cycle_accum += (cpu_cycles as f64) * scale;
+        let run = self.cycle_accum.floor() as i32;
+        self.cycle_accum -= run as f64;
+
+        if run > 0 {
+            if let Some(smp) = self.inner.smp.as_mut() {
+                smp.run(run);
+            }
+            if let Some(dsp) = self.inner.dsp.as_mut() {
+                dsp.flush();
+            }
+        }
+
+        // ハンドシェイク終了後は実ポート値を表側にも反映
+        if self.boot_state == BootState::Running {
+            for p in 0..4 {
+                self.apu_to_cpu_ports[p] = self.inner.cpu_read_port(p as u8);
+            }
+        }
+    }
+
+    /// CPU側ポート読み出し ($2140-$2143)
+    pub fn read_port(&mut self, port: u8) -> u8 {
+        let p = (port & 0x03) as usize;
+
+        // 強制値（デバッグ/HLE）指定時は即返す
+        if let Some(forced) = if p == 0 {
+            crate::debug_flags::apu_force_port0()
+        } else if p == 1 {
+            crate::debug_flags::apu_force_port1()
+        } else {
+            None
+        } {
+            return forced;
+        }
+
+        match self.boot_state {
+            BootState::Running => {
+                // 実ハード同様、SMP側が書いた値をそのまま返す
+                let v = if self.smw_apu_port_echo_strict {
+                    // HLE完了後は実ポート値を返す。完了前はラッチ値でエコー。
+                    if self.upload_done_count > 0 {
+                        self.inner.cpu_read_port(p as u8)
+                    } else {
+                        self.apu_to_cpu_ports[p]
+                    }
+                } else if self.smw_apu_echo {
+                    self.apu_to_cpu_ports[p]
+                } else if self.smw_apu_hle_handshake {
+                    self.apu_to_cpu_ports[p]
+                } else {
+                    self.inner.cpu_read_port(p as u8)
+                };
+                if !self.smw_apu_echo {
+                    self.apu_to_cpu_ports[p] = v;
+                }
+                if std::env::var_os("TRACE_APU_PORT_ONCE").is_some()
+                    || crate::debug_flags::trace_apu_port_all()
+                    || (p == 0 && crate::debug_flags::trace_apu_port0())
+                {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static CNT: AtomicU32 = AtomicU32::new(0);
+                    let n = CNT.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        println!("[APU-R] port{} -> {:02X} (boot=Running)", p, v);
+                    }
+                }
+                v
+            }
+            // ブート中: port0は「最後にCPUが書いた値」を保持して返す。port1-3も表キャッシュを返す。
+            _ => {
+                let v = if let Some(force) = self.force_port0 {
+                    if p == 0 {
+                        force
+                    } else {
+                        self.apu_to_cpu_ports[p]
+                    }
+                } else if p == 0 {
+                    self.boot_port0_echo
+                } else {
+                    self.apu_to_cpu_ports[p]
+                };
+                if std::env::var_os("TRACE_APU_PORT_ONCE").is_some()
+                    || crate::debug_flags::trace_apu_port_all()
+                    || (p == 0 && crate::debug_flags::trace_apu_port0())
+                {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static CNT: AtomicU32 = AtomicU32::new(0);
+                    let n = CNT.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        println!(
+                            "[APU-R] port{} -> {:02X} (boot={:?})",
+                            p, v, self.boot_state
+                        );
+                    }
+                }
+                v
+            }
+        }
+    }
+
+    /// CPU側ポート書き込み ($2140-$2143)
+    pub fn write_port(&mut self, port: u8, value: u8) {
+        let p = (port & 0x03) as usize;
+        self.port_latch[p] = value;
+        // CPU->APU ラッチへ反映（SMP側が $F4-$F7 で読む）
+        self.inner.cpu_write_port(p as u8, value);
+
+        // 簡易HLE: 転送を省略して即稼働させる
+        if self.fake_upload && self.boot_state != BootState::Running {
+            self.finish_upload_and_start_with_ack(0);
+        }
+
+        if crate::debug_flags::trace_apu_port_all()
+            || (p == 0 && crate::debug_flags::trace_apu_port0())
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static CNT: AtomicU32 = AtomicU32::new(0);
+            let n = CNT.fetch_add(1, Ordering::Relaxed);
+            if n < 512 {
+                println!(
+                    "[APU-W] port{} <- {:02X} state={:?} echo0={:02X} to_cpu=[{:02X} {:02X} {:02X} {:02X}]",
+                    p,
+                    value,
+                    self.boot_state,
+                    self.boot_port0_echo,
+                    self.apu_to_cpu_ports[0],
+                    self.apu_to_cpu_ports[1],
+                    self.apu_to_cpu_ports[2],
+                    self.apu_to_cpu_ports[3]
+                );
+            }
+        }
+
+        if !self.boot_hle_enabled {
+            return;
+        }
+
+        match self.boot_state {
+            BootState::ReadySignature => {
+                // CPUが0xCCを書いたらIPL転送開始。CC以外の値で署名を潰さない
+                // （SMC等の初期化で $2140 を0クリアするため）。
+                if p == 0 {
+                    if value != 0xCC {
+                        // 署名は維持したまま無視
+                        return;
+                    }
+                    // HLEでもアップロード状態に入り、CPUのインデックスエコーを行う
+                    self.boot_state = BootState::Uploading;
+                    if std::env::var_os("TRACE_APU_BOOTSTATE").is_some() {
+                        println!("[APU-BOOTSTATE] -> Uploading (kick=0xCC)");
+                    }
+                    self.apu_to_cpu_ports[0] = 0xCC;
+                    self.boot_port0_echo = 0xCC;
+                    self.expected_index = 0;
+                    self.block_active = false;
+                    self.zero_write_seen = false;
+                    self.pending_idx = None;
+                    self.data_ready = false;
+                    self.upload_bytes = 0;
+                    self.last_upload_idx = 0;
+                    // fast_upload は Uploading 中の閾値判定で早期完了する
+                }
+                if p == 2 {
+                    self.upload_addr = (self.upload_addr & 0xFF00) | value as u16;
+                } else if p == 3 {
+                    self.upload_addr = (self.upload_addr & 0x00FF) | ((value as u16) << 8);
+                } else if p == 1 {
+                    self.last_port1 = value;
                 }
             }
+            BootState::Uploading => {
+                // 転送先アドレス（毎ブロックごとに書き替えられる）
+                if p == 2 {
+                    self.upload_addr = (self.upload_addr & 0xFF00) | value as u16;
+                    return;
+                } else if p == 3 {
+                    self.upload_addr = (self.upload_addr & 0x00FF) | ((value as u16) << 8);
+                    return;
+                }
 
-            // マスターボリューム適用
-            left_sum = (left_sum * self.master_volume_left as i32) >> 7;
-            right_sum = (right_sum * self.master_volume_right as i32) >> 7;
+                // port0/port1 の書き込み順は ROM により異なる（8bit書き込み / 16bit書き込み）。
+                // 実機IPLは port0 の変化をトリガに port1 を読み取るため、ここでは
+                // 「port0(idx) と port1(data) の両方が揃ったタイミング」で1バイトを確定する。
+                match p {
+                    0 => {
+                        let idx = value;
+                        // Always echo APUIO0 back (handshake ACK)
+                        self.apu_to_cpu_ports[0] = idx;
+                        self.boot_port0_echo = idx;
 
-            // クリッピング
-            left_sum = left_sum.clamp(-32768, 32767);
-            right_sum = right_sum.clamp(-32768, 32767);
+                        // SPC700 IPL protocol:
+                        // - Data byte: APUIO0 must equal expected_index (starts at 0 for each block)
+                        // - Command: APUIO0 != expected_index; APUIO1==0 means "start program at APUIO2/3",
+                        //   otherwise it means "set new base address (APUIO2/3) and continue upload".
+                        if idx == self.expected_index {
+                            self.pending_idx = Some(idx);
+                            if self.data_ready {
+                                // port1 が先に来たケース: ここで確定
+                                let data = self.last_port1;
+                                self.data_ready = false;
+                                self.pending_idx = None;
 
-            *sample = (left_sum as i16, right_sum as i16);
+                                let addr = self.upload_addr.wrapping_add(idx as u16);
+                                self.inner.write_u8(addr as u32, data);
+                                self.upload_bytes = self.upload_bytes.saturating_add(1);
+                                self.last_upload_idx = idx;
+                                self.expected_index = self.expected_index.wrapping_add(1);
+                            }
+                        } else {
+                            // Command / state sync
+                            self.pending_idx = None;
+                            self.data_ready = false;
+                            self.expected_index = 0;
+                            if self.last_port1 == 0 {
+                                // Start program; ACK must echo the command value the CPU wrote.
+                                self.finish_upload_and_start_with_ack(idx);
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                    1 => {
+                        self.last_port1 = value;
+                        self.apu_to_cpu_ports[1] = value;
+                        self.data_ready = true;
+                        if let Some(idx) = self.pending_idx {
+                            // port0 が先に来たケース: ここで確定
+                            if idx == self.expected_index {
+                                self.data_ready = false;
+                                self.pending_idx = None;
+                                let addr = self.upload_addr.wrapping_add(idx as u16);
+                                self.inner.write_u8(addr as u32, value);
+                                self.upload_bytes = self.upload_bytes.saturating_add(1);
+                                self.last_upload_idx = idx;
+                                self.expected_index = self.expected_index.wrapping_add(1);
+                            }
+                        }
+                        return;
+                    }
+                    _ => {
+                        self.apu_to_cpu_ports[p] = value;
+                        return;
+                    }
+                }
+            }
+            BootState::Running => {
+                // 稼働後は表側キャッシュだけ更新（HLE継続時もキャッシュを維持）
+                self.apu_to_cpu_ports[p] = value;
+
+                // SMW HLE 継続モード: 0,0 が2回続いたら即 start (upload_done) とみなす
+                if self.smw_apu_hle_handshake && p == 0 {
+                    if value == 0 {
+                        self.smw_hle_end_zero_streak =
+                            self.smw_hle_end_zero_streak.saturating_add(1);
+                    } else {
+                        self.smw_hle_end_zero_streak = 0;
+                    }
+                    if self.smw_hle_end_zero_streak >= 2 {
+                        if std::env::var_os("TRACE_APU_BOOTSTATE").is_some() {
+                            println!("[APU-BOOTSTATE] SMW force start (running echo)");
+                        }
+                        if std::env::var_os("TRACE_APU_BOOT").is_some() {
+                            println!(
+                                "[APU-HLE] Forced start after port0=0 twice (running-phase echo)"
+                            );
+                        }
+                        self.finish_upload_and_start_with_ack(0);
+                        self.smw_hle_end_zero_streak = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// オーディオサンプル生成（ステレオ）
+    pub fn generate_audio_samples(&mut self, samples: &mut [(i16, i16)]) {
+        let need = samples.len() as i32;
+        if need <= 0 {
+            return;
+        }
+
+        // `step()` 側でSPC700/DSPを進めて output_buffer に溜める。
+        // ここでは output_buffer から読むだけにして、二重にSMPを回さない。
+        let Some(dsp) = self.inner.dsp.as_mut() else {
+            for s in samples.iter_mut() {
+                *s = (0, 0);
+            }
+            return;
+        };
+
+        dsp.flush();
+
+        let avail = dsp.output_buffer.get_sample_count().max(0);
+        let to_read = need.min(avail);
+
+        if to_read > 0 {
+            let mut left = vec![0i16; to_read as usize];
+            let mut right = vec![0i16; to_read as usize];
+            dsp.output_buffer.read(&mut left, &mut right, to_read);
+            for i in 0..(to_read as usize) {
+                samples[i] = (left[i], right[i]);
+            }
+        }
+
+        // 足りない分は無音で埋める（リングバッファのアンダーラン対策）
+        for s in samples.iter_mut().skip(to_read as usize) {
+            *s = (0, 0);
         }
     }
 
@@ -474,139 +547,119 @@ impl Apu {
         self.sample_rate
     }
 
-    // --- Save state serialization ---
+    // --- セーブステート（ダミー実装） ---
     pub fn to_save_state(&self) -> crate::savestate::ApuSaveState {
-        use crate::savestate::{
-            ApuSaveState, EnvelopeSaveState, SoundChannelSaveState, TimerSaveState,
-        };
-        let timers = self
-            .timers
-            .iter()
-            .map(|t| TimerSaveState {
-                enabled: t.enabled,
-                target: t.target,
-                counter: t.counter,
-                divider: t.divider,
-                divider_target: t.divider_target,
-            })
-            .collect();
-        let channels = self
-            .channels
-            .iter()
-            .map(|c| SoundChannelSaveState {
-                volume_left: c.volume_left,
-                volume_right: c.volume_right,
-                pitch: c.pitch,
-                sample_start: c.sample_start,
-                sample_loop: c.sample_loop,
-                envelope: EnvelopeSaveState {
-                    attack_rate: c.envelope.attack_rate,
-                    decay_rate: c.envelope.decay_rate,
-                    sustain_level: c.envelope.sustain_level,
-                    release_rate: c.envelope.release_rate,
-                    current_level: c.envelope.current_level,
-                    state: match c.envelope.state {
-                        EnvelopeState::Attack => 0,
-                        EnvelopeState::Decay => 1,
-                        EnvelopeState::Sustain => 2,
-                        EnvelopeState::Release => 3,
-                    },
-                },
-                enabled: c.enabled,
-                current_sample: c.current_sample,
-                phase: c.phase,
-                amplitude: c.amplitude,
-            })
-            .collect();
-
-        ApuSaveState {
-            ram: self.ram.clone(),
-            ports: self.ports,
-            dsp_registers: self.dsp_registers.clone(),
-            cycle_counter: self.cycle_counter,
-            timers,
-            channels,
-            master_volume_left: self.master_volume_left,
-            master_volume_right: self.master_volume_right,
-            echo_volume_left: self.echo_volume_left,
-            echo_volume_right: self.echo_volume_right,
-        }
+        crate::savestate::ApuSaveState::default()
     }
 
-    pub fn load_from_save_state(&mut self, st: &crate::savestate::ApuSaveState) {
-        if self.ram.len() == st.ram.len() {
-            self.ram.copy_from_slice(&st.ram);
-        }
-        self.ports = st.ports;
-        if self.dsp_registers.len() == st.dsp_registers.len() {
-            self.dsp_registers.copy_from_slice(&st.dsp_registers);
-        }
-        self.cycle_counter = st.cycle_counter;
-        for (i, t) in st.timers.iter().enumerate() {
-            if i < self.timers.len() {
-                self.timers[i].enabled = t.enabled;
-                self.timers[i].target = t.target;
-                self.timers[i].counter = t.counter;
-                self.timers[i].divider = t.divider;
-                self.timers[i].divider_target = t.divider_target;
-            }
-        }
-        for (i, c) in st.channels.iter().enumerate() {
-            if i < self.channels.len() {
-                let ch = &mut self.channels[i];
-                ch.volume_left = c.volume_left;
-                ch.volume_right = c.volume_right;
-                ch.pitch = c.pitch;
-                ch.sample_start = c.sample_start;
-                ch.sample_loop = c.sample_loop;
-                ch.envelope.attack_rate = c.envelope.attack_rate;
-                ch.envelope.decay_rate = c.envelope.decay_rate;
-                ch.envelope.sustain_level = c.envelope.sustain_level;
-                ch.envelope.release_rate = c.envelope.release_rate;
-                ch.envelope.current_level = c.envelope.current_level;
-                ch.envelope.state = match c.envelope.state {
-                    0 => EnvelopeState::Attack,
-                    1 => EnvelopeState::Decay,
-                    2 => EnvelopeState::Sustain,
-                    _ => EnvelopeState::Release,
-                };
-                ch.enabled = c.enabled;
-                ch.current_sample = c.current_sample;
-                ch.phase = c.phase;
-                ch.amplitude = c.amplitude;
-            }
-        }
-        self.master_volume_left = st.master_volume_left;
-        self.master_volume_right = st.master_volume_right;
-        self.echo_volume_left = st.echo_volume_left;
-        self.echo_volume_right = st.echo_volume_right;
+    pub fn load_from_save_state(&mut self, _st: &crate::savestate::ApuSaveState) {
+        self.reset();
     }
 
-    // Enable/disable the lightweight handshake shim at runtime
-    pub fn set_handshake_enabled(&mut self, enabled: bool) {
-        self.handshake_enabled = enabled;
-        if enabled {
-            self.handshake_state = HandshakeState::Booting;
-            self.handshake_reads = 0;
-            self.last_host_write = None;
-        }
-    }
-
+    // 旧ハンドシェイクAPI互換ダミー
+    pub fn set_handshake_enabled(&mut self, _enabled: bool) {}
     pub fn handshake_state_str(&self) -> &'static str {
-        if !self.handshake_enabled {
-            return "off";
-        }
-        match self.handshake_state {
-            HandshakeState::Booting => "booting",
-            HandshakeState::Ready => "ready",
+        match self.boot_state {
+            BootState::ReadySignature => "ipl-signature",
+            BootState::Uploading => "ipl-upload",
+            BootState::Running => "spc700",
         }
     }
-}
-//
-// Many APU fields/methods are currently stubs for future work.
-// Suppress dead_code warnings while iterating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandshakeState {
-    Booting,
-    Ready,
+
+    /// デバッグ/HLE用途: 任意のバイナリをARAmにロードして即実行開始する。
+    /// ポートの初期値は 0x00 に揃え、boot_state を Running に移行する。
+    pub fn load_and_start(&mut self, data: &[u8], base: u16, start_pc: u16) {
+        // 書き込み先は base から。I/Oレジスタ(0xF0-0xFF)は避ける。
+        let mut offset = base as usize;
+        for &b in data.iter() {
+            if offset >= 0x10000 {
+                break;
+            }
+            if (offset & 0xFF00) == 0x00F0 {
+                // スキップして次のページへ
+                offset = (offset & 0xFF00) + 0x0100;
+            }
+            if offset >= 0x10000 {
+                break;
+            }
+            self.inner.write_u8(offset as u32, b);
+            offset += 1;
+        }
+        if let Some(smp) = self.inner.smp.as_mut() {
+            smp.reg_pc = start_pc;
+        }
+        // IPL を無効化
+        self.inner.write_u8(0x00F1, 0x00);
+        // ポート初期値はAA/BB署名を維持してCPU側ハンドシェイクを満たす
+        let init_ports = [0xAA, 0xBB, 0x00, 0x00];
+        for p in 0..4 {
+            let v = init_ports[p];
+            self.inner.write_u8(0x00F4 + p as u32, v);
+            self.apu_to_cpu_ports[p] = v;
+        }
+        self.port_latch = [0; 4];
+        self.boot_port0_echo = 0xAA;
+        self.boot_state = BootState::Running;
+        if std::env::var_os("TRACE_APU_BOOTSTATE").is_some() {
+            println!(
+                "[APU-BOOTSTATE] load_and_start -> Running (base=${:04X} start_pc=${:04X} len={})",
+                base,
+                start_pc,
+                data.len()
+            );
+        }
+    }
+
+    /// 転送完了後にSPCプログラムを実行状態へ進める。
+    fn finish_upload_and_start(&mut self) {
+        // 実機IPL同様、完了時のACKは 0 を返す
+        self.finish_upload_and_start_with_ack(0);
+    }
+
+    fn finish_upload_and_start_with_ack(&mut self, ack: u8) {
+        self.boot_state = BootState::Running;
+        if std::env::var_os("TRACE_APU_BOOTSTATE").is_some() {
+            println!(
+                "[APU-BOOTSTATE] finish_upload_and_start ack={:02X} addr=${:04X}",
+                ack, self.upload_addr
+            );
+        }
+        self.block_active = false;
+        self.data_ready = false;
+        self.upload_done_count += 1;
+        if std::env::var_os("TRACE_APU_PORT").is_some()
+            || std::env::var_os("TRACE_APU_BOOT").is_some()
+            || crate::debug_flags::trace_apu_port_all()
+        {
+            println!(
+                "[APU-BOOT] upload complete count={} start_pc=${:04X} addr_base=${:04X}",
+                self.upload_done_count, self.upload_addr, self.upload_addr
+            );
+        }
+        // IPL ROM を無効化
+        self.inner.write_u8(0x00F1, 0x00);
+        // ジャンプ先をセット（IPLがジャンプする直前の初期レジスタ状態に寄せる）
+        if let Some(smp) = self.inner.smp.as_mut() {
+            let pc = if self.upload_addr == 0 {
+                0x0200
+            } else {
+                self.upload_addr
+            };
+            // IPL直後の基本状態（Smp::reset 相当）。
+            // これを揃えないと、HLEで中途半端なIPL実行状態のままジャンプしてSPC側が暴走しやすい。
+            smp.reg_a = 0;
+            smp.reg_x = 0;
+            smp.reg_y = 0;
+            smp.reg_sp = 0xEF;
+            smp.set_psw(0x02);
+            smp.reg_pc = pc;
+        }
+        // 実行開始をCPUへ知らせるためポート0にACK値を置く（既定=0）
+        self.inner.write_u8(0x00F4, ack);
+        self.apu_to_cpu_ports[0] = ack;
+        // 初期ACKはそのままにして、以後は実値を返す
+        for i in 0..4 {
+            self.apu_to_cpu_ports[i] = self.inner.cpu_read_port(i as u8);
+        }
+    }
 }

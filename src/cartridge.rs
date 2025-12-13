@@ -85,10 +85,15 @@ impl Cartridge {
             );
         }
 
-        // Parse ROM type (a.k.a. cartridge type)
-        // Cartridge type is at header base + 0x15 (relative to 0x7FC0/0xFFC0).
-        // Our header base is 0x7FB0/0xFFB0, so offset is +0x25 from this base.
-        let rom_type = rom[header_offset + 0x25];
+        // Header bytes:
+        // - Map mode ($FFD5/$7FD5) is at base + 0x15
+        // - ROM type / chipset ($FFD6/$7FD6) is at base + 0x16
+        //
+        // Our `header_offset` is 0x7FB0/0xFFB0 (0x10 bytes before base), so:
+        // - map_mode: +0x25
+        // - rom_type: +0x26
+        let _map_mode = rom[header_offset + 0x25];
+        let rom_type = rom[header_offset + 0x26];
         let mapper_type = Self::determine_mapper_type(rom_type, detected_mapper);
 
         // Enhanced mapper validation
@@ -145,22 +150,8 @@ impl Cartridge {
             return Err("ROM too small for SNES format".to_string());
         }
 
-        // Special-case: Dragon Quest III (ROM type 0x31) — prefer the header location
-        // that actually contains 0x31 and use the dedicated mapper.
         let lo_hdr = 0x7FB0;
         let hi_hdr = 0xFFB0;
-        if rom.len() > hi_hdr + 0x30 {
-            let lo_type = rom[lo_hdr + 0x25];
-            let hi_type = rom[hi_hdr + 0x25];
-            if hi_type == 0x31 {
-                return Ok((hi_hdr, MapperType::DragonQuest3));
-            }
-            if lo_type == 0x31 {
-                return Ok((lo_hdr, MapperType::DragonQuest3));
-            }
-        }
-
-        // ROM type 0x31 はLoROMのヘッダ位置を優先（標準LoROM検出を使う）
 
         let lorom_score = Self::score_header(rom, lo_hdr);
         let hirom_score = Self::score_header(rom, hi_hdr);
@@ -206,22 +197,12 @@ impl Cartridge {
     }
 
     fn determine_mapper_type(rom_type: u8, detected: MapperType) -> MapperType {
-        // Use detected mapper as base, but check for special cases
-        let chip_type = rom_type & 0x0F;
-        let _enhancement_chip = rom_type & 0xF0;
-
-        // 可能な限りヘッダスコアの検出結果（detected）を優先し、
-        // 強制的なマッピング上書きは避ける。
-        // Special-case full type byte first
-        if rom_type == 0x31 {
-            return MapperType::DragonQuest3;
-        }
-
-        match chip_type {
-            0x1A => MapperType::SuperFx, // Super FX chip
-            0x34 => MapperType::Sa1,     // SA-1 chip
-            0x05 => MapperType::ExHiRom, // 一部拡張HiROM
-            _ => detected,               // それ以外はスコア検出に従う
+        // Prefer the detected mapping (LoROM/HiROM/ExHiROM) and only override when
+        // the ROM type clearly indicates an enhancement chip that changes the bus.
+        match rom_type {
+            0x1A => MapperType::SuperFx, // Super FX
+            0x34 => MapperType::Sa1,     // SA-1
+            _ => detected,
         }
     }
 
@@ -269,23 +250,20 @@ impl Cartridge {
     }
 
     fn decode_ram_size(size_code: u8) -> usize {
-        match size_code {
-            0x00 => 0,
-            0x01 => 2 * 1024,    // 2KB
-            0x02 => 8 * 1024,    // 8KB
-            0x03 => 32 * 1024,   // 32KB
-            0x04 => 128 * 1024,  // 128KB
-            0x05 => 256 * 1024,  // 256KB
-            0x06 => 512 * 1024,  // 512KB
-            0x07 => 1024 * 1024, // 1MB
-            _ => {
-                if size_code <= 0x0C {
-                    1024 << size_code // Standard formula
-                } else {
-                    8 * 1024 // Default to 8KB for unknown values
-                }
-            }
+        // RAM size is encoded as "1 << N kilobytes" (with 0 meaning no RAM).
+        // Examples:
+        //   N=1 => 2KB
+        //   N=3 => 8KB
+        //   N=5 => 32KB
+        // Some ROMs use 0xFF as "unknown/none"; treat as no RAM.
+        if size_code == 0x00 || size_code == 0xFF {
+            return 0;
         }
+        let shift = size_code as usize;
+        if shift >= usize::BITS as usize {
+            return 0;
+        }
+        1024usize << shift
     }
 
     fn validate_rom_size(actual_size: usize, header_size: usize) -> Result<(), String> {
@@ -304,6 +282,10 @@ impl Cartridge {
     }
 
     fn validate_checksums(checksum: u16, checksum_complement: u16) -> Result<(), String> {
+        // Debugフラグでチェックサムを無視できるようにする
+        if std::env::var_os("ALLOW_BAD_CHECKSUM").is_some() {
+            return Ok(());
+        }
         if checksum ^ checksum_complement != 0xFFFF {
             return Err(format!(
                 "Invalid checksums: 0x{:04X} ^ 0x{:04X} != 0xFFFF",
@@ -350,8 +332,8 @@ impl Cartridge {
             score += 8;
         }
 
-        // Cartridge type is at header base + 0x15; our base (0x7FB0/0xFFB0) is 0x10 bytes earlier
-        let rom_type = rom[offset + 0x25];
+        // ROM type ($FFD6/$7FD6) is at base + 0x16; our offset is 0x10 bytes earlier.
+        let rom_type = rom[offset + 0x26];
         if rom_type <= 0x37 {
             score += 2;
         }

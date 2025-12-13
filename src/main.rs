@@ -9,6 +9,7 @@ mod debug_flags;
 mod debugger;
 mod dma;
 mod emulator;
+mod fake_apu;
 mod input;
 mod ppu;
 mod sa1;

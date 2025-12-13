@@ -42,6 +42,8 @@ pub struct PpuSaveState {
     pub forced_blank: bool,
     pub nmi_enabled: bool,
     pub nmi_pending: bool,
+    #[serde(default)]
+    pub rdnmi_read_in_vblank: bool,
     pub bg_mode: u8,
     pub mosaic_size: u8,
     pub bg_enabled: [bool; 4],
@@ -59,21 +61,31 @@ pub struct PpuSaveState {
     pub oam_address: u16,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct ApuSaveState {
+    #[serde(default)]
     pub ram: Vec<u8>,
+    #[serde(default)]
     pub ports: [u8; 4],
+    #[serde(default)]
     pub dsp_registers: Vec<u8>,
+    #[serde(default)]
     pub cycle_counter: u64,
+    #[serde(default)]
     pub timers: Vec<TimerSaveState>,
+    #[serde(default)]
     pub channels: Vec<SoundChannelSaveState>,
+    #[serde(default)]
     pub master_volume_left: u8,
+    #[serde(default)]
     pub master_volume_right: u8,
+    #[serde(default)]
     pub echo_volume_left: u8,
+    #[serde(default)]
     pub echo_volume_right: u8,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct TimerSaveState {
     pub enabled: bool,
     pub target: u8,
@@ -261,6 +273,7 @@ impl Default for PpuSaveState {
             forced_blank: true,
             nmi_enabled: false,
             nmi_pending: false,
+            rdnmi_read_in_vblank: false,
             bg_mode: 0,
             mosaic_size: 1,
             bg_enabled: [false; 4],
@@ -276,45 +289,6 @@ impl Default for PpuSaveState {
             vram_increment: 1,
             cgram_address: 0,
             oam_address: 0,
-        }
-    }
-}
-
-impl Default for ApuSaveState {
-    fn default() -> Self {
-        Self {
-            ram: vec![0; 0x10000],
-            ports: [0; 4],
-            dsp_registers: vec![0; 128],
-            cycle_counter: 0,
-            timers: vec![
-                TimerSaveState {
-                    enabled: false,
-                    target: 0,
-                    counter: 0,
-                    divider: 0,
-                    divider_target: 128,
-                },
-                TimerSaveState {
-                    enabled: false,
-                    target: 0,
-                    counter: 0,
-                    divider: 0,
-                    divider_target: 128,
-                },
-                TimerSaveState {
-                    enabled: false,
-                    target: 0,
-                    counter: 0,
-                    divider: 0,
-                    divider_target: 16,
-                },
-            ],
-            channels: vec![SoundChannelSaveState::default(); 8],
-            master_volume_left: 127,
-            master_volume_right: 127,
-            echo_volume_left: 0,
-            echo_volume_right: 0,
         }
     }
 }

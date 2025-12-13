@@ -1,0 +1,15 @@
+[package]
+name = "snes-apu"
+version = "0.1.12"
+authors = ["ferris <jake@fusetools.com>"]
+description = "A Super Nintendo audio unit emulator."
+homepage = "https://github.com/emu-rs/snes-apu"
+repository = "https://github.com/emu-rs/snes-apu"
+keywords = ["snes", "super", "nintendo", "spc", "emulator"]
+license = "BSD-2-Clause"
+
+[dependencies]
+spc = "0.1.0"
+
+[dev-dependencies]
+emu = "0.1.3"

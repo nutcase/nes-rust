@@ -20,4 +20,8 @@ pub trait CpuBus {
     }
     fn acknowledge_nmi(&mut self) {}
     fn poll_irq(&mut self) -> bool;
+
+    /// 任意: CPUが直近で実行中のPCをバス側へ通知するためのフック。
+    /// 既定では何もしない。
+    fn set_last_cpu_pc(&mut self, _pc24: u32) {}
 }

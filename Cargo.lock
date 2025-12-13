@@ -962,6 +962,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "snes-apu"
+version = "0.1.12"
+dependencies = [
+ "spc",
+]
+
+[[package]]
 name = "snes_emulator"
 version = "0.1.0"
 dependencies = [
@@ -970,7 +977,14 @@ dependencies = [
  "rodio",
  "serde",
  "serde_json",
+ "snes-apu",
 ]
+
+[[package]]
+name = "spc"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de5279aa54689fb2e62630bfedcdb158eb0dd26e65036cf4773e54031949fa74"
 
 [[package]]
 name = "symphonia"

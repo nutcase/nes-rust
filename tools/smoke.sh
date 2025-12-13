@@ -41,7 +41,7 @@ HEADLESS_VIS_CHECK=1 \
 COMPAT_BOOT_FALLBACK=0 \
 COMPAT_INJECT_MIN_PALETTE=0 \
 COMPAT_PERIODIC_MIN_PALETTE=0 \
-cargo run --release --quiet -- "$ROM_ARG" 2>&1 \
+cargo run --release --quiet --bin snes_emulator -- "$ROM_ARG" 2>&1 \
     | tee "$TMP_LOG" \
     | tail -n "$TAIL_LINES"
 status=${PIPESTATUS[0]}

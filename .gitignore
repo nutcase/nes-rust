@@ -1,2 +1,9 @@
 /target
 /logs
+/roms
+/artifacts
+quicksave.sav
+.DS_Store
+/.agent
+/.claude
+/src/tools_dump.rs

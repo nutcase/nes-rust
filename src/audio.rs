@@ -8,7 +8,11 @@ pub struct SnesAudioSource {
     sample_rate: u32,
     channels: u16,
     current_frame: Vec<(i16, i16)>,
-    frame_position: usize,
+    // Interleaved sample cursor (L,R,L,R...) within current_frame.
+    // current_frame holds stereo frames; cursor counts i16 samples.
+    sample_cursor: usize,
+    // Fractional remainder accumulator for distributing non-integer samples per 60Hz frame.
+    frame_sample_rem_acc: u32,
 }
 
 impl SnesAudioSource {
@@ -21,22 +25,34 @@ impl SnesAudioSource {
             sample_rate,
             channels,
             current_frame: Vec::new(),
-            frame_position: 0,
+            sample_cursor: 0,
+            frame_sample_rem_acc: 0,
         }
     }
 
     fn generate_audio_frame(&mut self) {
-        const FRAME_SIZE: usize = 533; // ~60fps at 32kHz (32000/60)
+        // Produce ~60Hz worth of samples. 32000/60 = 533.333..., so distribute the remainder.
+        const FPS: u32 = 60;
+        let base = (self.sample_rate / FPS) as usize;
+        let rem = self.sample_rate % FPS;
+        self.frame_sample_rem_acc = self.frame_sample_rem_acc.saturating_add(rem);
+        let extra = if self.frame_sample_rem_acc >= FPS {
+            self.frame_sample_rem_acc -= FPS;
+            1
+        } else {
+            0
+        };
+        let frame_size = base + extra;
 
         // Generate a frame of audio samples
-        let mut samples = vec![(0i16, 0i16); FRAME_SIZE];
+        let mut samples = vec![(0i16, 0i16); frame_size];
 
-        if let Ok(apu) = self.apu.lock() {
+        if let Ok(mut apu) = self.apu.lock() {
             apu.generate_audio_samples(&mut samples);
         }
 
         self.current_frame = samples;
-        self.frame_position = 0;
+        self.sample_cursor = 0;
     }
 }
 
@@ -45,7 +61,7 @@ impl Iterator for SnesAudioSource {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Generate new frame if we've consumed the current one
-        if self.frame_position >= self.current_frame.len() {
+        if self.sample_cursor >= self.current_frame.len().saturating_mul(2) {
             self.generate_audio_frame();
         }
 
@@ -53,8 +69,8 @@ impl Iterator for SnesAudioSource {
             return Some(0);
         }
 
-        let sample_index = self.frame_position / 2;
-        let is_right_channel = self.frame_position % 2 == 1;
+        let sample_index = self.sample_cursor / 2;
+        let is_right_channel = self.sample_cursor % 2 == 1;
 
         if sample_index >= self.current_frame.len() {
             return Some(0);
@@ -66,7 +82,7 @@ impl Iterator for SnesAudioSource {
             self.current_frame[sample_index].0
         };
 
-        self.frame_position += 1;
+        self.sample_cursor += 1;
         Some(sample)
     }
 }

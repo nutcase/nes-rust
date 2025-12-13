@@ -1,9 +1,13 @@
 // SNES Input Controller implementation
 
+use crate::debug_flags;
+
 #[derive(Debug, Clone, Default)]
 pub struct SnesController {
     // コントローラーの状態（ビットフィールド）
     buttons: u16,
+    // 強制的に押下したことにするボタン（デバッグ/ヘッドレス用）
+    auto_buttons: u16,
     // シフトレジスタ（読み取り用）
     shift_register: u16,
     // ラッチされた状態
@@ -33,10 +37,20 @@ impl SnesController {
     pub fn new() -> Self {
         Self {
             buttons: 0,
+            auto_buttons: 0,
             shift_register: 0,
             latched_buttons: 0,
             strobe: false,
         }
+    }
+
+    /// ハードウェア出力形式（アクティブLOW）に変換したボタン状態を返す
+    /// 1 = 未押下, 0 = 押下
+    #[inline]
+    pub fn active_low_bits(&self) -> u16 {
+        // SNESは12ボタン分のみ有効ビット（0..11）。上位4ビットは常に1が返る。
+        let combined = self.buttons | self.auto_buttons;
+        (!combined) | 0xF000
     }
 
     // ボタン状態を設定
@@ -52,6 +66,14 @@ impl SnesController {
     // 複数ボタンの状態を一度に設定
     pub fn set_buttons(&mut self, buttons: u16) {
         self.buttons = buttons;
+    }
+
+    pub fn set_auto_buttons(&mut self, mask: u16) {
+        self.auto_buttons = mask;
+        // strobe High 時には shift_register を即更新するため、再ラッチしておく
+        if self.strobe {
+            self.latch_buttons();
+        }
     }
 
     // 現在のボタン状態を取得
@@ -80,7 +102,8 @@ impl SnesController {
     pub fn read_data(&mut self) -> u8 {
         if self.strobe {
             // ストローブ中は常にAボタンの状態を返す
-            ((self.buttons & button::B) != 0) as u8
+            // ハードはアクティブLOWなので未押下=1, 押下=0
+            ((self.buttons & button::B) == 0) as u8
         } else {
             // シフトレジスタから1ビットずつ読み出し
             let result = (self.shift_register & 0x0001) as u8;
@@ -94,7 +117,8 @@ impl SnesController {
     fn latch_buttons(&mut self) {
         // ボタンの読み出し順序に合わせて並び替え
         // SNESの読み出し順序: B, Y, Select, Start, Up, Down, Left, Right, A, X, L, R
-        self.latched_buttons = self.buttons;
+        // 実機出力に合わせアクティブLOW（未押下=1, 押下=0）に反転する
+        self.latched_buttons = self.active_low_bits();
         self.shift_register = self.latched_buttons;
     }
 
@@ -160,8 +184,20 @@ pub struct InputSystem {
 
 impl InputSystem {
     pub fn new() -> Self {
+        let mut controller1 = SnesController::new();
+        // 環境変数 AUTO_JOYPAD1_MASK で常時押下するボタンを指定できる（例: 0x0100 = A）
+        if let Ok(val) = std::env::var("AUTO_JOYPAD1_MASK") {
+            if let Ok(mask) = u16::from_str_radix(val.trim_start_matches("0x"), 16)
+                .or_else(|_| val.parse::<u16>())
+            {
+                controller1.set_auto_buttons(mask);
+                if !debug_flags::quiet() {
+                    println!("AUTO_JOYPAD1_MASK set: 0x{:04X}", mask);
+                }
+            }
+        }
         Self {
-            controller1: SnesController::new(),
+            controller1,
             controller2: SnesController::new(),
             controller3: SnesController::new(),
             controller4: SnesController::new(),
@@ -251,6 +287,14 @@ impl InputSystem {
     }
     pub fn controller4_buttons(&self) -> u16 {
         self.controller4.get_buttons()
+    }
+
+    pub fn controller3_active_low(&self) -> u16 {
+        self.controller3.active_low_bits()
+    }
+
+    pub fn controller4_active_low(&self) -> u16 {
+        self.controller4.active_low_bits()
     }
 }
 

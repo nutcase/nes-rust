@@ -136,9 +136,34 @@ impl DmaController {
 
     // DMAレジスタ書き込み
     pub fn write(&mut self, addr: u16, value: u8) {
+        // Lightweight debug hook: dump early DMA register writes when TRACE_DMA_REG is set.
+        if std::env::var_os("TRACE_DMA_REG").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 256 {
+                let ch = ((addr.saturating_sub(0x4300)) >> 4) as u8;
+                let reg = addr & 0x0F;
+                println!(
+                    "[DMA-REG] W ${:04X} ch{} reg=${:X} val={:02X}",
+                    addr + 0x0000,
+                    ch,
+                    reg,
+                    value
+                );
+            }
+        }
         match addr {
             0x420B => {
                 self.dma_enable = value;
+                if (debug_flags::dma() || debug_flags::dma_reg()) && !debug_flags::quiet() {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static EN_LOG: AtomicU32 = AtomicU32::new(0);
+                    let n = EN_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 64 {
+                        println!("[DMA-EN] $420B MDMAEN=0x{:02X}", value);
+                    }
+                }
             }
             0x420C => {
                 self.hdma_enable = value;
@@ -160,6 +185,19 @@ impl DmaController {
                 let reg = (addr & 0x0F) as u8;
 
                 if channel < 8 {
+                    if channel == 1 && debug_flags::dma_reg() {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static COUNT1: AtomicU32 = AtomicU32::new(0);
+                        let n = COUNT1.fetch_add(1, Ordering::Relaxed);
+                        if n < 32 {
+                            println!(
+                                "[DMA1-REG] W ${:04X} reg=${:X} val={:02X}",
+                                addr + 0x0000,
+                                reg,
+                                value
+                            );
+                        }
+                    }
                     match reg {
                         0x00 => {
                             self.channels[channel].control = value;
@@ -168,19 +206,13 @@ impl DmaController {
                             self.channels[channel].configured = true;
                             self.channels[channel].cfg_ctrl = true;
                             if debug_flags::dma_reg() {
-                                static mut DMA_CTRL_LOG_CNT: u32 = 0;
-                                unsafe {
-                                    DMA_CTRL_LOG_CNT += 1;
-                                    if DMA_CTRL_LOG_CNT <= 16 {
-                                        println!(
-                                            "DMA ch{} control=0x{:02X} (unit={}, addr_mode={})",
-                                            channel,
-                                            value,
-                                            self.channels[channel].get_transfer_unit(),
-                                            self.channels[channel].get_address_mode()
-                                        );
-                                    }
-                                }
+                                println!(
+                                    "DMA ch{} control=0x{:02X} (unit={}, addr_mode={})",
+                                    channel,
+                                    value,
+                                    self.channels[channel].get_transfer_unit(),
+                                    self.channels[channel].get_address_mode()
+                                );
                             }
                         }
                         0x01 => {
@@ -188,18 +220,34 @@ impl DmaController {
                             self.channels[channel].dest_address = value;
                             self.channels[channel].configured = true;
                             self.channels[channel].cfg_dest = true;
+                            if debug_flags::dma_reg() {
+                                use std::sync::atomic::{AtomicU32, Ordering};
+                                static DEST_LOG: AtomicU32 = AtomicU32::new(0);
+                                let n = DEST_LOG.fetch_add(1, Ordering::Relaxed);
+                                if n < 64 {
+                                    println!(
+                                        "[DMA-DEST-REG] ch{} BBAD=$21{:02X} (reg=${:04X})",
+                                        channel, value, addr
+                                    );
+                                }
+                                // Lightweight trace for graphics-related destinations
+                                if matches!(value, 0x18 | 0x19 | 0x22 | 0x04) {
+                                    static DEST_TRACE: AtomicU32 = AtomicU32::new(0);
+                                    let n = DEST_TRACE.fetch_add(1, Ordering::Relaxed);
+                                    if n < 32 {
+                                        println!(
+                                            "[DMA-DEST] ch{} dest=$21{:02X} (graphics path)",
+                                            channel, value
+                                        );
+                                    }
+                                }
+                            }
                             if (debug_flags::dma_reg() || debug_flags::cgram_dma()) && value == 0x22
                             {
                                 println!("DMA ch{} configured for CGRAM ($2122)", channel);
                             }
                             if debug_flags::dma_reg() {
-                                static mut DMA_DEST_LOG_CNT: u32 = 0;
-                                unsafe {
-                                    DMA_DEST_LOG_CNT += 1;
-                                    if DMA_DEST_LOG_CNT <= 16 {
-                                        println!("DMA ch{} dest=$21{:02X}", channel, value);
-                                    }
-                                }
+                                println!("DMA ch{} dest=$21{:02X}", channel, value);
                             }
                         }
                         0x02 => {
@@ -208,13 +256,7 @@ impl DmaController {
                             self.channels[channel].configured = true;
                             self.channels[channel].cfg_src = true;
                             if debug_flags::dma_reg() {
-                                static mut DMA_SRC_LOG_CNT: u32 = 0;
-                                unsafe {
-                                    DMA_SRC_LOG_CNT += 1;
-                                    if DMA_SRC_LOG_CNT <= 16 {
-                                        println!("DMA ch{} src.lo=0x{:02X}", channel, value);
-                                    }
-                                }
+                                println!("DMA ch{} src.lo=0x{:02X}", channel, value);
                             }
                         }
                         0x03 => {
@@ -224,13 +266,7 @@ impl DmaController {
                             self.channels[channel].configured = true;
                             self.channels[channel].cfg_src = true;
                             if debug_flags::dma_reg() {
-                                static mut DMA_SRC_LOG_CNT2: u32 = 0;
-                                unsafe {
-                                    DMA_SRC_LOG_CNT2 += 1;
-                                    if DMA_SRC_LOG_CNT2 <= 16 {
-                                        println!("DMA ch{} src.mid=0x{:02X}", channel, value);
-                                    }
-                                }
+                                println!("DMA ch{} src.mid=0x{:02X}", channel, value);
                             }
                         }
                         0x04 => {
@@ -240,13 +276,7 @@ impl DmaController {
                             self.channels[channel].configured = true;
                             self.channels[channel].cfg_src = true;
                             if debug_flags::dma_reg() {
-                                static mut DMA_SRC_LOG_CNT3: u32 = 0;
-                                unsafe {
-                                    DMA_SRC_LOG_CNT3 += 1;
-                                    if DMA_SRC_LOG_CNT3 <= 16 {
-                                        println!("DMA ch{} src.bank=0x{:02X}", channel, value);
-                                    }
-                                }
+                                println!("DMA ch{} src.bank=0x{:02X}", channel, value);
                             }
                         }
                         0x05 => {
@@ -263,13 +293,7 @@ impl DmaController {
                                 );
                             }
                             if debug_flags::dma_reg() {
-                                static mut DMA_SIZE_LOG_CNT: u32 = 0;
-                                unsafe {
-                                    DMA_SIZE_LOG_CNT += 1;
-                                    if DMA_SIZE_LOG_CNT <= 16 {
-                                        println!("DMA ch{} size.lo=0x{:02X}", channel, value);
-                                    }
-                                }
+                                println!("DMA ch{} size.lo=0x{:02X}", channel, value);
                             }
                         }
                         0x06 => {

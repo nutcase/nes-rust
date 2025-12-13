@@ -1,11 +1,16 @@
 #![allow(static_mut_refs)]
 // Logging controls (runtime via env — see debug_flags)
 const IMPORTANT_WRITE_LIMIT: u32 = 10; // How many important writes to print
+use std::sync::OnceLock;
 
 pub struct Ppu {
     vram: Vec<u8>,
     cgram: Vec<u8>,
     oam: Vec<u8>,
+    // DQ3専用: INIDISP への DMA/HDMA を無視するフラグ
+    dq3_block_inidisp: bool,
+    /// 強制ブランクを無視して描画するデバッグ／DQ3用のオーバーライド
+    force_display_override: bool,
 
     pub scanline: u16,
     // Current dot within the scanline (0..=340 approx). This is our dot counter.
@@ -112,6 +117,9 @@ pub struct Ppu {
     mode7_center_x: i16, // Mode 7回転中心X ($211F)
     mode7_center_y: i16, // Mode 7回転中心Y ($2120)
 
+    // Mode 7 乗算結果キャッシュ ($2134-$2136)
+    mode7_mul_result: u32, // 24bit 有効（下位3バイト）
+
     // Mode 7 register write latches (two-write: low then high)
     m7_latch_low: [u8; 6],
     m7_latch_second: [bool; 6],
@@ -127,7 +135,9 @@ pub struct Ppu {
 
     pub nmi_enabled: bool,
     pub nmi_flag: bool,
-    nmi_latched: bool,
+    pub nmi_latched: bool,
+    /// 同一VBlank中にRDNMIが読まれたか（読まれたら再セットしないためのフラグ）
+    pub rdnmi_read_in_vblank: bool,
 
     v_blank: bool,
     h_blank: bool,
@@ -256,6 +266,7 @@ pub struct Ppu {
 
     // Distinguish CPU vs MDMA vs HDMA register writes (0=CPU,1=MDMA,2=HDMA)
     write_ctx: u8,
+    debug_dma_channel: Option<u8>, // active MDMA/HDMA channel for debug logs
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +288,11 @@ enum SpriteSize {
 }
 
 impl Ppu {
+    #[inline]
+    fn force_display_active(&self) -> bool {
+        self.force_display_override || crate::debug_flags::force_display()
+    }
+
     // --- Coarse NTSC timing helpers ---
     #[inline]
     fn dots_per_line(&self) -> u16 {
@@ -292,7 +308,16 @@ impl Ppu {
     }
     #[inline]
     pub fn get_visible_height(&self) -> u16 {
-        224
+        // デバッグ用に表示高さを短くして早めにVBlankへ入れるオプション。
+        // 環境変数 PPU_VIS_HEIGHT を指定するとその値を使う（例: 200）。
+        static VIS: OnceLock<u16> = OnceLock::new();
+        *VIS.get_or_init(|| {
+            std::env::var("PPU_VIS_HEIGHT")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .filter(|v| *v >= 160 && *v <= 239)
+                .unwrap_or(224)
+        })
     } // TODO: overscan=239 when supported
     #[inline]
     fn fixed8_floor(val: i64) -> i32 {
@@ -308,6 +333,9 @@ impl Ppu {
             vram: vec![0; 0x10000],
             cgram: vec![0; 0x200],
             oam: vec![0; 0x220],
+
+            dq3_block_inidisp: false,
+            force_display_override: false,
 
             scanline: 0,
             cycle: 0,
@@ -404,6 +432,7 @@ impl Ppu {
             mode7_matrix_d: 256, // 1.0 in fixed point (8.8)
             mode7_center_x: 0,
             mode7_center_y: 0,
+            mode7_mul_result: 0,
 
             m7_latch_low: [0; 6],
             m7_latch_second: [false; 6],
@@ -417,8 +446,10 @@ impl Ppu {
             interlace: false,
 
             nmi_enabled: false,
-            nmi_flag: false,
+            // 実機ではリセット直後に RDNMI フラグ(bit7)が1の状態から始まるため、初期値をtrueにしておく。
+            nmi_flag: true,
             nmi_latched: false,
+            rdnmi_read_in_vblank: false,
 
             v_blank: false,
             h_blank: false,
@@ -517,10 +548,11 @@ impl Ppu {
             dbg_math_blocked_backdrop: 0,
 
             write_ctx: 0,
+            debug_dma_channel: None,
         }
     }
 
-    pub fn step(&mut self, cycles: u8) {
+    pub fn step(&mut self, cycles: u16) {
         // Per-CPU-cycle PPU stepping (approx 1 CPU cycle -> 1 PPU dot)
         let dots_per_line = self.dots_per_line();
         let first_hblank = self.first_hblank_dot();
@@ -567,10 +599,10 @@ impl Ppu {
                 self.scanline = self.scanline.wrapping_add(1);
 
                 // VBlank transitions
+                // 通常: 可視領域終了の次のラインでVBlank突入
                 if self.scanline == vis_h {
-                    // Enter VBlank at the first line after visible area
                     if crate::debug_flags::boot_verbose() {
-                        println!("📺 ENTERING VBLANK at scanline 224");
+                        println!("📺 ENTERING VBLANK at scanline {}", self.scanline);
                     }
                     self.enter_vblank();
                 } else if self.scanline == 262 {
@@ -685,16 +717,33 @@ impl Ppu {
 
     fn enter_vblank(&mut self) {
         self.v_blank = true;
+        self.rdnmi_read_in_vblank = false; // 新しいVBlankでリセット
+                                           // RDNMIフラグ（$4210 bit7）はNMI許可に関わらずVBlank突入で立つ。
+                                           // 読み出しでクリアされるが、VBlank中は常に再セットされる挙動に近づける。
+        self.nmi_flag = true;
+        // NMIパルスは許可時のみCPUへ届ける。ラッチを使って多重発火を防ぐ。
         if self.nmi_enabled && !self.nmi_latched {
-            self.nmi_flag = true;
             self.nmi_latched = true; // ensure one NMI per VBlank
+        }
+        if std::env::var_os("TRACE_VBLANK").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                println!(
+                    "[TRACE_VBLANK] frame={} scanline={} nmi_flag={} nmi_en={} latched={}",
+                    self.frame, self.scanline, self.nmi_flag, self.nmi_enabled, self.nmi_latched
+                );
+            }
         }
     }
 
     fn exit_vblank(&mut self) {
         self.v_blank = false;
+        // VBlankが終わったらRDNMIフラグも必ず下げる
         self.nmi_flag = false;
         self.nmi_latched = false;
+        self.rdnmi_read_in_vblank = false;
     }
 
     // Returns true if we're currently in the active display area (not V/HBlank)
@@ -1243,7 +1292,7 @@ impl Ppu {
     fn get_pixel_color(&mut self, x: u16, y: u16) -> u32 {
         // Respect forced blank: when set, output black regardless of scene state
         let mut forced_blank = (self.screen_display & 0x80) != 0;
-        if crate::debug_flags::force_display() {
+        if self.force_display_active() {
             forced_blank = false;
         }
         if forced_blank {
@@ -2198,8 +2247,9 @@ impl Ppu {
         // Calculate word address first, then convert to byte index
         let map_entry_word_addr = tilemap_base_word
             .saturating_add(quadrant * 0x400) // 32x32 tilemap = 1024 words
-            .saturating_add((map_ty as u32) * 32 + map_tx as u32);
-        let map_entry_addr = map_entry_word_addr * 2; // Convert to byte index for VRAM access
+            .saturating_add((map_ty as u32) * 32 + map_tx as u32)
+            & 0x7FFF; // VRAM mirrors at 0x8000 words
+        let map_entry_addr = (map_entry_word_addr * 2) as usize; // Convert to byte index for VRAM access
 
         // Debug address calculation and VRAM content
         static mut ADDR_DEBUG_COUNT: u32 = 0;
@@ -2228,16 +2278,6 @@ impl Ppu {
                 }
             }
         }
-
-        // Apply VRAM address wrapping for tilemap access
-        // SNES VRAM is 64KB (0x10000 bytes), but emulator may have 32KB
-        let map_entry_addr = if self.vram.len() >= 0x10000 {
-            // Full 64KB VRAM - use address directly
-            map_entry_addr as usize
-        } else {
-            // 32KB VRAM - wrap high addresses to lower range
-            (map_entry_addr & 0x7FFF) as usize
-        };
 
         if map_entry_addr + 1 >= self.vram.len() {
             return (0, 0);
@@ -2303,9 +2343,9 @@ impl Ppu {
             _ => 0,
         };
 
-        // tile_base is in words (from register << 12)
+        // tile_base is in VRAM words (from BGxNBA registers)
         // 2bpp tile = 16 bytes = 8 words
-        let tile_addr = (tile_base + (tile_id * 8)) & 0xFFFF;
+        let tile_addr = tile_base.wrapping_add(tile_id.wrapping_mul(8)) & 0x7FFF;
 
         // Fix VRAM addressing: Handle high address ranges correctly
         // VRAM is 64KB but may be mirrored/banked, don't reject high addresses immediately
@@ -2323,7 +2363,8 @@ impl Ppu {
         }
         // tile_addr is in words, convert to byte index by multiplying by 2
         let plane0_addr = ((tile_addr + rel_y as u16) as usize) * 2;
-        let plane1_addr = ((tile_addr + rel_y as u16 + 8) as usize) * 2;
+        // 2bpp は同じ行内で plane0, plane1 が連続する 2 バイト（row*2 + {0,1}）
+        let plane1_addr = plane0_addr + 1;
         if plane0_addr >= self.vram.len() || plane1_addr >= self.vram.len() {
             return (0, 0);
         }
@@ -2527,7 +2568,7 @@ impl Ppu {
             3 => self.bg4_tile_base,
             _ => 0,
         };
-        // tile_base is in words (from register << 12)
+        // tile_base is in VRAM words (from BGxNBA registers)
         // 4bpp tile = 32 bytes = 16 words
         let tile_addr = (tile_base.wrapping_add(tile_id.wrapping_mul(16))) & 0x7FFF; // Mask to VRAM range
 
@@ -2544,11 +2585,15 @@ impl Ppu {
             }
         }
 
-        // tile_addr is in words, convert to byte index
-        let plane0_addr = ((tile_addr + rel_y as u16) as usize) * 2;
-        let plane1_addr = ((tile_addr + rel_y as u16 + 8) as usize) * 2;
-        let plane2_addr = ((tile_addr + rel_y as u16 + 16) as usize) * 2;
-        let plane3_addr = ((tile_addr + rel_y as u16 + 24) as usize) * 2;
+        // 4bpp tile layout in VRAM (word-addressed):
+        // - words 0..7:  plane0 (low byte) + plane1 (high byte) for rows 0..7
+        // - words 8..15: plane2 (low byte) + plane3 (high byte) for rows 0..7
+        let row01_word = (tile_addr.wrapping_add(rel_y as u16)) & 0x7FFF;
+        let row23_word = (tile_addr.wrapping_add(8).wrapping_add(rel_y as u16)) & 0x7FFF;
+        let plane0_addr = (row01_word as usize) * 2;
+        let plane1_addr = plane0_addr + 1;
+        let plane2_addr = (row23_word as usize) * 2;
+        let plane3_addr = plane2_addr + 1;
         if plane3_addr >= self.vram.len() {
             return (0, 0);
         }
@@ -2585,9 +2630,9 @@ impl Ppu {
         };
 
         let plane0 = get_vram_with_fallback(plane0_addr, rel_y as usize);
-        let plane1 = get_vram_with_fallback(plane1_addr, rel_y as usize + 8);
-        let plane2 = get_vram_with_fallback(plane2_addr, rel_y as usize + 16);
-        let plane3 = get_vram_with_fallback(plane3_addr, rel_y as usize + 24);
+        let plane1 = get_vram_with_fallback(plane1_addr, rel_y as usize);
+        let plane2 = get_vram_with_fallback(plane2_addr, rel_y as usize);
+        let plane3 = get_vram_with_fallback(plane3_addr, rel_y as usize);
 
         // Optional tile debug (disabled by default)
         if crate::debug_flags::boot_verbose() {
@@ -2643,12 +2688,15 @@ impl Ppu {
     }
 
     fn render_bg_8bpp(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
-        // Mode 4の8bpp描画（256色）
-        let tile_size = 8;
+        let tile_16 = self.bg_tile_16[bg_num as usize];
+        let tile_px = if tile_16 { 16 } else { 8 } as u16;
+        let ss = self.bg_screen_size[bg_num as usize];
+        let width_tiles = if ss == 1 || ss == 3 { 64 } else { 32 } as u16;
+        let height_tiles = if ss == 2 || ss == 3 { 64 } else { 32 } as u16;
+        let wrap_x = width_tiles * tile_px;
+        let wrap_y = height_tiles * tile_px;
 
-        // モザイク効果適用
         let (mosaic_x, mosaic_y) = self.apply_mosaic(x, y, bg_num);
-
         let (scroll_x, scroll_y) = match bg_num {
             0 => (self.bg1_hscroll, self.bg1_vscroll),
             1 => (self.bg2_hscroll, self.bg2_vscroll),
@@ -2656,49 +2704,58 @@ impl Ppu {
             3 => (self.bg4_hscroll, self.bg4_vscroll),
             _ => (0, 0),
         };
+        let bg_x = (mosaic_x.wrapping_add(scroll_x)) % wrap_x;
+        let bg_y = (mosaic_y.wrapping_add(scroll_y)) % wrap_y;
 
-        let bg_x = (mosaic_x + scroll_x) % 1024;
-        let bg_y = (mosaic_y + scroll_y) % 1024;
+        let tile_x = bg_x / tile_px;
+        let tile_y = bg_y / tile_px;
 
-        let tile_x = bg_x / tile_size;
-        let tile_y = bg_y / tile_size;
-
-        let tilemap_addr = match bg_num {
+        let tilemap_base_word = match bg_num {
             0 => self.bg1_tilemap_base,
             1 => self.bg2_tilemap_base,
             2 => self.bg3_tilemap_base,
             3 => self.bg4_tilemap_base,
             _ => 0,
-        };
-        // tilemap_addr is in words, convert to byte index
-        let map_entry_word_addr =
-            (tilemap_addr as u32).saturating_add((tile_y as u32) * 32 + (tile_x as u32));
+        } as u32;
+        let (map_tx, map_ty) = (tile_x % 32, tile_y % 32);
+        let scx = (tile_x / 32) as u32;
+        let scy = (tile_y / 32) as u32;
+        let width_screens = if ss == 1 || ss == 3 { 2 } else { 1 } as u32;
+        let quadrant = scx + scy * width_screens;
+        let map_entry_word_addr = tilemap_base_word
+            .saturating_add(quadrant * 0x400)
+            .saturating_add((map_ty as u32) * 32 + map_tx as u32)
+            & 0x7FFF;
         let map_entry_addr = map_entry_word_addr * 2;
-
-        if map_entry_addr >= 0x10000
-            || (map_entry_addr + 1) >= 0x10000
-            || (map_entry_addr + 1) as usize >= self.vram.len()
-        {
+        if (map_entry_addr as usize + 1) >= self.vram.len() {
             return (0, 0);
         }
 
         let map_entry_lo = self.vram[map_entry_addr as usize];
-        let map_entry_hi = self.vram[(map_entry_addr + 1) as usize];
+        let map_entry_hi = self.vram[(map_entry_addr as usize) + 1];
         let map_entry = ((map_entry_hi as u16) << 8) | (map_entry_lo as u16);
 
-        let tile_id = map_entry & 0x03FF;
+        let mut tile_id = map_entry & 0x03FF;
         let flip_x = (map_entry & 0x4000) != 0;
         let flip_y = (map_entry & 0x8000) != 0;
         let priority = (map_entry & 0x2000) != 0;
 
-        let mut pixel_x = (bg_x % tile_size) as u8;
-        let mut pixel_y = (bg_y % tile_size) as u8;
-
+        let mut rel_x = (bg_x % tile_px) as u8;
+        let mut rel_y = (bg_y % tile_px) as u8;
         if flip_x {
-            pixel_x = 7 - pixel_x;
+            rel_x = (tile_px as u8 - 1) - rel_x;
         }
         if flip_y {
-            pixel_y = 7 - pixel_y;
+            rel_y = (tile_px as u8 - 1) - rel_y;
+        }
+        if tile_16 {
+            let sub_x = (rel_x / 8) as u16;
+            let sub_y = (rel_y / 8) as u16;
+            tile_id = tile_id
+                .wrapping_add(sub_x)
+                .wrapping_add(sub_y.wrapping_mul(16));
+            rel_x %= 8;
+            rel_y %= 8;
         }
 
         let tile_base = match bg_num {
@@ -2708,30 +2765,50 @@ impl Ppu {
             3 => self.bg4_tile_base,
             _ => 0,
         };
-        // tile_base is in words (from register << 12)
-        // 8bpp tile = 64 bytes = 32 words
-        let tile_addr = tile_base + (tile_id * 32);
+        let tile_addr = tile_base.wrapping_add(tile_id.wrapping_mul(32)) & 0x7FFF;
 
-        // 8bppデータを読み取り（8プレーン）
-        // tile_addr is in words, convert to byte index
-        let mut color_index = 0u8;
-        for plane in 0..8 {
-            let plane_addr = ((tile_addr + pixel_y as u16 + plane * 8) as usize) * 2;
-            if plane_addr >= self.vram.len() {
-                return (0, 0);
-            }
-            let plane_data = self.vram[plane_addr];
-            let bit = 7 - pixel_x;
-            if (plane_data >> bit) & 1 != 0 {
-                color_index |= 1 << plane;
-            }
+        let row01_word = (tile_addr.wrapping_add(rel_y as u16)) & 0x7FFF;
+        let row23_word = (tile_addr.wrapping_add(8).wrapping_add(rel_y as u16)) & 0x7FFF;
+        let row45_word = (tile_addr.wrapping_add(16).wrapping_add(rel_y as u16)) & 0x7FFF;
+        let row67_word = (tile_addr.wrapping_add(24).wrapping_add(rel_y as u16)) & 0x7FFF;
+
+        let plane0_addr = (row01_word as usize) * 2;
+        let plane1_addr = plane0_addr + 1;
+        let plane2_addr = (row23_word as usize) * 2;
+        let plane3_addr = plane2_addr + 1;
+        let plane4_addr = (row45_word as usize) * 2;
+        let plane5_addr = plane4_addr + 1;
+        let plane6_addr = (row67_word as usize) * 2;
+        let plane7_addr = plane6_addr + 1;
+        if plane7_addr >= self.vram.len() {
+            return (0, 0);
         }
+
+        let p0 = self.vram[plane0_addr];
+        let p1 = self.vram[plane1_addr];
+        let p2 = self.vram[plane2_addr];
+        let p3 = self.vram[plane3_addr];
+        let p4 = self.vram[plane4_addr];
+        let p5 = self.vram[plane5_addr];
+        let p6 = self.vram[plane6_addr];
+        let p7 = self.vram[plane7_addr];
+
+        let bit = 7 - rel_x;
+        let mut color_index = 0u8;
+        color_index |= ((p0 >> bit) & 1) << 0;
+        color_index |= ((p1 >> bit) & 1) << 1;
+        color_index |= ((p2 >> bit) & 1) << 2;
+        color_index |= ((p3 >> bit) & 1) << 3;
+        color_index |= ((p4 >> bit) & 1) << 4;
+        color_index |= ((p5 >> bit) & 1) << 5;
+        color_index |= ((p6 >> bit) & 1) << 6;
+        color_index |= ((p7 >> bit) & 1) << 7;
 
         if color_index == 0 {
-            return (0, 0); // 透明
+            return (0, 0);
         }
 
-        let palette_index = self.get_bg_palette_index(0, color_index, 8); // 8bppはパレット番号無し
+        let palette_index = self.get_bg_palette_index(0, color_index, 8);
         let color = self.cgram_to_rgb(palette_index);
         let priority_value = if priority { 1 } else { 0 };
         (color, priority_value)
@@ -3034,12 +3111,15 @@ impl Ppu {
     }
 
     fn apply_brightness(&self, color: u32) -> u32 {
-        // Forced blank overrides everything (unless FORCE_DISPLAY)
-        if (self.screen_display & 0x80) != 0 && !crate::debug_flags::force_display() {
+        // Forced blank overrides everything (unless FORCE_DISPLAY or FORCE_NO_BLANK)
+        if (self.screen_display & 0x80) != 0
+            && !self.force_display_active()
+            && std::env::var_os("FORCE_NO_BLANK").is_none()
+        {
             return 0xFF000000;
         }
         // Apply INIDISP brightness level (0..15). 15 = full.
-        let factor = if crate::debug_flags::force_display() {
+        let factor = if self.force_display_active() {
             15
         } else {
             (self.brightness as u32).min(15)
@@ -3402,7 +3482,7 @@ impl Ppu {
 
         // tile_addr is in words, convert to byte index
         let plane0_addr = ((tile_addr + pixel_y as u16) as usize) * 2;
-        let plane1_addr = ((tile_addr + pixel_y as u16 + 8) as usize) * 2;
+        let plane1_addr = plane0_addr + 1;
 
         if plane0_addr >= self.vram.len() || plane1_addr >= self.vram.len() {
             return 0;
@@ -3430,11 +3510,13 @@ impl Ppu {
         // 4bpp sprite tile = 32 bytes = 16 words
         let tile_addr = (self.sprite_name_base >> 1) + (tile_num * 16);
 
-        // tile_addr is in words, convert to byte index
-        let plane0_addr = ((tile_addr + pixel_y as u16) as usize) * 2;
-        let plane1_addr = ((tile_addr + pixel_y as u16 + 8) as usize) * 2;
-        let plane2_addr = ((tile_addr + pixel_y as u16 + 16) as usize) * 2;
-        let plane3_addr = ((tile_addr + pixel_y as u16 + 24) as usize) * 2;
+        // 4bpp sprite tile layout matches BG 4bpp: (plane0/1) then (plane2/3), 8 words each.
+        let row01_word = (tile_addr.wrapping_add(pixel_y as u16)) & 0x7FFF;
+        let row23_word = (tile_addr.wrapping_add(8).wrapping_add(pixel_y as u16)) & 0x7FFF;
+        let plane0_addr = (row01_word as usize) * 2;
+        let plane1_addr = plane0_addr + 1;
+        let plane2_addr = (row23_word as usize) * 2;
+        let plane3_addr = plane2_addr + 1;
 
         if plane3_addr >= self.vram.len() {
             return 0;
@@ -3467,19 +3549,40 @@ impl Ppu {
         // 8bpp sprite tile = 64 bytes = 32 words
         let tile_addr = (self.sprite_name_base >> 1) + (tile_num * 32);
 
-        let mut color_index = 0u8;
-        for plane in 0..8 {
-            // tile_addr is in words, convert to byte index
-            let plane_addr = ((tile_addr + pixel_y as u16 + plane * 8) as usize) * 2;
-            if plane_addr >= self.vram.len() {
-                return 0;
-            }
-            let plane_data = self.vram[plane_addr];
-            let bit = 7 - pixel_x;
-            if (plane_data >> bit) & 1 != 0 {
-                color_index |= 1 << plane;
-            }
+        // 8bpp layout is 4 plane-pairs of 8 words each:
+        // - +0:  plane0/1 rows 0..7
+        // - +8:  plane2/3 rows 0..7
+        // - +16: plane4/5 rows 0..7
+        // - +24: plane6/7 rows 0..7
+        let row0 = (tile_addr.wrapping_add(pixel_y as u16)) & 0x7FFF;
+        let row1 = (tile_addr.wrapping_add(8).wrapping_add(pixel_y as u16)) & 0x7FFF;
+        let row2 = (tile_addr.wrapping_add(16).wrapping_add(pixel_y as u16)) & 0x7FFF;
+        let row3 = (tile_addr.wrapping_add(24).wrapping_add(pixel_y as u16)) & 0x7FFF;
+        let a0 = (row0 as usize) * 2;
+        let a1 = (row1 as usize) * 2;
+        let a2 = (row2 as usize) * 2;
+        let a3 = (row3 as usize) * 2;
+        if a3 + 1 >= self.vram.len() {
+            return 0;
         }
+        let p0 = self.vram[a0];
+        let p1 = self.vram[a0 + 1];
+        let p2 = self.vram[a1];
+        let p3 = self.vram[a1 + 1];
+        let p4 = self.vram[a2];
+        let p5 = self.vram[a2 + 1];
+        let p6 = self.vram[a3];
+        let p7 = self.vram[a3 + 1];
+
+        let bit = 7 - pixel_x;
+        let color_index = ((p7 >> bit) & 1) << 7
+            | ((p6 >> bit) & 1) << 6
+            | ((p5 >> bit) & 1) << 5
+            | ((p4 >> bit) & 1) << 4
+            | ((p3 >> bit) & 1) << 3
+            | ((p2 >> bit) & 1) << 2
+            | ((p1 >> bit) & 1) << 1
+            | ((p0 >> bit) & 1);
 
         if color_index == 0 {
             return 0; // 透明
@@ -3761,13 +3864,13 @@ impl Ppu {
 
     pub fn read(&mut self, addr: u16) -> u8 {
         match addr {
-            0x34 => 0,
-            0x35 => 0,
-            0x36 => 0,
+            0x34 => (self.mode7_mul_result & 0xFF) as u8, // product bit7-0
+            0x35 => ((self.mode7_mul_result >> 8) & 0xFF) as u8, // product bit15-8
+            0x36 => ((self.mode7_mul_result >> 16) & 0xFF) as u8, // product bit23-16
             0x37 => {
-                let result = if self.nmi_flag { 0x80 } else { 0 };
-                self.nmi_flag = false;
-                result
+                // $2137 (SLHV) - latch H/V counters on read.
+                // 本実装ではラッチ未実装のため 0 を返すが、RDNMI とは無関係なので nmi_flag は触らない。
+                0
             }
             0x38 => {
                 // OAMDATAREAD ($2138)
@@ -3889,7 +3992,7 @@ impl Ppu {
         }
     }
 
-    pub fn write(&mut self, addr: u16, value: u8) {
+    pub fn write(&mut self, addr: u16, mut value: u8) {
         // Debug $2105 writes to detect corruption
         if addr == 0x05 {
             static mut BG_MODE_WRITE_COUNT: u32 = 0;
@@ -4004,13 +4107,77 @@ impl Ppu {
                 let defer_update =
                     crate::debug_flags::strict_ppu_timing() && self.in_active_display();
 
+                // DQ3: optionally block DMA/HDMAによる強制ブランキング
+                if self.dq3_block_inidisp && self.write_ctx != 0 {
+                    return;
+                }
+
+                // Optional debug override: ignore forced blank/zero brightness when DQ3_FORCE_DISPLAY=1
+                if std::env::var("DQ3_FORCE_DISPLAY")
+                    .map(|v| v == "1" || v.to_lowercase() == "true")
+                    .unwrap_or(false)
+                {
+                    // Clear forced blank bit and clamp brightness to at least 1
+                    let mut forced = value & 0x0F;
+                    if forced == 0 {
+                        forced = 0x0F;
+                    }
+                    let mut patched = value & 0xF0; // keep high nibble for logging
+                    patched &= !0x80; // clear forced blank
+                    patched = (patched & 0xF0) | (forced & 0x0F);
+                    if patched != value {
+                        value = patched;
+                    }
+                }
+                // Optional: globally lock the display ON (for stubborn titles like SMW when APU upload is stubbed)
+                if std::env::var("FORCE_INIDISP_ON")
+                    .map(|v| v == "1" || v.to_lowercase() == "true")
+                    .unwrap_or(false)
+                {
+                    let mut patched = value & 0x0F; // brightness only
+                    if patched == 0 {
+                        patched = 0x0F;
+                    }
+                    value = patched; // ensure forced blank bit cleared
+                }
+
+                // Optional: ignore CPU writes to INIDISP (debug workaround for stubborn blanking)
+                if self.write_ctx == 0 && crate::debug_flags::ignore_inidisp_cpu() {
+                    return;
+                }
+
+                // CPU writes (write_ctx == 0): log first few to catch unintended values (e.g., 0x9X)
+                if self.write_ctx == 0 && std::env::var_os("TRACE_INIDISP_CPU").is_some() {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static COUNT: AtomicU32 = AtomicU32::new(0);
+                    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        println!(
+                            "[INIDISP-CPU][{}] scanline={} value=0x{:02X} (prev=0x{:02X} forced_blank={})",
+                            n + 1,
+                            self.scanline,
+                            value,
+                            prev_display,
+                            (value & 0x80) != 0
+                        );
+                    }
+                }
+
                 // Detect and log DMA/HDMA writes to INIDISP
                 if self.write_ctx != 0 {
+                    // Mario 起動安定化: HDMA/MDMA からの INIDISP 書き込みは無効化
+                    let allow_dma_write = std::env::var("ALLOW_INIDISP_DMA")
+                        .map(|v| v == "1" || v.to_lowercase() == "true")
+                        .unwrap_or(false);
+                    if !allow_dma_write {
+                        return;
+                    }
                     let source = match self.write_ctx {
                         1 => "MDMA",
                         2 => "HDMA",
                         _ => "unknown",
                     };
+                    let ch = self.debug_dma_channel.unwrap_or(0xFF);
 
                     static mut INIDISP_DMA_WRITE_COUNT: u32 = 0;
                     static mut INIDISP_DMA_BLANK_ON: u32 = 0;
@@ -4030,9 +4197,10 @@ impl Ppu {
                             || INIDISP_DMA_WRITE_COUNT <= 20
                         {
                             println!(
-                                "⚠️  {} write to INIDISP #{}: value=0x{:02X} (blank={} brightness={}) [total: {} on={} off={}]",
+                                "⚠️  {} write to INIDISP #{} (ch={}): value=0x{:02X} (blank={} brightness={}) [total: {} on={} off={}]",
                                 source,
                                 INIDISP_DMA_WRITE_COUNT,
+                                if ch == 0xFF { -1 } else { ch as i32 },
                                 value,
                                 if is_blank_on { "ON" } else { "OFF" },
                                 value & 0x0F,
@@ -4043,8 +4211,8 @@ impl Ppu {
                         }
                     }
 
-                    // Block DMA/HDMA writes to INIDISP by default to prevent interference
-                    // Can be overridden with ALLOW_INIDISP_DMA=1 for testing
+                    // Allow DMA/HDMA writes to INIDISP?
+                    // Mario 黒画面対策: デフォルトを「許可しない」に変更。必要なら env で明示的に許可。
                     let allow_dma_write = std::env::var("ALLOW_INIDISP_DMA")
                         .map(|v| v == "1" || v.to_lowercase() == "true")
                         .unwrap_or(false);
@@ -4052,6 +4220,13 @@ impl Ppu {
                     if !allow_dma_write {
                         return;
                     }
+                }
+
+                // Optional debug override: force display on with max brightness
+                if std::env::var_os("FORCE_MAX_BRIGHTNESS").is_some() {
+                    self.screen_display = 0x0F;
+                    self.brightness = 0x0F;
+                    return;
                 }
 
                 let applied_value = value;
@@ -4265,8 +4440,11 @@ impl Ppu {
                 self.mosaic_size = ((value >> 4) & 0x0F) + 1; // ビット4-7がモザイクサイズ（0-15 → 1-16）
             }
             0x07 => {
-                // Tilemap base: bits 2-7, shift left 10 for word address
-                // (value & 0xFC) >> 2 gives 6-bit value, then << 10 = (value & 0xFC) << 8
+                // BG1SC ($2107):
+                // - bits 0-1: screen size
+                // - bits 2-7: tilemap base in units of 0x400 bytes (1KB)
+                // Tilemap VRAM address is a *word* address: AAAAAA << 10 (1 KiW = 2 KiB pages).
+                // We store word addresses to match the renderer.
                 self.bg1_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[0] = value & 0x03;
                 if !crate::debug_flags::quiet() {
@@ -4277,6 +4455,7 @@ impl Ppu {
                 }
             }
             0x08 => {
+                // BG2SC ($2108): store base as VRAM word address (see $2107)
                 self.bg2_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[1] = value & 0x03;
                 if (crate::debug_flags::ppu_write() || crate::debug_flags::boot_verbose())
@@ -4289,6 +4468,7 @@ impl Ppu {
                 }
             }
             0x09 => {
+                // BG3SC ($2109): store base as VRAM word address (see $2107)
                 self.bg3_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[2] = value & 0x03;
                 if !crate::debug_flags::quiet() {
@@ -4299,14 +4479,19 @@ impl Ppu {
                 }
             }
             0x0A => {
+                // BG4SC ($210A): store base as VRAM word address (see $2107)
                 self.bg4_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[3] = value & 0x03;
             }
             0x0B => {
-                // Tile base address: 3-bit value in 4K word steps (shift left 12 for word address)
-                // Matches snes9x: (Byte & 7) << 12
-                self.bg1_tile_base = ((value as u16) & 0x07) << 12;
-                self.bg2_tile_base = ((value as u16) & 0x70) << 8; // Upper 3 bits (bits 4-6)
+                // BG12NBA ($210B): Character (tile) data area designation.
+                // Bits 0-3: BG1 base, bits 4-7: BG2 base.
+                // Unit is 0x2000 bytes (8 KiB); VRAM is word-addressed.
+                // => base_word = nibble * 0x1000 words (0x2000 bytes)
+                let bg1 = (value & 0x0F) as u16;
+                let bg2 = ((value >> 4) & 0x0F) as u16;
+                self.bg1_tile_base = bg1 << 12;
+                self.bg2_tile_base = bg2 << 12;
                 if !crate::debug_flags::quiet() {
                     println!(
                         "PPU: BG1 tile base: 0x{:04X}, BG2 tile base: 0x{:04X}",
@@ -4315,9 +4500,13 @@ impl Ppu {
                 }
             }
             0x0C => {
-                // Tile base address: 3-bit value in 4K word steps (shift left 12 for word address)
-                self.bg3_tile_base = ((value as u16) & 0x07) << 12;
-                self.bg4_tile_base = ((value as u16) & 0x70) << 8; // Upper 3 bits (bits 4-6)
+                // BG34NBA ($210C): Character (tile) data area designation.
+                // Bits 0-3: BG3 base, bits 4-7: BG4 base.
+                // Unit is 0x2000 bytes (8 KiB); VRAM is word-addressed.
+                let bg3 = (value & 0x0F) as u16;
+                let bg4 = ((value >> 4) & 0x0F) as u16;
+                self.bg3_tile_base = bg3 << 12;
+                self.bg4_tile_base = bg4 << 12;
                 if (crate::debug_flags::ppu_write() || crate::debug_flags::boot_verbose())
                     && !crate::debug_flags::quiet()
                 {
@@ -4417,15 +4606,34 @@ impl Ppu {
             }
             0x15 => {
                 // $2115: VRAM Address Increment/Mapping
-                // In STRICT timing, defer changes to safe sub-window
-                // Always record last written for summaries
-                self.vram_last_vmain = value;
-                if self.can_commit_vmain_now() {
-                    // Defer effect to simulate pipeline delay
-                    self.vmain_effect_pending = Some(value);
-                    self.vmain_effect_ticks = crate::debug_flags::vmain_effect_delay_dots();
+                // NOTE: VMAIN is a normal control register; in the common (non-strict) path
+                // it takes effect immediately. Any deferral is debug-only behind STRICT_PPU_TIMING.
+                if crate::debug_flags::strict_ppu_timing() {
+                    // In STRICT timing, defer changes to a safe sub-window.
+                    // Always record last written for summaries.
+                    self.vram_last_vmain = value;
+                    if self.can_commit_vmain_now() {
+                        // Defer the visible effect by a small number of dots (debug-only)
+                        self.vmain_effect_pending = Some(value);
+                        self.vmain_effect_ticks = crate::debug_flags::vmain_effect_delay_dots();
+                    } else {
+                        self.latched_vmain = Some(value);
+                    }
                 } else {
-                    self.latched_vmain = Some(value);
+                    // Immediate apply (default)
+                    self.vram_mapping = value;
+                    self.vram_last_vmain = value;
+                    self.vram_increment = match value & 0x03 {
+                        0 => 1,
+                        1 => 32,
+                        _ => 128,
+                    };
+                    // Any VMADD/VMAIN change should invalidate the VRAM read pipeline.
+                    self.vram_read_prefetched = false;
+                    self.vram_read_valid = false;
+                    self.vmain_effect_pending = None;
+                    self.vmain_effect_ticks = 0;
+                    self.latched_vmain = None;
                 }
                 if crate::debug_flags::ppu_write() || crate::debug_flags::boot_verbose() {
                     static mut VMAIN_LOG_CNT: u32 = 0;
@@ -4440,7 +4648,8 @@ impl Ppu {
                             let fg = (value >> 2) & 0x03;
                             let inc_on_high = (value & 0x80) != 0;
                             println!("VMAIN write: 0x{:02X} (inc={}, FGmode={}, inc_on_{}, pending_commit={})",
-                                value, inc, fg, if inc_on_high {"HIGH"} else {"LOW"}, !self.can_commit_vmain_now());
+                                value, inc, fg, if inc_on_high {"HIGH"} else {"LOW"},
+                                crate::debug_flags::strict_ppu_timing() && !self.can_commit_vmain_now());
                         }
                     }
                 }
@@ -4633,14 +4842,13 @@ impl Ppu {
 
             0x21 => {
                 // CGADD - set color index (word address). In strict timing, defer to HBlank mid-window.
-                static mut CGADD_WRITE_COUNT: u32 = 0;
-                unsafe {
-                    CGADD_WRITE_COUNT += 1;
-                    if CGADD_WRITE_COUNT <= 10 {
-                        println!(
-                            "🎨 CGADD write[{}]: value=0x{:02X}",
-                            CGADD_WRITE_COUNT, value
-                        );
+                if crate::debug_flags::ppu_write() && !crate::debug_flags::quiet() {
+                    static mut CGADD_WRITE_COUNT: u32 = 0;
+                    unsafe {
+                        CGADD_WRITE_COUNT += 1;
+                        if CGADD_WRITE_COUNT <= 64 {
+                            println!("[PPU] CGADD write[{}]: value=0x{:02X}", CGADD_WRITE_COUNT, value);
+                        }
                     }
                 }
                 if self.can_commit_cgadd_now() {
@@ -4711,7 +4919,7 @@ impl Ppu {
                         static mut CGRAM_STORE_DEBUG: u32 = 0;
                         unsafe {
                             CGRAM_STORE_DEBUG += 1;
-                            if CGRAM_STORE_DEBUG <= 5 && !quiet {
+                            if crate::debug_flags::ppu_write() && CGRAM_STORE_DEBUG <= 5 && !quiet {
                                 let stored_color =
                                     ((hi as u16) << 8) | (self.cgram_latch_lo as u16);
                                 println!("🎨 CGRAM STORED[{}]: addr={}, base={}, cgram[{}]=0x{:02X}, cgram[{}]=0x{:02X}, color=0x{:04X}", 
@@ -4721,7 +4929,7 @@ impl Ppu {
                         static mut CGRAM_WRITE_COUNT: u32 = 0;
                         unsafe {
                             CGRAM_WRITE_COUNT += 1;
-                            if CGRAM_WRITE_COUNT <= 10 && !quiet {
+                            if crate::debug_flags::ppu_write() && CGRAM_WRITE_COUNT <= 10 && !quiet {
                                 println!(
                                     "CGRAM write[{}]: color=0x{:02X}, HIGH byte, value=0x{:02X} (masked 0x{:02X})",
                                     CGRAM_WRITE_COUNT, self.cgram_addr, value, hi
@@ -4744,19 +4952,21 @@ impl Ppu {
                         self.main_screen_designation_last_nonzero = value;
                     }
                 }
-                static mut TM_DEBUG_COUNT: u32 = 0;
-                unsafe {
-                    if TM_DEBUG_COUNT < 30 {
-                        TM_DEBUG_COUNT += 1;
-                        println!("PPU[$212C][{}]: scanline={} value=0x{:02X} (BG1:{} BG2:{} BG3:{} BG4:{} OBJ:{}) vblank={} using=0x{:02X}",
-                                 TM_DEBUG_COUNT, self.scanline, value,
-                                 (value & 1) != 0,
-                                 (value & 2) != 0,
-                                 (value & 4) != 0,
-                                 (value & 8) != 0,
-                                 (value & 16) != 0,
-                                 self.v_blank,
-                                 if value != 0 { value } else { self.main_screen_designation_last_nonzero });
+                if crate::debug_flags::ppu_write() && !crate::debug_flags::quiet() {
+                    static mut TM_DEBUG_COUNT: u32 = 0;
+                    unsafe {
+                        if TM_DEBUG_COUNT < 30 {
+                            TM_DEBUG_COUNT += 1;
+                            println!("PPU[$212C][{}]: scanline={} value=0x{:02X} (BG1:{} BG2:{} BG3:{} BG4:{} OBJ:{}) vblank={} using=0x{:02X}",
+                                     TM_DEBUG_COUNT, self.scanline, value,
+                                     (value & 1) != 0,
+                                     (value & 2) != 0,
+                                     (value & 4) != 0,
+                                     (value & 8) != 0,
+                                     (value & 16) != 0,
+                                     self.v_blank,
+                                     if value != 0 { value } else { self.main_screen_designation_last_nonzero });
+                        }
                     }
                 }
             }
@@ -4900,9 +5110,19 @@ impl Ppu {
                     match idx {
                         0 => {
                             self.mode7_matrix_a = combined;
+                            self.update_mode7_mul_result();
                         }
                         1 => {
                             self.mode7_matrix_b = combined;
+                            self.update_mode7_mul_result();
+                            if !crate::debug_flags::quiet() {
+                                static M7B_LOG: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                let n = M7B_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n < 4 {
+                                    println!("PPU: Mode 7 matrix B set to {}", self.mode7_matrix_b);
+                                }
+                            }
                         }
                         2 => {
                             self.mode7_matrix_c = combined;
@@ -4933,6 +5153,100 @@ impl Ppu {
         &self.framebuffer
     }
 
+    // Mutable framebuffer accessor (debug use only)
+    #[allow(dead_code)]
+    pub fn get_framebuffer_mut(&mut self) -> &mut [u32] {
+        &mut self.framebuffer
+    }
+
+    #[inline]
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// Mode 7 乗算結果を更新（$2134-$2136）
+    fn update_mode7_mul_result(&mut self) {
+        // 実機では基本 16x8 符号付き積。デバッグで 16x16 や固定値にも切り替え可能。
+        let prod = if let Some(forced) = crate::debug_flags::force_m7_product() {
+            forced as i32
+        } else {
+            let a = self.mode7_matrix_a as i32;
+            if crate::debug_flags::m7_mul_full16() {
+                let b = self.mode7_matrix_b as i32;
+                a * b
+            } else {
+                let b = (self.mode7_matrix_b as i8) as i32; // low byte, sign-extend 8bit
+                a * b
+            }
+        };
+        self.mode7_mul_result = (prod as u32) & 0x00FF_FFFF;
+    }
+
+    /// 現在のフレームバッファが全て黒（0x00FFFFFF=0）かどうか簡易判定
+    pub fn framebuffer_is_all_black(&self) -> bool {
+        self.framebuffer.iter().all(|&p| (p & 0x00FF_FFFF) == 0)
+    }
+
+    /// フレームバッファを指定色で塗りつぶす（強制フォールバック用）
+    pub fn force_framebuffer_color(&mut self, color: u32) {
+        for px in self.framebuffer.iter_mut() {
+            *px = color;
+        }
+    }
+
+    /// DQ3デバッグ用: INIDISP への DMA/HDMA 書き込みを無視するかを設定
+    pub fn set_block_inidisp(&mut self, on: bool) {
+        self.dq3_block_inidisp = on;
+    }
+
+    /// 強制ブランク無視フラグ（DQ3用）を設定
+    pub fn set_force_display_override(&mut self, on: bool) {
+        self.force_display_override = on;
+    }
+
+    /// デバッグ用: BG1 のタイルマップ／タイルベースアドレスを取得
+    pub fn dbg_bg1_bases(&self) -> (u16, u16) {
+        (self.bg1_tilemap_base, self.bg1_tile_base)
+    }
+
+    // Raw memory accessors (headless debug dump)
+    #[allow(dead_code)]
+    pub fn get_vram(&self) -> &[u8] {
+        &self.vram
+    }
+
+    #[allow(dead_code)]
+    pub fn get_cgram(&self) -> &[u8] {
+        &self.cgram
+    }
+
+    #[allow(dead_code)]
+    pub fn get_oam(&self) -> &[u8] {
+        &self.oam
+    }
+
+    // Convenience dumps (head portion) for debugging
+    pub fn dump_vram_head(&self, n: usize) -> Vec<u8> {
+        let cnt = n.min(self.vram.len());
+        self.vram[..cnt].to_vec()
+    }
+
+    pub fn dump_cgram_head(&self, n: usize) -> Vec<u16> {
+        let mut out = Vec::new();
+        let cnt = n.min(16).min(self.cgram.len() / 2);
+        for i in 0..cnt {
+            let lo = self.cgram[i * 2] as u16;
+            let hi = self.cgram[i * 2 + 1] as u16;
+            out.push((hi << 8) | lo);
+        }
+        out
+    }
+
+    pub fn dump_oam_head(&self, n: usize) -> Vec<u8> {
+        let cnt = n.min(self.oam.len());
+        self.oam[..cnt].to_vec()
+    }
+
     #[allow(dead_code)]
     pub fn get_subscreen_buffer(&self) -> &[u32] {
         &self.subscreen_buffer
@@ -4955,17 +5269,6 @@ impl Ppu {
     }
 
     // Dump first n colors from CGRAM as 15-bit BGR
-    pub fn dump_cgram_head(&self, n: usize) -> Vec<u16> {
-        let mut out = Vec::new();
-        let cnt = n.min(16).min(self.cgram.len() / 2);
-        for i in 0..cnt {
-            let lo = self.cgram[i * 2] as u16;
-            let hi = (self.cgram[i * 2 + 1] & 0x7F) as u16;
-            out.push((hi << 8) | lo);
-        }
-        out
-    }
-
     // --- Save state serialization ---
     pub fn to_save_state(&self) -> crate::savestate::PpuSaveState {
         use crate::savestate::PpuSaveState;
@@ -4979,6 +5282,7 @@ impl Ppu {
             forced_blank: (self.screen_display & 0x80) != 0,
             nmi_enabled: self.nmi_enabled,
             nmi_pending: self.nmi_flag,
+            rdnmi_read_in_vblank: self.rdnmi_read_in_vblank,
             bg_mode: self.bg_mode,
             mosaic_size: self.mosaic_size,
             ..Default::default()
@@ -5036,6 +5340,7 @@ impl Ppu {
         }
         self.nmi_enabled = st.nmi_enabled;
         self.nmi_flag = st.nmi_pending;
+        self.rdnmi_read_in_vblank = st.rdnmi_read_in_vblank;
         self.bg_mode = st.bg_mode;
         self.mosaic_size = st.mosaic_size;
         for i in 0..4 {
@@ -5820,7 +6125,7 @@ impl Ppu {
         x: u16,
     ) -> u32 {
         // Forced blank produces black regardless of color math (unless FORCE_DISPLAY)
-        if (self.screen_display & 0x80) != 0 && !crate::debug_flags::force_display() {
+        if (self.screen_display & 0x80) != 0 && !self.force_display_active() {
             return 0;
         }
 
@@ -5855,7 +6160,7 @@ impl Ppu {
 
         // Force black clip is a hard override: return black and skip math entirely
         // But FORCE_DISPLAY debug flag should bypass this (like it bypasses forced blank)
-        if gate_black(black_mode, win) && !crate::debug_flags::force_display() {
+        if gate_black(black_mode, win) && !self.force_display_active() {
             if crate::debug_flags::render_metrics() {
                 if (self.cgwsel >> 6) & 0x03 == 1 {
                     self.dbg_clip_inside = self.dbg_clip_inside.saturating_add(1);
@@ -5942,7 +6247,9 @@ impl Ppu {
     }
 
     pub fn nmi_pending(&self) -> bool {
-        self.nmi_enabled && self.nmi_flag
+        // CPU側へ通知するNMIリクエストは「ラッチ」(edge)で管理する。
+        // nmi_flag は $4210(RDNMI) のbit7用で、読み出しでクリアされる。
+        self.nmi_enabled && self.nmi_latched
     }
 
     // Expose minimal NMI latch control for $4200 edge cases
@@ -5979,6 +6286,7 @@ impl Ppu {
     #[inline]
     pub fn end_mdma_context(&mut self) {
         self.write_ctx = 0;
+        self.debug_dma_channel = None;
     }
     #[inline]
     pub fn begin_hdma_context(&mut self) {
@@ -5987,6 +6295,13 @@ impl Ppu {
     #[inline]
     pub fn end_hdma_context(&mut self) {
         self.write_ctx = 0;
+        self.debug_dma_channel = None;
+    }
+
+    // Debug helper: mark which DMA channel is currently active
+    #[inline]
+    pub fn set_debug_dma_channel(&mut self, ch: Option<u8>) {
+        self.debug_dma_channel = ch;
     }
 
     // Mark HBlank head guard window for HDMA operations
@@ -5998,10 +6313,9 @@ impl Ppu {
 
     #[allow(dead_code)]
     pub fn clear_nmi(&mut self) {
-        self.nmi_flag = false;
-        if crate::debug_flags::boot_verbose() {
-            println!("NMI cleared");
-        }
+        // NMIラッチだけを解除し、RDNMIフラグ（nmi_flag）は保持する。
+        // 実機では $4210 読み出しでクリアされるため、CPU側のポーリングに委ねる。
+        self.nmi_latched = false;
     }
 
     // Lightweight usage stats (counts non-zero bytes)
@@ -6117,7 +6431,9 @@ impl Ppu {
 
     /// Write tilemap entry directly to VRAM (bypassing timing checks)
     pub fn write_vram_word(&mut self, word_addr: u16, low_byte: u8, high_byte: u8) {
-        let byte_addr = (word_addr as usize) * 2;
+        // VRAM is 32KB words; wrap addresses the way hardware mirrors the 15-bit address.
+        let addr = (word_addr as usize) & 0x7FFF; // 15-bit
+        let byte_addr = addr * 2;
         if byte_addr + 1 < self.vram.len() {
             self.vram[byte_addr] = low_byte;
             self.vram[byte_addr + 1] = high_byte;
@@ -6191,20 +6507,6 @@ impl Ppu {
     // テストパターンを強制表示（デバッグ用）
     pub fn force_test_pattern(&mut self) {
         println!("Forcing test pattern display...");
-
-        // フレームバッファに直接テストパターンを描画
-        for y in 0..224 {
-            for x in 0..256 {
-                let color = if (x + y) % 2 == 0 {
-                    0xFF0000FF // 赤
-                } else {
-                    0x00FF00FF // 緑
-                };
-
-                let pixel_offset = y * 256 + x;
-                self.framebuffer[pixel_offset] = color;
-            }
-        }
 
         // テストパターン表示のため基本的なPPU設定を上書き
         self.brightness = 15;
