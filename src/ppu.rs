@@ -2500,28 +2500,36 @@ impl Ppu {
         let map_entry_word_addr = map_entry_word_addr & 0x7FFF;
         let map_entry_addr = map_entry_word_addr * 2; // Convert to byte index for VRAM access
 
-        // デバッグ: タイルマップアドレス計算を確認
-        static mut DEBUG_TILEMAP_COUNT: u32 = 0;
-        unsafe {
-            DEBUG_TILEMAP_COUNT += 1;
-            if DEBUG_TILEMAP_COUNT <= 3 && x < 5 && y < 5 {
-                println!(
-                    "  BG{} tilemap_base=0x{:04X}, map_entry_addr=0x{:04X}, VRAM_len=0x{:04X}",
-                    bg_num,
-                    tilemap_base,
-                    map_entry_addr,
-                    self.vram.len()
-                );
+        // デバッグ: タイルマップアドレス計算を確認（オプトイン）
+        if std::env::var_os("DEBUG_TILEMAP_ADDR").is_some() && !crate::debug_flags::quiet() {
+            static mut DEBUG_TILEMAP_COUNT: u32 = 0;
+            unsafe {
+                DEBUG_TILEMAP_COUNT += 1;
+                if DEBUG_TILEMAP_COUNT <= 3 && x < 5 && y < 5 {
+                    println!(
+                        "  BG{} tilemap_base=0x{:04X}, map_entry_addr=0x{:04X}, VRAM_len=0x{:04X}",
+                        bg_num,
+                        tilemap_base,
+                        map_entry_addr,
+                        self.vram.len()
+                    );
+                }
             }
         }
 
         if (map_entry_addr + 1) as usize >= self.vram.len() {
-            static mut DEBUG_MAP_COUNT: u32 = 0;
-            unsafe {
-                DEBUG_MAP_COUNT += 1;
-                if DEBUG_MAP_COUNT <= 3 {
-                    println!("  BG{} EARLY RETURN: map_entry_addr=0x{:04X} out of VRAM bounds (len=0x{:04X})", 
-                             bg_num, map_entry_addr, self.vram.len());
+            if std::env::var_os("DEBUG_TILEMAP_ADDR").is_some() && !crate::debug_flags::quiet() {
+                static mut DEBUG_MAP_COUNT: u32 = 0;
+                unsafe {
+                    DEBUG_MAP_COUNT += 1;
+                    if DEBUG_MAP_COUNT <= 3 {
+                        println!(
+                            "  BG{} EARLY RETURN: map_entry_addr=0x{:04X} out of VRAM bounds (len=0x{:04X})",
+                            bg_num,
+                            map_entry_addr,
+                            self.vram.len()
+                        );
+                    }
                 }
             }
             return (0, 0);
