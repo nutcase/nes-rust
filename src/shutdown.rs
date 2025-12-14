@@ -1,6 +1,7 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 pub fn should_quit() -> bool {
     QUIT_REQUESTED.load(Ordering::SeqCst)
@@ -8,6 +9,23 @@ pub fn should_quit() -> bool {
 
 pub fn request_quit() {
     QUIT_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+pub fn exit_code() -> i32 {
+    EXIT_CODE.load(Ordering::SeqCst)
+}
+
+pub fn set_exit_code(code: i32) {
+    if code == 0 {
+        return;
+    }
+    // Keep the first non-zero code to preserve the original failure reason.
+    let _ = EXIT_CODE.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+pub fn request_quit_with_code(code: i32) {
+    set_exit_code(code);
+    request_quit();
 }
 
 #[cfg(unix)]

@@ -155,9 +155,17 @@ fn main() {
             .expect("Failed to spawn emulator thread")
             .join()
             .expect("Emulator thread panicked");
+        let code = shutdown::exit_code();
+        if code != 0 {
+            process::exit(code);
+        }
     } else {
         // In GUI mode, must run on main thread for macOS compatibility
         run_emulator();
+        let code = shutdown::exit_code();
+        if code != 0 {
+            process::exit(code);
+        }
     }
 }
 

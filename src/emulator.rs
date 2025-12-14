@@ -3330,18 +3330,23 @@ impl Emulator {
         let lower = msg.to_ascii_lowercase();
         if lower.contains("success") {
             println!("[CPUTEST] PASS (test_idx=0x{:04X})", test_idx);
+            crate::shutdown::request_quit();
+            return;
         } else if lower.contains("failed") || lower.contains("invalid") {
             println!(
                 "[CPUTEST] FAIL (msg=\"{}\" test_idx=0x{:04X})",
                 msg, test_idx
             );
+            crate::shutdown::request_quit_with_code(1);
+            return;
         } else {
             println!(
                 "[CPUTEST] HALT (pc=00:81A2 x=0x{:04X} msg=\"{}\" test_idx=0x{:04X})",
                 x, msg, test_idx
             );
+            crate::shutdown::request_quit_with_code(2);
+            return;
         }
-        crate::shutdown::request_quit();
     }
 
     // Periodically inject a minimal visible palette until the game loads enough CGRAM
