@@ -354,6 +354,106 @@ mod tests {
     }
 
     #[test]
+    fn adc_immediate_8bit_carry_ignores_b() {
+        // In 8-bit accumulator mode, ADC carries out of bit7 (low byte) only.
+        // The upper accumulator byte (B) must not affect carry/overflow.
+        //
+        // Scenario from cputest-full (Test 0032):
+        // REP #$20 ; LDA #$1167 ; SEP #$20 ; ADC #$20
+        // => A=$1187, C=0, V=1, N=1
+        let mut bus = TestBus::new();
+        bus.load(
+            0x8000,
+            &[
+                0xC2, 0x20, // REP #$20 (clear M => 16-bit A)
+                0xA9, 0x67, 0x11, // LDA #$1167
+                0xE2, 0x20, // SEP #$20 (set M => 8-bit A)
+                0x69, 0x20, // ADC #$20
+            ],
+        );
+        let mut core = make_core(0x8000);
+        {
+            let st = core.state_mut();
+            st.emulation_mode = false;
+        }
+        run_steps(&mut core, &mut bus, 4);
+        let st = core.state();
+        assert_eq!(st.a, 0x1187);
+        assert!(st.p.contains(StatusFlags::MEMORY_8BIT));
+        assert!(st.p.contains(StatusFlags::OVERFLOW));
+        assert!(st.p.contains(StatusFlags::NEGATIVE));
+        assert!(!st.p.contains(StatusFlags::CARRY));
+        assert!(!st.p.contains(StatusFlags::ZERO));
+    }
+
+    #[test]
+    fn sbc_immediate_8bit_borrow_ignores_b() {
+        // In 8-bit accumulator mode, SBC borrow/carry is computed from the low byte only.
+        // Upper accumulator byte (B) must be preserved and must not affect carry.
+        let mut bus = TestBus::new();
+        bus.load(
+            0x8000,
+            &[
+                0xC2, 0x20, // REP #$20 (clear M => 16-bit A)
+                0xA9, 0x67, 0x11, // LDA #$1167
+                0xE2, 0x20, // SEP #$20 (set M => 8-bit A)
+                0x38, // SEC (no borrow)
+                0xE9, 0x20, // SBC #$20 => low: 0x67-0x20=0x47
+            ],
+        );
+        let mut core = make_core(0x8000);
+        {
+            let st = core.state_mut();
+            st.emulation_mode = false;
+        }
+        run_steps(&mut core, &mut bus, 5);
+        let st = core.state();
+        assert_eq!(st.a, 0x1147);
+        assert!(st.p.contains(StatusFlags::MEMORY_8BIT));
+        assert!(st.p.contains(StatusFlags::CARRY));
+        assert!(!st.p.contains(StatusFlags::OVERFLOW));
+        assert!(!st.p.contains(StatusFlags::NEGATIVE));
+        assert!(!st.p.contains(StatusFlags::ZERO));
+    }
+
+    #[test]
+    fn mvn_operand_order_is_src_then_dest_and_sets_dbr() {
+        // MVN takes two immediate operands: source bank, then destination bank.
+        // It copies A+1 bytes from src: X.. to dest: Y.., increments X/Y each step,
+        // decrements A and repeats until A becomes 0xFFFF, and sets DBR=dest bank.
+        let mut bus = TestBus::new();
+        // MVN #$00,#$01
+        bus.load(0x8000, &[0x54, 0x00, 0x01, 0xEA]); // NOP after
+        // Source bytes at 00:1000..1003
+        bus.load(0x001000, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        // Destination area at 01:2000..2003 (init to 0)
+        bus.load(0x012000, &[0x00, 0x00, 0x00, 0x00]);
+
+        let mut core = make_core(0x8000);
+        {
+            let st = core.state_mut();
+            st.emulation_mode = false;
+            st.a = 0x0003; // copy 4 bytes total
+            st.x = 0x1000;
+            st.y = 0x2000;
+            st.db = 0x7E; // should become dest bank (0x01)
+        }
+
+        run_steps(&mut core, &mut bus, 4);
+        let st = core.state();
+        assert_eq!(st.a, 0xFFFF);
+        assert_eq!(st.x, 0x1004);
+        assert_eq!(st.y, 0x2004);
+        assert_eq!(st.db, 0x01);
+        assert_eq!(st.pc, 0x8003);
+
+        assert_eq!(bus.read_u8(0x012000), 0xDE);
+        assert_eq!(bus.read_u8(0x012001), 0xAD);
+        assert_eq!(bus.read_u8(0x012002), 0xBE);
+        assert_eq!(bus.read_u8(0x012003), 0xEF);
+    }
+
+    #[test]
     fn pha_pla_preserves_a() {
         // A=0x42; PHA; LDA #$00; PLA -> A should be 0x42, SP should round-trip
         let mut bus = TestBus::new();
@@ -1081,14 +1181,17 @@ fn adc_generic(state: &mut CoreState, operand: u16) {
             state.a = ((hi as u16) << 8) | (lo as u16);
         }
     } else {
-        let result = (original_a as u32) + (operand as u32) + (carry_in as u32);
         if memory_8bit {
-            state.p.set(StatusFlags::CARRY, result > 0xFF);
-            let overflow =
-                ((original_a ^ operand) & 0x80) == 0 && ((original_a ^ result as u16) & 0x80) != 0;
+            let a8 = (original_a & 0x00FF) as u8;
+            let b8 = (operand & 0x00FF) as u8;
+            let sum = (a8 as u16) + (b8 as u16) + (carry_in as u16);
+            let res8 = (sum & 0x00FF) as u8;
+            state.p.set(StatusFlags::CARRY, sum > 0x00FF);
+            let overflow = ((!(a8 ^ b8)) & (a8 ^ res8) & 0x80) != 0;
             state.p.set(StatusFlags::OVERFLOW, overflow);
-            state.a = (original_a & 0xFF00) | ((result & 0xFF) as u16);
+            state.a = (original_a & 0xFF00) | (res8 as u16);
         } else {
+            let result = (original_a as u32) + (operand as u32) + (carry_in as u32);
             state.p.set(StatusFlags::CARRY, result > 0xFFFF);
             let overflow = ((original_a ^ operand) & 0x8000) == 0
                 && ((original_a ^ result as u16) & 0x8000) != 0;
@@ -1138,14 +1241,17 @@ fn sbc_generic(state: &mut CoreState, operand: u16) {
             state.a = ((hi as u16) << 8) | (lo as u16);
         }
     } else {
-        let result = (original_a as i32) - (operand as i32) - (carry_clear as i32);
         if memory_8bit {
-            state.p.set(StatusFlags::CARRY, result >= 0);
-            let overflow =
-                ((original_a ^ operand) & 0x80) != 0 && ((original_a ^ result as u16) & 0x80) != 0;
+            let a8 = (original_a & 0x00FF) as u8;
+            let b8 = (operand & 0x00FF) as u8;
+            let diff = (a8 as i16) - (b8 as i16) - (carry_clear as i16);
+            let res8 = diff as u8;
+            state.p.set(StatusFlags::CARRY, diff >= 0);
+            let overflow = ((a8 ^ b8) & (a8 ^ res8) & 0x80) != 0;
             state.p.set(StatusFlags::OVERFLOW, overflow);
-            state.a = (original_a & 0xFF00) | ((result as u16) & 0x00FF);
+            state.a = (original_a & 0xFF00) | (res8 as u16);
         } else {
+            let result = (original_a as i32) - (operand as i32) - (carry_clear as i32);
             state.p.set(StatusFlags::CARRY, result >= 0);
             let overflow = ((original_a ^ operand) & 0x8000) != 0
                 && ((original_a ^ result as u16) & 0x8000) != 0;
@@ -1681,10 +1787,11 @@ pub fn execute_instruction_generic<T: CpuBus>(
 
         0x44 => {
             // MVP (Block Move Positive)
-            // Operand order in object code: dest bank then src bank
-            // (assembler syntax is src, dest; we already see object bytes here)
-            let dest_bank = read_u8_generic(state, bus);
+            // Operand order in object code: src bank then dest bank
             let src_bank = read_u8_generic(state, bus);
+            let dest_bank = read_u8_generic(state, bus);
+            // DBR becomes destination bank.
+            state.db = dest_bank;
             let src_addr = ((src_bank as u32) << 16) | (state.x as u32);
             let dest_addr = ((dest_bank as u32) << 16) | (state.y as u32);
             let value = bus.read_u8(src_addr);
@@ -1703,10 +1810,11 @@ pub fn execute_instruction_generic<T: CpuBus>(
 
         0x54 => {
             // MVN (Block Move Negative)
-            // Operand order in object code: dest bank then src bank
-            // (assembler syntax is src, dest; we already see object bytes here)
-            let dest_bank = read_u8_generic(state, bus);
+            // Operand order in object code: src bank then dest bank
             let src_bank = read_u8_generic(state, bus);
+            let dest_bank = read_u8_generic(state, bus);
+            // DBR becomes destination bank.
+            state.db = dest_bank;
             let src_addr = ((src_bank as u32) << 16) | (state.x as u32);
             let dest_addr = ((dest_bank as u32) << 16) | (state.y as u32);
             let value = bus.read_u8(src_addr);
