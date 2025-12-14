@@ -1497,7 +1497,8 @@ impl Ppu {
         let sprite_transparent = self.is_transparent_pixel(sprite_color);
         let bg_transparent = self.is_transparent_pixel(bg_color);
         if sprite_transparent && bg_transparent {
-            return (0xFF000000, 5);
+            // Fully transparent: caller will fall back to backdrop color.
+            return (0, 5);
         }
         if sprite_transparent {
             return (bg_color, bg_layer_id);
@@ -4870,7 +4871,10 @@ impl Ppu {
                     unsafe {
                         CGADD_WRITE_COUNT += 1;
                         if CGADD_WRITE_COUNT <= 64 {
-                            println!("[PPU] CGADD write[{}]: value=0x{:02X}", CGADD_WRITE_COUNT, value);
+                            println!(
+                                "[PPU] CGADD write[{}]: value=0x{:02X}",
+                                CGADD_WRITE_COUNT, value
+                            );
                         }
                     }
                 }
@@ -4952,7 +4956,8 @@ impl Ppu {
                         static mut CGRAM_WRITE_COUNT: u32 = 0;
                         unsafe {
                             CGRAM_WRITE_COUNT += 1;
-                            if crate::debug_flags::ppu_write() && CGRAM_WRITE_COUNT <= 10 && !quiet {
+                            if crate::debug_flags::ppu_write() && CGRAM_WRITE_COUNT <= 10 && !quiet
+                            {
                                 println!(
                                     "CGRAM write[{}]: color=0x{:02X}, HIGH byte, value=0x{:02X} (masked 0x{:02X})",
                                     CGRAM_WRITE_COUNT, self.cgram_addr, value, hi

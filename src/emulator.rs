@@ -752,10 +752,10 @@ impl Emulator {
                     }
 
                     // Headless visibility metric (counter-based, no screenshots). Separate borrow.
-                    if std::env::var("HEADLESS_VIS_CHECK")
+                    let vis_check = std::env::var("HEADLESS_VIS_CHECK")
                         .map(|v| v == "1" || v.to_lowercase() == "true")
-                        .unwrap_or(true)
-                    {
+                        .unwrap_or(!quiet);
+                    if vis_check {
                         let (non_black, first_non_black, sample0, sample128, sample256) = {
                             let fb = self.bus.get_ppu().get_framebuffer();
                             let nb = fb.iter().filter(|&&px| px != 0xFF000000).count();
@@ -875,17 +875,22 @@ impl Emulator {
                 // Compatibility boot fallback (headless)
                 self.maybe_auto_unblank();
             }
-            // Final init summary
-            let (nmi_w, mdma_w, hdma_w, dma_cfg) = self.bus.get_init_counters();
-            let (imp_w, vwl, vwh, cg, oam) = self.bus.get_ppu().get_init_counters();
-            println!(
-                "INIT summary: $4200 writes={} MDMAEN!=0={} HDMAEN!=0={} DMAreg={} PPU important={} VRAM L/H={}/{} CGRAM={} OAM={}",
-                nmi_w, mdma_w, hdma_w, dma_cfg, imp_w, vwl, vwh, cg, oam
-            );
-            println!("{}", self.bus.get_dma_config_summary());
-            // OBJ (sprite) timing summary
-            let obj_sum = { self.bus.get_ppu_mut().take_obj_summary() };
-            println!("{}", obj_sum);
+            // Final init summary (used by tools/smoke.sh; can be disabled for CPU test runs)
+            let headless_summary = std::env::var("HEADLESS_SUMMARY")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(true);
+            if headless_summary {
+                let (nmi_w, mdma_w, hdma_w, dma_cfg) = self.bus.get_init_counters();
+                let (imp_w, vwl, vwh, cg, oam) = self.bus.get_ppu().get_init_counters();
+                println!(
+                    "INIT summary: $4200 writes={} MDMAEN!=0={} HDMAEN!=0={} DMAreg={} PPU important={} VRAM L/H={}/{} CGRAM={} OAM={}",
+                    nmi_w, mdma_w, hdma_w, dma_cfg, imp_w, vwl, vwh, cg, oam
+                );
+                println!("{}", self.bus.get_dma_config_summary());
+                // OBJ (sprite) timing summary
+                let obj_sum = { self.bus.get_ppu_mut().take_obj_summary() };
+                println!("{}", obj_sum);
+            }
 
             // Optional framebuffer dump for headless debugging (PPM, 256x224)
             if std::env::var("HEADLESS_DUMP_FRAME")
@@ -3167,9 +3172,9 @@ impl Emulator {
                 hold_start
             );
             }
-        // テストROMでは他の自動入力は不要
-        return;
-    }
+            // テストROMでは他の自動入力は不要
+            return;
+        }
 
         // More aggressive input pattern for Dragon Quest III
         if !self.is_dq3_title() {
@@ -3245,7 +3250,8 @@ impl Emulator {
         // X は結果文字列（"Success"/"Failed"/"Invalid test order" 等）の先頭を指す
         let read_msg = |emu: &mut Emulator, bank: u8, ptr: u16| -> String {
             let bank_base = (bank as u32) << 16;
-            let read = |emu: &mut Emulator, off: u16| -> u8 { emu.bus.read_u8(bank_base | off as u32) };
+            let read =
+                |emu: &mut Emulator, off: u16| -> u8 { emu.bus.read_u8(bank_base | off as u32) };
 
             // cputest-full.sfc は print ルーチンで X を進めるため、
             // 文字列末尾(0)を指して停止することがある。0終端ASCIIを前後で探す。

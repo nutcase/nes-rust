@@ -209,8 +209,10 @@ impl Cpu {
                 state.sp = sp;
             }
             if state.stopped {
+                bus.begin_cpu_instruction();
                 state.cycles = state.cycles.wrapping_add(1);
                 self.sync_cpu_from_core();
+                bus.end_cpu_instruction(1);
                 return 1;
             }
 
@@ -230,19 +232,25 @@ impl Cpu {
                         );
                     }
                 }
+                // WAI は IRQ_DISABLE(I) に関係なく「IRQ/NMI の発生」で解除される。
+                // ただし IRQ は I=1 の場合はベクタへ分岐せず、WAI の次の命令から継続する。
                 if bus.poll_irq() || bus.poll_nmi() {
                     state.waiting_for_irq = false;
                 } else {
+                    bus.begin_cpu_instruction();
                     state.cycles = state.cycles.wrapping_add(1);
                     self.sync_cpu_from_core();
+                    bus.end_cpu_instruction(1);
                     return 1;
                 }
             }
         }
 
         if bus.poll_nmi() {
+            bus.begin_cpu_instruction();
             let cycles = crate::cpu_core::service_nmi(self.core.state_mut(), bus);
             self.sync_cpu_from_core();
+            bus.end_cpu_instruction(cycles);
             return cycles;
         }
 
@@ -266,8 +274,10 @@ impl Cpu {
             }
         }
         if irq_pending {
+            bus.begin_cpu_instruction();
             let cycles = crate::cpu_core::service_irq(self.core.state_mut(), bus);
             self.sync_cpu_from_core();
+            bus.end_cpu_instruction(cycles);
             return cycles;
         }
 
@@ -338,8 +348,9 @@ impl Cpu {
 
                     let mut dump_on_pc_hit = false;
                     if let Some(list) = crate::debug_flags::dump_on_pc_list() {
-                        dump_on_pc_hit =
-                            list.iter().any(|&x| x == pc24 || x == (state_before.pc as u32));
+                        dump_on_pc_hit = list
+                            .iter()
+                            .any(|&x| x == pc24 || x == (state_before.pc as u32));
                     }
                     let dump_opcode_hit = crate::debug_flags::dump_on_opcode()
                         .map(|op| op == opcode)
@@ -348,7 +359,9 @@ impl Cpu {
                     let near_vector = state_before.pb == 0x00 && state_before.pc >= 0xFFF0;
                     let near_zero = state_before.pb == 0x00 && state_before.pc <= 0x0100;
                     let dump_ffff = std::env::var_os("DUMP_ON_PC_FFFF").is_some();
-                    if dump_opcode_hit || dump_on_pc_hit || (dump_ffff && (near_vector || near_zero))
+                    if dump_opcode_hit
+                        || dump_on_pc_hit
+                        || (dump_ffff && (near_vector || near_zero))
                     {
                         let count = if RING_FILLED {
                             RING_BUF.len()
@@ -474,73 +487,73 @@ impl Cpu {
                     // Do not log beyond the configured limit, but keep executing.
                     // Returning here would freeze the CPU and distort debugging.
                 } else {
-                // Special-case: debug the BIT $4210 loop on cputest
-                let mut extra = String::new();
-                if state_before.pc == 0x8260 || state_before.pc == 0x8263 {
-                    let operand = bus.read_u8(0x4210);
-                    extra = format!(" operand($4210)={:02X}", operand);
-                }
-                // cputest: 0x8105/0x802B ブロックで参照する主要ワークを併記
-                if state_before.pc == 0x8105 || state_before.pc == 0x802B {
-                    let w12 = bus.read_u8(0x0012);
-                    let w18 = bus.read_u8(0x0018);
-                    let w19 = bus.read_u8(0x0019);
-                    let w33 = bus.read_u8(0x0033);
-                    let w34 = bus.read_u8(0x0034);
-                    extra.push_str(&format!(
-                        " w12={:02X} w18={:02X} w19={:02X} w33={:02X} w34={:02X}",
-                        w12, w18, w19, w33, w34
-                    ));
-                    // デバッグフック: cputest が期待する初期値を強制セットして通過できるか確認
-                    if std::env::var_os("CPUTEST_FORCE_WRAM_INIT").is_some() {
-                        bus.write_u8(0x0012, 0xCD);
-                        bus.write_u8(0x0013, 0x00);
-                        bus.write_u8(0x0018, 0xCC);
-                        bus.write_u8(0x0019, 0x00);
-                        bus.write_u8(0x0033, 0xCD);
-                        bus.write_u8(0x0034, 0xAB);
-                        bus.write_u8(0x7F1234, 0xCD);
-                        bus.write_u8(0x7F1235, 0xAB);
-                        extra.push_str(" [WRAM forced]");
+                    // Special-case: debug the BIT $4210 loop on cputest
+                    let mut extra = String::new();
+                    if state_before.pc == 0x8260 || state_before.pc == 0x8263 {
+                        let operand = bus.read_u8(0x4210);
+                        extra = format!(" operand($4210)={:02X}", operand);
                     }
-                }
-                // cputest-full: テスト本体ループの開始地点(00:8294)でインデックスを記録
-                if state_before.pc == 0x8294 {
-                    use std::sync::atomic::{AtomicU32, Ordering};
-                    static HIT: AtomicU32 = AtomicU32::new(0);
-                    let n = HIT.fetch_add(1, Ordering::Relaxed);
-                    if n < std::env::var("WATCH_PC_TESTIDX_MAX")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(64)
-                    {
-                        // X がテスト番号、DP先頭(0000)にはテーブルへのポインタ(24bit)が置かれている
-                        let t_lo = bus.read_u8(0x0000) as u32;
-                        let t_mid = bus.read_u8(0x0001) as u32;
-                        let t_hi = bus.read_u8(0x0002) as u32;
-                        let table_ptr = (t_hi << 16) | (t_mid << 8) | t_lo;
+                    // cputest: 0x8105/0x802B ブロックで参照する主要ワークを併記
+                    if state_before.pc == 0x8105 || state_before.pc == 0x802B {
+                        let w12 = bus.read_u8(0x0012);
+                        let w18 = bus.read_u8(0x0018);
+                        let w19 = bus.read_u8(0x0019);
+                        let w33 = bus.read_u8(0x0033);
+                        let w34 = bus.read_u8(0x0034);
                         extra.push_str(&format!(
-                            " [TESTIDX idx={:04X} A={:04X} Y={:04X} table={:06X}]",
-                            state_before.x, state_before.a, state_before.y, table_ptr
+                            " w12={:02X} w18={:02X} w19={:02X} w33={:02X} w34={:02X}",
+                            w12, w18, w19, w33, w34
                         ));
-                        // 進捗テーブル先頭4バイトを覗いてみる
-                        let head = (bus.read_u8(table_ptr) as u32)
-                            | ((bus.read_u8(table_ptr + 1) as u32) << 8)
-                            | ((bus.read_u8(table_ptr + 2) as u32) << 16)
-                            | ((bus.read_u8(table_ptr + 3) as u32) << 24);
-                        extra.push_str(&format!(" table_head={:08X}", head));
+                        // デバッグフック: cputest が期待する初期値を強制セットして通過できるか確認
+                        if std::env::var_os("CPUTEST_FORCE_WRAM_INIT").is_some() {
+                            bus.write_u8(0x0012, 0xCD);
+                            bus.write_u8(0x0013, 0x00);
+                            bus.write_u8(0x0018, 0xCC);
+                            bus.write_u8(0x0019, 0x00);
+                            bus.write_u8(0x0033, 0xCD);
+                            bus.write_u8(0x0034, 0xAB);
+                            bus.write_u8(0x7F1234, 0xCD);
+                            bus.write_u8(0x7F1235, 0xAB);
+                            extra.push_str(" [WRAM forced]");
+                        }
                     }
-                }
-                // cputest 向け: DPテーブル 82E95C 先頭32バイトをダンプして進行フラグを観察（WATCH_PC_DUMP_DP=1）
-                if std::env::var_os("WATCH_PC_DUMP_DP").is_some() {
-                    let base = 0x82E95C;
-                    let mut buf = [0u8; 32];
-                    for i in 0..buf.len() {
-                        buf[i] = bus.read_u8(base + i as u32);
+                    // cputest-full: テスト本体ループの開始地点(00:8294)でインデックスを記録
+                    if state_before.pc == 0x8294 {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static HIT: AtomicU32 = AtomicU32::new(0);
+                        let n = HIT.fetch_add(1, Ordering::Relaxed);
+                        if n < std::env::var("WATCH_PC_TESTIDX_MAX")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(64)
+                        {
+                            // X がテスト番号、DP先頭(0000)にはテーブルへのポインタ(24bit)が置かれている
+                            let t_lo = bus.read_u8(0x0000) as u32;
+                            let t_mid = bus.read_u8(0x0001) as u32;
+                            let t_hi = bus.read_u8(0x0002) as u32;
+                            let table_ptr = (t_hi << 16) | (t_mid << 8) | t_lo;
+                            extra.push_str(&format!(
+                                " [TESTIDX idx={:04X} A={:04X} Y={:04X} table={:06X}]",
+                                state_before.x, state_before.a, state_before.y, table_ptr
+                            ));
+                            // 進捗テーブル先頭4バイトを覗いてみる
+                            let head = (bus.read_u8(table_ptr) as u32)
+                                | ((bus.read_u8(table_ptr + 1) as u32) << 8)
+                                | ((bus.read_u8(table_ptr + 2) as u32) << 16)
+                                | ((bus.read_u8(table_ptr + 3) as u32) << 24);
+                            extra.push_str(&format!(" table_head={:08X}", head));
+                        }
                     }
-                    extra.push_str(&format!(" DP[82E95C..]={:02X?}", buf));
-                }
-                println!(
+                    // cputest 向け: DPテーブル 82E95C 先頭32バイトをダンプして進行フラグを観察（WATCH_PC_DUMP_DP=1）
+                    if std::env::var_os("WATCH_PC_DUMP_DP").is_some() {
+                        let base = 0x82E95C;
+                        let mut buf = [0u8; 32];
+                        for i in 0..buf.len() {
+                            buf[i] = bus.read_u8(base + i as u32);
+                        }
+                        extra.push_str(&format!(" DP[82E95C..]={:02X?}", buf));
+                    }
+                    println!(
                     "WATCH_PC hit#{} at {:02X}:{:04X} A={:04X} X={:04X} Y={:04X} SP={:04X} D={:04X} DB={:02X} P={:02X}{}",
                     n + 1,
                     state_before.pb,
@@ -554,25 +567,26 @@ impl Cpu {
                     state_before.p.bits(),
                     extra
                 );
-                // APUポート0/1の現在値も併記して比較状態を確認
-                let p0 = bus.read_u8(0x2140);
-                let p1 = bus.read_u8(0x2141);
-                println!("  APU ports: p0={:02X} p1={:02X}", p0, p1);
-                // Resolve DP+0 long pointer (e.g., LDA [00],Y)
-                let dp_base = state_before.dp as u32;
-                let ptr_lo = bus.read_u8(dp_base);
-                let ptr_hi = bus.read_u8(dp_base + 1);
-                let ptr_bank = bus.read_u8(dp_base + 2);
-                let base_ptr = ((ptr_bank as u32) << 16) | ((ptr_hi as u32) << 8) | ptr_lo as u32;
-                let eff_addr = base_ptr.wrapping_add(state_before.y as u32) & 0xFF_FFFF;
-                let eff_val = bus.read_u8(eff_addr);
-                println!(
-                    "  PTR[DP+0]={:02X}{:02X}{:02X} +Y={:04X} -> {:06X} = {:02X}",
-                    ptr_bank, ptr_hi, ptr_lo, state_before.y, eff_addr, eff_val
-                );
-                // Dump first 16 bytes of current direct page for indirect vector調査
-                if std::env::var_os("ENABLE_Y_GUARD").is_some() && state_before.y >= 0x8000 {
+                    // APUポート0/1の現在値も併記して比較状態を確認
+                    let p0 = bus.read_u8(0x2140);
+                    let p1 = bus.read_u8(0x2141);
+                    println!("  APU ports: p0={:02X} p1={:02X}", p0, p1);
+                    // Resolve DP+0 long pointer (e.g., LDA [00],Y)
+                    let dp_base = state_before.dp as u32;
+                    let ptr_lo = bus.read_u8(dp_base);
+                    let ptr_hi = bus.read_u8(dp_base + 1);
+                    let ptr_bank = bus.read_u8(dp_base + 2);
+                    let base_ptr =
+                        ((ptr_bank as u32) << 16) | ((ptr_hi as u32) << 8) | ptr_lo as u32;
+                    let eff_addr = base_ptr.wrapping_add(state_before.y as u32) & 0xFF_FFFF;
+                    let eff_val = bus.read_u8(eff_addr);
                     println!(
+                        "  PTR[DP+0]={:02X}{:02X}{:02X} +Y={:04X} -> {:06X} = {:02X}",
+                        ptr_bank, ptr_hi, ptr_lo, state_before.y, eff_addr, eff_val
+                    );
+                    // Dump first 16 bytes of current direct page for indirect vector調査
+                    if std::env::var_os("ENABLE_Y_GUARD").is_some() && state_before.y >= 0x8000 {
+                        println!(
                         "[Y-GUARD] PC={:02X}:{:04X} Y=0x{:04X} A=0x{:04X} X=0x{:04X} P=0x{:02X}",
                         state_before.pb,
                         state_before.pc,
@@ -581,51 +595,52 @@ impl Cpu {
                         state_before.x,
                         state_before.p.bits()
                     );
-                }
-                let dbase = state_before.dp as u32;
-                print!("  DP dump {:04X}: ", state_before.dp);
-                for i in 0..16u32 {
-                    let addr = dbase + i;
-                    let b = bus.read_u8(addr);
-                    print!("{:02X} ", b);
-                }
-                println!();
-                // Dump stack top 8 bytes (after current SP)
-                let mut sbytes = [0u8; 8];
-                for i in 0..8u16 {
-                    let addr = if state_before.emulation_mode {
-                        0x0100 | ((state_before.sp.wrapping_add(1 + i)) & 0x00FF) as u32
-                    } else {
-                        state_before.sp.wrapping_add(1 + i) as u32
-                    };
-                    sbytes[i as usize] = bus.read_u8(addr);
-                }
-                print!("  Stack top (SP={:04X}): ", state_before.sp);
-                for b in sbytes.iter() {
-                    print!("{:02X} ", b);
-                }
-                println!();
-                // dump 16 bytes around PC in the same bank
-                let base = state_before.pc.wrapping_sub(8);
-                print!("  bytes @{:#02X}:{:04X}: ", state_before.pb, base);
-                for i in 0..16u16 {
-                    let addr = ((state_before.pb as u32) << 16) | base.wrapping_add(i) as u32;
-                    let b = bus.read_u8(addr);
-                    print!("{:02X} ", b);
-                }
-                println!();
-                // If bank is FF (WRAM mirror), also dump 7E bank for clarity
-                if state_before.pb == 0xFF || state_before.pb == 0x7E || state_before.pb == 0x7F {
-                    let wram_bank = 0x7E;
-                    let base = state_before.pc.wrapping_sub(8);
-                    print!("  bytes @{:#02X}:{:04X}: ", wram_bank, base);
-                    for i in 0..16u16 {
-                        let addr = ((wram_bank as u32) << 16) | base.wrapping_add(i) as u32;
+                    }
+                    let dbase = state_before.dp as u32;
+                    print!("  DP dump {:04X}: ", state_before.dp);
+                    for i in 0..16u32 {
+                        let addr = dbase + i;
                         let b = bus.read_u8(addr);
                         print!("{:02X} ", b);
                     }
                     println!();
-                }
+                    // Dump stack top 8 bytes (after current SP)
+                    let mut sbytes = [0u8; 8];
+                    for i in 0..8u16 {
+                        let addr = if state_before.emulation_mode {
+                            0x0100 | ((state_before.sp.wrapping_add(1 + i)) & 0x00FF) as u32
+                        } else {
+                            state_before.sp.wrapping_add(1 + i) as u32
+                        };
+                        sbytes[i as usize] = bus.read_u8(addr);
+                    }
+                    print!("  Stack top (SP={:04X}): ", state_before.sp);
+                    for b in sbytes.iter() {
+                        print!("{:02X} ", b);
+                    }
+                    println!();
+                    // dump 16 bytes around PC in the same bank
+                    let base = state_before.pc.wrapping_sub(8);
+                    print!("  bytes @{:#02X}:{:04X}: ", state_before.pb, base);
+                    for i in 0..16u16 {
+                        let addr = ((state_before.pb as u32) << 16) | base.wrapping_add(i) as u32;
+                        let b = bus.read_u8(addr);
+                        print!("{:02X} ", b);
+                    }
+                    println!();
+                    // If bank is FF (WRAM mirror), also dump 7E bank for clarity
+                    if state_before.pb == 0xFF || state_before.pb == 0x7E || state_before.pb == 0x7F
+                    {
+                        let wram_bank = 0x7E;
+                        let base = state_before.pc.wrapping_sub(8);
+                        print!("  bytes @{:#02X}:{:04X}: ", wram_bank, base);
+                        for i in 0..16u16 {
+                            let addr = ((wram_bank as u32) << 16) | base.wrapping_add(i) as u32;
+                            let b = bus.read_u8(addr);
+                            print!("{:02X} ", b);
+                        }
+                        println!();
+                    }
                 }
             }
         }
@@ -633,7 +648,9 @@ impl Cpu {
         let trace_p_change = std::env::var_os("TRACE_P_CHANGE").is_some();
         let p_before = state_before.p;
 
+        bus.begin_cpu_instruction();
         let StepResult { cycles, fetch } = self.core.step(bus);
+        bus.end_cpu_instruction(cycles);
 
         // 軽量PCウォッチ: 環境変数 WATCH_PC_FLOW がセットされていれば、
         // 00:8240-00:82A0 付近のPC遷移を先頭 64 件だけ表示する（初回フレーム向け）。

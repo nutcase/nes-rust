@@ -3,6 +3,14 @@
 pub trait CpuBus {
     fn read_u8(&mut self, addr: u32) -> u8;
     fn write_u8(&mut self, addr: u32, value: u8);
+
+    /// CPU命令の開始/終了フック（任意）。
+    ///
+    /// バス側で「命令内サイクル」相当の周辺機器（例: $4202-$4206 の乗除算）を
+    /// より正確に進めたい場合に使う。既定では何もしない。
+    fn begin_cpu_instruction(&mut self) {}
+    fn end_cpu_instruction(&mut self, _cycles: u8) {}
+
     fn opcode_memory_penalty(&mut self, _addr: u32) -> u8 {
         0
     }

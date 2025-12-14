@@ -37,6 +37,26 @@ pub struct Bus {
     div_b: u8,
     div_quot: u16,
     div_rem: u16,
+    // Hardware math in-flight timing (coarse per S-CPU cycle slice)
+    mul_busy: bool,
+    mul_just_started: bool,
+    mul_cycles_left: u8,
+    mul_work_a: u16,
+    mul_work_b: u8,
+    mul_partial: u16,
+    div_busy: bool,
+    div_just_started: bool,
+    div_cycles_left: u8,
+    div_work_dividend: u16,
+    div_work_divisor: u8,
+    div_work_quot: u16,
+    div_work_rem: u16,
+    div_work_bit: i8,
+    // CPU命令内のバスアクセス数（サイクル近似）を数えるためのフック。
+    // - CpuBusトレイト経由の read_u8/write_u8 を 1回=1サイクル相当として扱い、
+    //   $4202-$4206 等の時間依存I/Oをより正確に進める。
+    cpu_instr_active: bool,
+    cpu_instr_bus_cycles: u8,
 
     // IRQ/Timer
     irq_h_enabled: bool,             // $4200 bit4
@@ -120,6 +140,15 @@ pub struct Bus {
 
 impl Bus {
     #[inline]
+    fn on_cpu_bus_cycle(&mut self) {
+        if !self.cpu_instr_active {
+            return;
+        }
+        self.cpu_instr_bus_cycles = self.cpu_instr_bus_cycles.saturating_add(1);
+        self.tick_cpu_cycles(1);
+    }
+
+    #[inline]
     pub fn wram(&self) -> &[u8] {
         &self.wram
     }
@@ -170,6 +199,22 @@ impl Bus {
             div_b: 0,
             div_quot: 0,
             div_rem: 0,
+            mul_busy: false,
+            mul_just_started: false,
+            mul_cycles_left: 0,
+            mul_work_a: 0,
+            mul_work_b: 0,
+            mul_partial: 0,
+            div_busy: false,
+            div_just_started: false,
+            div_cycles_left: 0,
+            div_work_dividend: 0,
+            div_work_divisor: 0,
+            div_work_quot: 0,
+            div_work_rem: 0,
+            div_work_bit: 0,
+            cpu_instr_active: false,
+            cpu_instr_bus_cycles: 0,
 
             irq_h_enabled: false,
             irq_v_enabled: false,
@@ -345,6 +390,22 @@ impl Bus {
             div_b: 0,
             div_quot: 0,
             div_rem: 0,
+            mul_busy: false,
+            mul_just_started: false,
+            mul_cycles_left: 0,
+            mul_work_a: 0,
+            mul_work_b: 0,
+            mul_partial: 0,
+            div_busy: false,
+            div_just_started: false,
+            div_cycles_left: 0,
+            div_work_dividend: 0,
+            div_work_divisor: 0,
+            div_work_quot: 0,
+            div_work_rem: 0,
+            div_work_bit: 0,
+            cpu_instr_active: false,
+            cpu_instr_bus_cycles: 0,
 
             irq_h_enabled: false,
             irq_v_enabled: false,
@@ -1648,7 +1709,8 @@ impl Bus {
             }
         }
         // Debug: trace S-CPU reads of SA-1 status regs ($2300/$2301) (opt-in)
-        if (std::env::var_os("TRACE_SFR").is_some() || std::env::var_os("TRACE_SFR_VALUES").is_some())
+        if (std::env::var_os("TRACE_SFR").is_some()
+            || std::env::var_os("TRACE_SFR_VALUES").is_some())
             && (offset == 0x2300 || offset == 0x2301)
         {
             use std::sync::atomic::{AtomicU32, Ordering};
@@ -1909,9 +1971,8 @@ impl Bus {
                         let addr = self.wram_address as usize;
                         if addr < self.wram.len() {
                             let value = self.wram[addr];
-                            // WMADD ($2181-2183): increment low 16-bit only; high bit is not carried.
-                            self.wram_address =
-                                (self.wram_address & 0x10000) | ((self.wram_address + 1) & 0xFFFF);
+                            // WMADD ($2181-2183) is a 17-bit address; auto-increment carries across bit16.
+                            self.wram_address = (self.wram_address + 1) & 0x1FFFF;
                             value
                         } else {
                             0xFF
@@ -1936,8 +1997,7 @@ impl Bus {
                                     0xFF
                                 } else {
                                     let bank_index = (bank & 0x3F) as usize;
-                                    let window =
-                                        bank_index * 0x2000 + ((offset - 0x6000) as usize);
+                                    let window = bank_index * 0x2000 + ((offset - 0x6000) as usize);
                                     let idx = window % self.sram_size;
                                     self.sram[idx]
                                 }
@@ -2083,8 +2143,8 @@ impl Bus {
                             if self.sram_size == 0 || !(0x70..=0x7D).contains(&mirror_bank) {
                                 0xFF
                             } else {
-                                let window = ((mirror_bank - 0x70) as usize) * 0x8000
-                                    + (offset as usize);
+                                let window =
+                                    ((mirror_bank - 0x70) as usize) * 0x8000 + (offset as usize);
                                 let idx = window % self.sram_size;
                                 self.sram[idx]
                             }
@@ -2732,9 +2792,8 @@ impl Bus {
                                 );
                             }
                             self.wram[addr] = value;
-                            // WMADD ($2181-2183): increment low 16-bit only; high bit is not carried.
-                            self.wram_address =
-                                (self.wram_address & 0x10000) | ((self.wram_address + 1) & 0xFFFF);
+                            // WMADD ($2181-2183) is a 17-bit address; auto-increment carries across bit16.
+                            self.wram_address = (self.wram_address + 1) & 0x1FFFF;
                             if std::env::var_os("TRACE_WRAM_ADDR").is_some() {
                                 static TRACE_WRAM_CNT: OnceLock<std::sync::atomic::AtomicU32> =
                                     OnceLock::new();
@@ -2818,8 +2877,7 @@ impl Bus {
                                 // SRAM window in system banks ($00-$3F/$80-$BF): $6000-$7FFF (8KB)
                                 if self.sram_size > 0 {
                                     let bank_index = (bank & 0x3F) as usize;
-                                    let window =
-                                        bank_index * 0x2000 + ((offset - 0x6000) as usize);
+                                    let window = bank_index * 0x2000 + ((offset - 0x6000) as usize);
                                     let idx = window % self.sram_size;
                                     self.sram[idx] = value;
                                     self.sram_dirty = true;
@@ -2953,8 +3011,8 @@ impl Bus {
                         if self.sram_size > 0 && offset < 0x8000 {
                             let mirror_bank = bank.wrapping_sub(0x80);
                             if (0x70..=0x7D).contains(&mirror_bank) {
-                                let window = ((mirror_bank - 0x70) as usize) * 0x8000
-                                    + (offset as usize);
+                                let window =
+                                    ((mirror_bank - 0x70) as usize) * 0x8000 + (offset as usize);
                                 let idx = window % self.sram_size;
                                 self.sram[idx] = value;
                                 self.sram_dirty = true;
@@ -3329,10 +3387,7 @@ impl Bus {
                         // 次はRight押下を返す（bit7=0）
                         val &= !0x80;
                         if std::env::var_os("TRACE_CPU_TEST_AUTO").is_some() {
-                            println!(
-                                "[CPU-TEST-AUTO] JOY1L read (Right) val=0x{:02X}",
-                                val
-                            );
+                            println!("[CPU-TEST-AUTO] JOY1L read (Right) val=0x{:02X}", val);
                         }
                         return val;
                     }
@@ -3493,7 +3548,26 @@ impl Bus {
             0x4203 => {
                 // WRMPYB - Multiplicand B (start 8x8 multiply)
                 self.mul_b = value;
-                self.mul_result = (self.mul_a as u16) * (self.mul_b as u16);
+                // Any in-flight divide is aborted (single shared math unit behavior).
+                self.div_busy = false;
+                self.div_just_started = false;
+
+                if self.mul_busy {
+                    // Real hardware quirk: writing to WRMPYB again before the 8-cycle
+                    // multiply has completed does *not* correctly restart the unit; the
+                    // remaining cycles continue and the result becomes "corrupted".
+                    // Model this by updating the internal multiplier shift register only.
+                    self.mul_work_b = self.mul_b;
+                } else {
+                    // Start 8-cycle multiply; results ($4216/$4217) update while in-flight.
+                    self.mul_busy = true;
+                    self.mul_just_started = true;
+                    self.mul_cycles_left = 8;
+                    self.mul_work_a = self.mul_a as u16;
+                    self.mul_work_b = self.mul_b;
+                    self.mul_partial = 0;
+                    self.mul_result = 0;
+                }
             }
             0x4204 => {
                 // WRDIVL - Dividend Low
@@ -3506,16 +3580,37 @@ impl Bus {
             0x4206 => {
                 // WRDIVB - Divisor (start 16/8 divide)
                 self.div_b = value;
+                // Abort in-flight multiply (single shared math unit behavior).
+                self.mul_busy = false;
+                self.mul_just_started = false;
+
                 if self.div_b == 0 {
+                    // Division-by-zero special case.
                     self.div_quot = 0xFFFF;
                     self.div_rem = self.div_a;
+                    self.mul_result = self.div_rem;
+                    self.div_busy = false;
+                    self.div_just_started = false;
+                    self.div_cycles_left = 0;
+                    self.div_work_dividend = 0;
+                    self.div_work_divisor = 0;
+                    self.div_work_quot = 0;
+                    self.div_work_rem = 0;
+                    self.div_work_bit = 0;
                 } else {
-                    let divisor = u16::from(self.div_b);
-                    self.div_quot = self.div_a / divisor;
-                    self.div_rem = self.div_a % divisor;
+                    // 16-cycle restoring division; results ($4214-$4217) update while in-flight.
+                    self.div_busy = true;
+                    self.div_just_started = true;
+                    self.div_cycles_left = 16;
+                    self.div_work_dividend = self.div_a;
+                    self.div_work_divisor = self.div_b;
+                    self.div_work_quot = 0;
+                    self.div_work_rem = 0;
+                    self.div_work_bit = 15;
+                    self.div_quot = 0;
+                    self.div_rem = 0;
+                    self.mul_result = 0;
                 }
-                // Also reflect remainder into mul_result registers per common emu behavior
-                self.mul_result = self.div_rem;
             }
             0x4207 => {
                 // HTIMEL - Horizontal Timer Low
@@ -3884,6 +3979,96 @@ impl Bus {
         self.irq_pending = false;
     }
 
+    /// Tick CPU-cycle based peripherals (currently: hardware math).
+    /// Call once per executed S-CPU instruction slice with the number of cycles consumed.
+    pub fn tick_cpu_cycles(&mut self, cpu_cycles: u8) {
+        if cpu_cycles == 0 {
+            return;
+        }
+
+        // Fast path: nothing in flight.
+        if !self.mul_busy && !self.div_busy {
+            return;
+        }
+
+        for _ in 0..cpu_cycles {
+            if self.mul_busy {
+                // Defer by 1 CPU cycle so we don't advance within the same cycle as the
+                // start write (WRMPYB). This matches common documentation and is enough
+                // to satisfy in-flight test ROMs.
+                if self.mul_just_started {
+                    self.mul_just_started = false;
+                    continue;
+                }
+                if self.mul_cycles_left == 0 {
+                    self.mul_busy = false;
+                    continue;
+                }
+                if (self.mul_work_b & 1) != 0 {
+                    self.mul_partial = self.mul_partial.wrapping_add(self.mul_work_a);
+                }
+                self.mul_work_b >>= 1;
+                self.mul_work_a = self.mul_work_a.wrapping_shl(1);
+                self.mul_cycles_left = self.mul_cycles_left.saturating_sub(1);
+                self.mul_result = self.mul_partial;
+                if self.mul_cycles_left == 0 {
+                    self.mul_busy = false;
+                }
+                continue;
+            }
+
+            if self.div_busy {
+                // Defer by 1 CPU cycle so we don't advance within the same cycle as the
+                // start write (WRDIVB).
+                if self.div_just_started {
+                    self.div_just_started = false;
+                    continue;
+                }
+                if self.div_cycles_left == 0 {
+                    self.div_busy = false;
+                    continue;
+                }
+                let divisor = self.div_work_divisor as u16;
+                if divisor == 0 {
+                    // Shouldn't happen (handled on start), but keep behavior safe.
+                    self.div_quot = 0xFFFF;
+                    self.div_rem = self.div_work_dividend;
+                    self.mul_result = self.div_rem;
+                    self.div_busy = false;
+                    continue;
+                }
+
+                let bit = self.div_work_bit;
+                if bit < 0 {
+                    // Completed.
+                    self.div_quot = self.div_work_quot;
+                    self.div_rem = self.div_work_rem;
+                    self.mul_result = self.div_rem;
+                    self.div_busy = false;
+                    continue;
+                }
+
+                let next = (self.div_work_dividend >> (bit as u16)) & 1;
+                self.div_work_rem = (self.div_work_rem << 1) | next;
+                if self.div_work_rem >= divisor {
+                    self.div_work_rem = self.div_work_rem.wrapping_sub(divisor);
+                    self.div_work_quot |= 1u16 << (bit as u16);
+                }
+                self.div_work_bit = self.div_work_bit.saturating_sub(1);
+                self.div_cycles_left = self.div_cycles_left.saturating_sub(1);
+
+                // Expose intermediate state through result registers.
+                self.div_quot = self.div_work_quot;
+                self.div_rem = self.div_work_rem;
+                self.mul_result = self.div_work_rem;
+
+                if self.div_cycles_left == 0 {
+                    self.div_busy = false;
+                }
+            }
+        }
+    }
+
     // Called by emulator each time scanline advances; minimal V-timer IRQ
     pub fn tick_timers(&mut self) {
         // Called at scanline boundary (good moment to check V compare)
@@ -3913,10 +4098,20 @@ impl Bus {
         let v_match = self.v_timer_set && (scanline == self.v_timer);
         let mut h_match = false;
         if self.h_timer_set {
-            let h = self.h_timer;
+            // Hardware note (coarse): H-IRQ triggers slightly after the programmed dot.
+            // Many docs describe ~HTIME+3.5 dots; approximate with +4 here.
+            let h = self.h_timer.wrapping_add(4);
             // Detect crossing of the H timer threshold within this PPU step
-            if old_cycle <= h && h < new_cycle {
-                h_match = true;
+            if old_cycle <= new_cycle {
+                // same scanline
+                if old_cycle <= h && h < new_cycle {
+                    h_match = true;
+                }
+            } else {
+                // scanline advanced and dot counter wrapped
+                if old_cycle <= h || h < new_cycle {
+                    h_match = true;
+                }
             }
         }
 
@@ -4390,8 +4585,9 @@ impl Bus {
             }
         }
 
-        // Special log for CGRAM transfers
-        if dest_base_full == 0x22 && cpu_to_ppu {
+        // Special log for CGRAM transfers (debug-only)
+        if debug_flags::cgram_dma() && !debug_flags::quiet() && dest_base_full == 0x22 && cpu_to_ppu
+        {
             static CGRAM_DMA_COUNT: OnceLock<AtomicU32> = OnceLock::new();
             let n = CGRAM_DMA_COUNT
                 .get_or_init(|| AtomicU32::new(0))
@@ -4785,11 +4981,31 @@ impl Bus {
 
 impl CpuBus for Bus {
     fn read_u8(&mut self, addr: u32) -> u8 {
-        Bus::read_u8(self, addr)
+        let v = Bus::read_u8(self, addr);
+        self.on_cpu_bus_cycle();
+        v
     }
 
     fn write_u8(&mut self, addr: u32, value: u8) {
-        Bus::write_u8(self, addr, value)
+        Bus::write_u8(self, addr, value);
+        self.on_cpu_bus_cycle();
+    }
+
+    fn begin_cpu_instruction(&mut self) {
+        self.cpu_instr_active = true;
+        self.cpu_instr_bus_cycles = 0;
+    }
+
+    fn end_cpu_instruction(&mut self, cycles: u8) {
+        // 命令内で発生したバスアクセス分は read_u8/write_u8 側で tick 済み。
+        // 残り（内部サイクル/ウェイト相当）だけ進める。
+        let bus_cycles = self.cpu_instr_bus_cycles;
+        self.cpu_instr_active = false;
+        self.cpu_instr_bus_cycles = 0;
+        let remaining = cycles.saturating_sub(bus_cycles);
+        if remaining != 0 {
+            self.tick_cpu_cycles(remaining);
+        }
     }
 
     fn poll_nmi(&mut self) -> bool {

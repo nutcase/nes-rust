@@ -2946,14 +2946,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
                 state.a = value;
                 set_flags_nz_16(state, value);
             }
-            add_cycles(
-                state,
-                if memory_8bit {
-                    2
-                } else {
-                    3
-                },
-            );
+            add_cycles(state, if memory_8bit { 2 } else { 3 });
             if memory_8bit {
                 2
             } else {
@@ -3005,14 +2998,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
                 state.x = value;
                 set_flags_nz_16(state, value);
             }
-            add_cycles(
-                state,
-                if index_8bit {
-                    2
-                } else {
-                    3
-                },
-            );
+            add_cycles(state, if index_8bit { 2 } else { 3 });
             if index_8bit {
                 2
             } else {
@@ -3058,14 +3044,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
                 state.y = value;
                 set_flags_nz_16(state, value);
             }
-            add_cycles(
-                state,
-                if index_8bit {
-                    2
-                } else {
-                    3
-                },
-            );
+            add_cycles(state, if index_8bit { 2 } else { 3 });
             if index_8bit {
                 2
             } else {

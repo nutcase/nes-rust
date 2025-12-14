@@ -26,10 +26,26 @@ if [[ ${#ROM_LIST[@]} -eq 0 ]]; then
   exit 2
 fi
 
-pass=0; fail=0; unknown=0
+pass=0; fail=0; skip=0; unknown=0
+include_manual="${RUN_CPU_TESTS_INCLUDE_MANUAL:-0}"
 for rom in "${ROM_LIST[@]}"; do
   echo "==> RUN: $rom"
   base="$(basename "$rom")"
+
+  # Some ROMs under roms/tests are manual/visual suites and don't emit APU PASS/FAIL signatures.
+  if [[ "$include_manual" != "1" ]]; then
+    if [[ "$base" == *"burn-in"* || "$base" == *"burnin"* ]]; then
+      echo "[RESULT] SKIP: $rom (manual burn-in test ROM; set RUN_CPU_TESTS_INCLUDE_MANUAL=1 to run)"
+      skip=$((skip+1))
+      continue
+    fi
+    if [[ "$base" == *"wrmpyb-in-flight"* ]]; then
+      echo "[RESULT] SKIP: $rom (visual test ROM; no APU PASS/FAIL signature)"
+      skip=$((skip+1))
+      continue
+    fi
+  fi
+
   is_cputest=0
   if [[ "$base" == *cputest* || "$base" == *CPUTEST* || "$base" == *65c816* || "$base" == *65C816* ]]; then
     is_cputest=1
@@ -42,11 +58,15 @@ for rom in "${ROM_LIST[@]}"; do
 if [[ $is_cputest -eq 1 ]]; then
   OUT=$(CPU_TEST_MODE=1 CPU_TEST_AUTO_FRAMES=${CPU_TEST_AUTO_FRAMES:-2000} \
           HEADLESS=1 HEADLESS_FRAMES=${HEADLESS_FRAMES:-2000} QUIET=1 \
+          HEADLESS_VIS_CHECK=0 HEADLESS_SUMMARY=0 \
           ALLOW_BAD_CHECKSUM=1 \
+          RUSTFLAGS="-Awarnings ${RUSTFLAGS:-}" \
           cargo run --release --quiet --bin snes_emulator -- "$rom" 2>&1)
 else
   OUT=$(TESTROM_APU_PRINT=1 HEADLESS=1 HEADLESS_FRAMES=${HEADLESS_FRAMES:-7200} QUIET=1 \
+          HEADLESS_VIS_CHECK=0 HEADLESS_SUMMARY=0 \
           ALLOW_BAD_CHECKSUM=1 \
+          RUSTFLAGS="-Awarnings ${RUSTFLAGS:-}" \
           cargo run --release --quiet --bin snes_emulator -- "$rom" 2>&1)
 fi
   rc=$?
@@ -65,11 +85,16 @@ fi
     echo "[RESULT] FAIL: $rom"
     fail=$((fail+1))
   else
-    echo "[RESULT] UNKNOWN: $rom (no PASS/FAIL signature)"
-    unknown=$((unknown+1))
+    if [[ $rc -ne 0 ]]; then
+      echo "[RESULT] FAIL: $rom (emulator returned exit=$rc)"
+      fail=$((fail+1))
+    else
+      echo "[RESULT] UNKNOWN: $rom (no PASS/FAIL signature)"
+      unknown=$((unknown+1))
+    fi
   fi
 done
 
-echo "\nSummary: PASS=$pass FAIL=$fail UNKNOWN=$unknown (total=$((pass+fail+unknown)))"
+echo "\nSummary: PASS=$pass FAIL=$fail SKIP=$skip UNKNOWN=$unknown (total=$((pass+fail+skip+unknown)))"
 [[ $fail -eq 0 ]] || exit 1
 exit 0

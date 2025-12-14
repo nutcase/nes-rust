@@ -62,8 +62,8 @@ impl Apu {
         let boot_hle_enabled = std::env::var("APU_BOOT_HLE")
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(false); // デフォルト: HLE無効（実IPLで正確さ優先）
-                              // 正確さ優先: デフォルトではフルサイズ転送を行う。
-                              // 速さが欲しい場合のみ APU_FAST_UPLOAD=1 を明示する。
+                               // 正確さ優先: デフォルトではフルサイズ転送を行う。
+                               // 速さが欲しい場合のみ APU_FAST_UPLOAD=1 を明示する。
         let fast_upload = std::env::var("APU_FAST_UPLOAD")
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(false);
