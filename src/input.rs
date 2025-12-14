@@ -38,19 +38,50 @@ impl SnesController {
         Self {
             buttons: 0,
             auto_buttons: 0,
-            shift_register: 0,
-            latched_buttons: 0,
+            // Power-on: no buttons pressed.
+            // SNES joypad bits are "1=Low=Pressed", so unpressed = 0.
+            // Some ROMs read $4016/$4017 before any strobe edge, so keep this sane.
+            shift_register: 0x0000,
+            latched_buttons: 0x0000,
             strobe: false,
         }
     }
 
-    /// ハードウェア出力形式（アクティブLOW）に変換したボタン状態を返す
-    /// 1 = 未押下, 0 = 押下
+    /// SNES の $4016/$4017 および $4218-$421F の 16-bit 出力形式に変換した値を返す。
+    /// 1 = Low = 押下, 0 = High = 未押下
+    ///
+    /// 注意: SNES の自動ジョイパッド読み取り/シリアル読み取りは MSB(Bボタン) から出力される。
+    /// よって本関数は以下のビット配置で返す:
+    ///   bit15..0 = B,Y,Select,Start,Up,Down,Left,Right,A,X,L,R,0,0,0,0
     #[inline]
     pub fn active_low_bits(&self) -> u16 {
-        // SNESは12ボタン分のみ有効ビット（0..11）。上位4ビットは常に1が返る。
         let combined = self.buttons | self.auto_buttons;
-        (!combined) | 0xF000
+        let b = ((combined & button::B) != 0) as u16;
+        let y = ((combined & button::Y) != 0) as u16;
+        let select = ((combined & button::SELECT) != 0) as u16;
+        let start = ((combined & button::START) != 0) as u16;
+        let up = ((combined & button::UP) != 0) as u16;
+        let down = ((combined & button::DOWN) != 0) as u16;
+        let left = ((combined & button::LEFT) != 0) as u16;
+        let right = ((combined & button::RIGHT) != 0) as u16;
+        let a = ((combined & button::A) != 0) as u16;
+        let x = ((combined & button::X) != 0) as u16;
+        let l = ((combined & button::L) != 0) as u16;
+        let r = ((combined & button::R) != 0) as u16;
+
+        // Standard controller signature bits are 0000.
+        (b << 15)
+            | (y << 14)
+            | (select << 13)
+            | (start << 12)
+            | (up << 11)
+            | (down << 10)
+            | (left << 9)
+            | (right << 8)
+            | (a << 7)
+            | (x << 6)
+            | (l << 5)
+            | (r << 4)
     }
 
     // ボタン状態を設定
@@ -101,23 +132,23 @@ impl SnesController {
     // データ読み取り（$4016/$4017）
     pub fn read_data(&mut self) -> u8 {
         if self.strobe {
-            // ストローブ中は常にAボタンの状態を返す
-            // ハードはアクティブLOWなので未押下=1, 押下=0
-            ((self.buttons & button::B) == 0) as u8
+            // ストローブ中は常に最初のビット（B）の状態を返す。
+            let combined = self.buttons | self.auto_buttons;
+            ((combined & button::B) != 0) as u8
         } else {
-            // シフトレジスタから1ビットずつ読み出し
-            let result = (self.shift_register & 0x0001) as u8;
-            self.shift_register >>= 1;
-            // 読み切った後は1を返す（コントローラー接続確認）
-            self.shift_register |= 0x8000;
+            // シフトレジスタから1ビットずつ読み出し（MSBから: Bが最初）。
+            let result = ((self.shift_register & 0x8000) != 0) as u8;
+            // 読み切った後は0を返す（High=未押下）
+            self.shift_register <<= 1;
             result
         }
     }
 
     fn latch_buttons(&mut self) {
         // ボタンの読み出し順序に合わせて並び替え
-        // SNESの読み出し順序: B, Y, Select, Start, Up, Down, Left, Right, A, X, L, R
-        // 実機出力に合わせアクティブLOW（未押下=1, 押下=0）に反転する
+        // SNESの読み出し順序（MSB→LSB）:
+        //   B, Y, Select, Start, Up, Down, Left, Right, A, X, L, R, 0, 0, 0, 0
+        // 実機出力に合わせ「1=Low=Pressed」に変換する
         self.latched_buttons = self.active_low_bits();
         self.shift_register = self.latched_buttons;
     }
@@ -196,9 +227,21 @@ impl InputSystem {
                 }
             }
         }
+        let mut controller2 = SnesController::new();
+        // 環境変数 AUTO_JOYPAD2_MASK で常時押下するボタンを指定できる（例: 0x0100 = A）
+        if let Ok(val) = std::env::var("AUTO_JOYPAD2_MASK") {
+            if let Ok(mask) = u16::from_str_radix(val.trim_start_matches("0x"), 16)
+                .or_else(|_| val.parse::<u16>())
+            {
+                controller2.set_auto_buttons(mask);
+                if !debug_flags::quiet() {
+                    println!("AUTO_JOYPAD2_MASK set: 0x{:04X}", mask);
+                }
+            }
+        }
         Self {
             controller1,
-            controller2: SnesController::new(),
+            controller2,
             controller3: SnesController::new(),
             controller4: SnesController::new(),
             multitap_enabled: false,
@@ -229,6 +272,8 @@ impl InputSystem {
     pub fn write_strobe(&mut self, value: u8) {
         self.controller1.write_strobe(value);
         self.controller2.write_strobe(value);
+        self.controller3.write_strobe(value);
+        self.controller4.write_strobe(value);
     }
 
     // 外部からのキー入力を処理
@@ -272,7 +317,19 @@ impl InputSystem {
             buttons |= button::SELECT;
         }
 
-        self.controller1.set_buttons(buttons);
+        // Keyboard → controller port mapping (default: port1).
+        // Some test ROMs (e.g. Super NES Service) use controller2 for navigation.
+        let input_port = std::env::var("INPUT_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(1);
+        match input_port {
+            2 => self.controller2.set_buttons(buttons),
+            _ => self.controller1.set_buttons(buttons),
+        }
+        if std::env::var_os("INPUT_MIRROR_P1_TO_P2").is_some() {
+            self.controller2.set_buttons(buttons);
+        }
     }
 
     pub fn set_multitap_enabled(&mut self, enabled: bool) {

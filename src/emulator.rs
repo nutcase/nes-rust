@@ -1811,11 +1811,30 @@ impl Emulator {
         });
 
         if should_inject {
-            // Inject START button press
-            self.bus
-                .get_input_system_mut()
-                .controller1
-                .set_buttons(button_mask);
+            // Inject button press.
+            let input_port = std::env::var("INPUT_PORT")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(1);
+            match input_port {
+                2 => self
+                    .bus
+                    .get_input_system_mut()
+                    .controller2
+                    .set_buttons(button_mask),
+                _ => self
+                    .bus
+                    .get_input_system_mut()
+                    .controller1
+                    .set_buttons(button_mask),
+            }
+            // Optional: mirror P1 injection to P2 as well (useful for manual test ROMs)
+            if std::env::var_os("INPUT_MIRROR_P1_TO_P2").is_some() {
+                self.bus
+                    .get_input_system_mut()
+                    .controller2
+                    .set_buttons(button_mask);
+            }
 
             static mut INJECT_LOG_COUNT: u32 = 0;
             unsafe {
@@ -1826,7 +1845,17 @@ impl Emulator {
             }
         } else {
             // Clear buttons when not in injection range
-            self.bus.get_input_system_mut().controller1.set_buttons(0);
+            let input_port = std::env::var("INPUT_PORT")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(1);
+            match input_port {
+                2 => self.bus.get_input_system_mut().controller2.set_buttons(0),
+                _ => self.bus.get_input_system_mut().controller1.set_buttons(0),
+            }
+            if std::env::var_os("INPUT_MIRROR_P1_TO_P2").is_some() {
+                self.bus.get_input_system_mut().controller2.set_buttons(0);
+            }
         }
     }
 

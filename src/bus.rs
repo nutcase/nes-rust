@@ -234,8 +234,9 @@ impl Bus {
             v_timer_set: false,
 
             joy_busy_counter: 0,
-            // $4218-$421F (JOY1..4): power-on should read as "no buttons pressed" (active-low => 0xFF).
-            joy_data: [0xFF; 8],
+            // $4218-$421F (JOY1..4): power-on should read as "no buttons pressed".
+            // SNES joypad bits are "1=Low=Pressed", so default is 0x00.
+            joy_data: [0x00; 8],
             // JOYBUSY はオートジョイパッド読み取り中だけ立つ。
             // 実機では約 3 本分のスキャンライン相当 (4224 master cycles) 継続する。
             // CPU テスト ROM では VBlank 突入から数ライン後に $4212 を覗くため、
@@ -427,8 +428,9 @@ impl Bus {
             v_timer_set: false,
 
             joy_busy_counter: 0,
-            // $4218-$421F (JOY1..4): power-on should read as "no buttons pressed" (active-low => 0xFF).
-            joy_data: [0xFF; 8],
+            // $4218-$421F (JOY1..4): power-on should read as "no buttons pressed".
+            // SNES joypad bits are "1=Low=Pressed", so default is 0x00.
+            joy_data: [0x00; 8],
             joy_busy_scanlines: std::env::var("JOYBUSY_SCANLINES")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -3105,34 +3107,49 @@ impl Bus {
     fn read_io_register(&mut self, addr: u16) -> u8 {
         match addr {
             0x4016 => {
-                let v = self.input_system.read_controller1();
+                // JOYSER0 ($4016): returns two bits (D0/D1) per read.
+                // Standard controllers use only D0 (bit0). D1 (bit1) is used by multitap/etc.
+                let d0 = self.input_system.read_controller1() & 1;
+                let d1 = if self.input_system.is_multitap_enabled() {
+                    self.input_system.read_controller3() & 1
+                } else {
+                    0
+                };
+                let v = d0 | (d1 << 1);
                 if std::env::var_os("TRACE_4016").is_some() {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static COUNT: AtomicU32 = AtomicU32::new(0);
                     let n = COUNT.fetch_add(1, Ordering::Relaxed);
                     if n < 256 {
                         println!(
-                            "[TRACE4016] read#{} $4016 -> {} PC={:06X}",
+                            "[TRACE4016] read#{} $4016 -> 0b{:02b} PC={:06X}",
                             n + 1,
-                            v & 1,
-                            self.last_cpu_pc
+                            v & 0x03,
+                            self.last_cpu_pc,
                         );
                     }
                 }
                 v
             }
             0x4017 => {
-                let v = self.input_system.read_controller2();
+                // JOYSER1 ($4017): returns two bits (D0/D1) per read plus fixed 1s in bits2-4.
+                let d0 = self.input_system.read_controller2() & 1;
+                let d1 = if self.input_system.is_multitap_enabled() {
+                    self.input_system.read_controller4() & 1
+                } else {
+                    0
+                };
+                let v = 0x1C | d0 | (d1 << 1);
                 if std::env::var_os("TRACE_4016").is_some() {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static COUNT: AtomicU32 = AtomicU32::new(0);
                     let n = COUNT.fetch_add(1, Ordering::Relaxed);
                     if n < 256 {
                         println!(
-                            "[TRACE4016] read#{} $4017 -> {} PC={:06X}",
+                            "[TRACE4016] read#{} $4017 -> 0b{:02b} PC={:06X}",
                             n + 1,
-                            v & 1,
-                            self.last_cpu_pc
+                            v & 0x03,
+                            self.last_cpu_pc,
                         );
                     }
                 }
@@ -3375,7 +3392,7 @@ impl Bus {
             // JOY1/2/3/4 data
             0x4218 => {
                 // cputest-full 初期操作補助（ヘッドレス向け）:
-                // 最初の読みで未押下、次の読みで右ボタン押下(bit7=0)を返し、
+                // 最初の読みで未押下、次の読みでAボタン押下(bit7=1)を返し、
                 // BPL/BMI の二段階チェックを通過させる。
                 // - CPU_TEST_MODE により cpu_test_mode が有効になるが、ウィンドウ表示では入力を尊重するため無効
                 // - 明示的に有効化したい場合は CPUTEST_AUTORIGHT=1
@@ -3390,8 +3407,8 @@ impl Bus {
                         let mut val = self.joy_data[0];
                         if self.cpu_test_auto_joy_phase == 0 {
                             self.cpu_test_auto_joy_phase = 1;
-                            // まず未押下を返す（Right=1, active-low）
-                            val |= 0x80;
+                            // まず未押下を返す（A=0, 1=Low=Pressed）
+                            val &= !0x80;
                             if std::env::var_os("TRACE_CPU_TEST_AUTO").is_some() {
                                 println!(
                                     "[CPU-TEST-AUTO] JOY1L read (unpressed) val=0x{:02X}",
@@ -3401,10 +3418,10 @@ impl Bus {
                             return val;
                         }
                         self.cpu_test_auto_joy_phase = 0;
-                        // 次はRight押下を返す（bit7=0）
-                        val &= !0x80;
+                        // 次はA押下を返す（bit7=1）
+                        val |= 0x80;
                         if std::env::var_os("TRACE_CPU_TEST_AUTO").is_some() {
-                            println!("[CPU-TEST-AUTO] JOY1L read (Right) val=0x{:02X}", val);
+                            println!("[CPU-TEST-AUTO] JOY1L read (A) val=0x{:02X}", val);
                         }
                         return val;
                     }
@@ -4165,37 +4182,42 @@ impl Bus {
     // Called when VBlank starts (scanline 224). Handles auto-joy if enabled.
     pub fn on_vblank_start(&mut self) {
         if (self.nmitimen & 0x01) != 0 {
-            // Latch controller states into JOY registers
-            // パッドはアクティブLOW（未押下=1, 押下=0）。
-            // AUTO_JOYPAD1_MASK などで常時押下を注入できるよう、active_low_bits() を使用する。
-            let mut b1 = self.input_system.controller1.active_low_bits();
-            let mut b2 = self.input_system.controller2.active_low_bits();
+            // Auto-joypad read begins with a latch pulse (equivalent to writing 1->0 to $4016).
+            // This also prepares the manual serial read registers ($4016/$4017) for ROMs that
+            // read them after enabling auto-joypad without explicitly strobbing.
+            self.input_system.write_strobe(1);
+            self.input_system.write_strobe(0);
+
+            // Auto-joypad: emulate the hardware serial read (16 bits per pad).
+            // SNES stores bits as "1=Low=Pressed" with first serial bit (B) as MSB.
             let mt = self.input_system.is_multitap_enabled();
-            let b3 = if mt {
-                self.input_system.controller3_active_low()
-            } else {
-                0
-            };
-            let b4 = if mt {
-                self.input_system.controller4_active_low()
-            } else {
-                0
-            };
-            self.joy_data[0] = (b1 & 0x00FF) as u8; // JOY1L: B,Y,Sel,Start,Up,Down,Left,Right
-            self.joy_data[1] = ((b1 >> 8) & 0x00FF) as u8; // JOY1H: A,X,L,R
-            self.joy_data[2] = (b2 & 0x00FF) as u8; // JOY2L
-            self.joy_data[3] = ((b2 >> 8) & 0x00FF) as u8; // JOY2H
-                                                           // JOY3/4 for multitap
+            let mut b1: u16 = 0;
+            let mut b2: u16 = 0;
+            let mut b3: u16 = 0;
+            let mut b4: u16 = 0;
+            for _ in 0..16 {
+                b1 = (b1 << 1) | ((self.input_system.read_controller1() & 1) as u16);
+                b2 = (b2 << 1) | ((self.input_system.read_controller2() & 1) as u16);
+                if mt {
+                    b3 = (b3 << 1) | ((self.input_system.read_controller3() & 1) as u16);
+                    b4 = (b4 << 1) | ((self.input_system.read_controller4() & 1) as u16);
+                }
+            }
+
+            self.joy_data[0] = (b1 & 0x00FF) as u8;
+            self.joy_data[1] = ((b1 >> 8) & 0x00FF) as u8;
+            self.joy_data[2] = (b2 & 0x00FF) as u8;
+            self.joy_data[3] = ((b2 >> 8) & 0x00FF) as u8;
             self.joy_data[4] = (b3 & 0x00FF) as u8;
             self.joy_data[5] = ((b3 >> 8) & 0x00FF) as u8;
             self.joy_data[6] = (b4 & 0x00FF) as u8;
             self.joy_data[7] = ((b4 >> 8) & 0x00FF) as u8;
             // CPUテストROM専用（ヘッドレスのみ）:
-            // ラッチ値を「未押下」に固定し、$4218 の2回目読みで右押下を返す。
+            // ラッチ値を「未押下」に固定し、$4218 の2回目読みでA押下を返す。
             // ウィンドウ表示時はユーザー入力を優先する。
             if self.cpu_test_mode && crate::debug_flags::headless() {
-                self.joy_data[0] = 0xFF;
-                self.joy_data[1] = 0xFF;
+                self.joy_data[0] = 0x00;
+                self.joy_data[1] = 0x00;
             }
             // Set JOYBUSY for a short duration (approximation)
             // CPUテストHLE_FORCE中は BUSY=0（常に完了扱い）、そうでなければ長めに保持
@@ -5055,7 +5077,8 @@ impl CpuBus for Bus {
         // - cpu_test_mode (title-based) AND
         // - HEADLESS=1 AND
         // - CPU_TEST_MODE env var set (explicit opt-in for auto-exit)
-        if !self.cpu_test_mode || self.cpu_test_result.is_some() || !crate::debug_flags::headless() {
+        if !self.cpu_test_mode || self.cpu_test_result.is_some() || !crate::debug_flags::headless()
+        {
             return;
         }
         static ENABLED: OnceLock<bool> = OnceLock::new();
