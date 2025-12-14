@@ -3230,122 +3230,25 @@ impl Emulator {
         if !self.bus.is_cpu_test_mode() {
             return;
         }
-        let st = self.cpu.core.state();
-        let pb = st.pb;
-        let pc = st.pc;
-        let db = st.db;
-        let x = st.x;
-        // cputest-full.sfc: PASS/FAIL表示後、00:81A2の無限ループへ入る
-        if pb != 0x00 || pc != 0x81A2 {
+        let Some(result) = self.bus.take_cpu_test_result() else {
             return;
-        }
-        // テスト番号は WRAM 0x0010/0x0011（ミラー）に保持される
-        let test_idx = {
-            let wram = self.bus.wram();
-            let t_lo = wram.get(0x0010).copied().unwrap_or(0);
-            let t_hi = wram.get(0x0011).copied().unwrap_or(0);
-            ((t_hi as u16) << 8) | (t_lo as u16)
         };
-
-        // X は結果文字列（"Success"/"Failed"/"Invalid test order" 等）の先頭を指す
-        let read_msg = |emu: &mut Emulator, bank: u8, ptr: u16| -> String {
-            let bank_base = (bank as u32) << 16;
-            let read =
-                |emu: &mut Emulator, off: u16| -> u8 { emu.bus.read_u8(bank_base | off as u32) };
-
-            // cputest-full.sfc は print ルーチンで X を進めるため、
-            // 文字列末尾(0)を指して停止することがある。0終端ASCIIを前後で探す。
-            let mut start = ptr;
-            if read(emu, ptr) == 0 {
-                let mut off = ptr;
-                for _ in 0..64 {
-                    if off == 0 {
-                        break;
-                    }
-                    off = off.wrapping_sub(1);
-                    if read(emu, off) == 0 {
-                        start = off.wrapping_add(1);
-                        break;
-                    }
-                }
-            } else {
-                let mut off = ptr;
-                for _ in 0..64 {
-                    if off == 0 {
-                        break;
-                    }
-                    let prev = off.wrapping_sub(1);
-                    if read(emu, prev) == 0 {
-                        start = off;
-                        break;
-                    }
-                    off = prev;
-                }
+        match result {
+            crate::bus::CpuTestResult::Pass { test_idx } => {
+                println!("[CPUTEST] PASS (test_idx=0x{:04X})", test_idx);
+                crate::shutdown::request_quit();
             }
-
-            let mut s = String::new();
-            let start_u32 = start as u32;
-            for i in 0..64u32 {
-                let off = start_u32 + i;
-                if off > 0xFFFF {
-                    break;
-                }
-                let b = emu.bus.read_u8(bank_base | off);
-                if b == 0 {
-                    break;
-                }
-                let ch = b as char;
-                if ch.is_ascii_graphic() || ch == ' ' {
-                    s.push(ch);
-                }
+            crate::bus::CpuTestResult::Fail { test_idx } => {
+                println!("[CPUTEST] FAIL (test_idx=0x{:04X})", test_idx);
+                crate::shutdown::request_quit_with_code(1);
             }
-            s
-        };
-
-        let mut msg = String::new();
-        let mut banks = vec![db, pb, 0x00, 0x80, 0x7E, 0x7F];
-        let mut seen = [false; 256];
-        banks.retain(|&b| {
-            let idx = b as usize;
-            if seen[idx] {
-                return false;
+            crate::bus::CpuTestResult::InvalidOrder { test_idx } => {
+                println!(
+                    "[CPUTEST] FAIL (msg=\"Invalid test order\" test_idx=0x{:04X})",
+                    test_idx
+                );
+                crate::shutdown::request_quit_with_code(1);
             }
-            seen[idx] = true;
-            true
-        });
-        for bank in banks {
-            let cand = read_msg(self, bank, x);
-            if cand.is_empty() {
-                continue;
-            }
-            let lower = cand.to_ascii_lowercase();
-            if lower.contains("success") || lower.contains("failed") || lower.contains("invalid") {
-                msg = cand;
-                break;
-            }
-            if msg.is_empty() {
-                msg = cand;
-            }
-        }
-        let lower = msg.to_ascii_lowercase();
-        if lower.contains("success") {
-            println!("[CPUTEST] PASS (test_idx=0x{:04X})", test_idx);
-            crate::shutdown::request_quit();
-            return;
-        } else if lower.contains("failed") || lower.contains("invalid") {
-            println!(
-                "[CPUTEST] FAIL (msg=\"{}\" test_idx=0x{:04X})",
-                msg, test_idx
-            );
-            crate::shutdown::request_quit_with_code(1);
-            return;
-        } else {
-            println!(
-                "[CPUTEST] HALT (pc=00:81A2 x=0x{:04X} msg=\"{}\" test_idx=0x{:04X})",
-                x, msg, test_idx
-            );
-            crate::shutdown::request_quit_with_code(2);
-            return;
         }
     }
 

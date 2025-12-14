@@ -12,6 +12,13 @@ use crate::debug_flags;
 use crate::fake_apu::FakeApuUploadState;
 use crate::sa1::Sa1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuTestResult {
+    Pass { test_idx: u16 },
+    Fail { test_idx: u16 },
+    InvalidOrder { test_idx: u16 },
+}
+
 pub struct Bus {
     wram: Vec<u8>,
     sram: Vec<u8>,
@@ -76,6 +83,7 @@ pub struct Bus {
     cpu_test_mode: bool,
     cpu_test_auto_frames: u32,
     cpu_test_auto_joy_phase: u8,
+    cpu_test_result: Option<CpuTestResult>,
 
     // Run-wide counters for headless init summary
     nmitimen_writes_count: u32,
@@ -239,6 +247,7 @@ impl Bus {
             cpu_test_mode: false,
             cpu_test_auto_frames: 120,
             cpu_test_auto_joy_phase: 0,
+            cpu_test_result: None,
 
             nmitimen_writes_count: 0,
             mdmaen_nonzero_count: 0,
@@ -427,6 +436,7 @@ impl Bus {
             cpu_test_mode: false,
             cpu_test_auto_frames: 120,
             cpu_test_auto_joy_phase: 0,
+            cpu_test_result: None,
 
             nmitimen_writes_count: 0,
             mdmaen_nonzero_count: 0,
@@ -3874,11 +3884,16 @@ impl Bus {
             .and_then(|s| s.parse().ok())
             .unwrap_or(120);
         self.cpu_test_auto_joy_phase = 0;
+        self.cpu_test_result = None;
     }
 
     #[inline]
     pub fn is_cpu_test_mode(&self) -> bool {
         self.cpu_test_mode
+    }
+
+    pub fn take_cpu_test_result(&mut self) -> Option<CpuTestResult> {
+        self.cpu_test_result.take()
     }
 
     #[inline]
@@ -5032,5 +5047,35 @@ impl CpuBus for Bus {
 
     fn set_last_cpu_pc(&mut self, pc24: u32) {
         self.last_cpu_pc = pc24;
+
+        // cputest-full.sfc: detect PASS/FAIL/Invalid by watching known PC points where it prints
+        // the result string. This is used by headless runners to exit with an appropriate code.
+        //
+        // Guarded by:
+        // - cpu_test_mode (title-based) AND
+        // - HEADLESS=1 AND
+        // - CPU_TEST_MODE env var set (explicit opt-in for auto-exit)
+        if !self.cpu_test_mode || self.cpu_test_result.is_some() || !crate::debug_flags::headless() {
+            return;
+        }
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| std::env::var_os("CPU_TEST_MODE").is_some());
+        if !enabled {
+            return;
+        }
+
+        let test_idx = ((self.wram.get(0x0011).copied().unwrap_or(0) as u16) << 8)
+            | (self.wram.get(0x0010).copied().unwrap_or(0) as u16);
+
+        // These addresses are stable for the bundled roms/tests/cputest-full.sfc.
+        // 00:8199 -> prints "Success"
+        // 00:8148/00:81B8 -> prints "Failed"
+        // 00:8150 -> prints "Invalid test order"
+        self.cpu_test_result = match pc24 {
+            0x008199 => Some(CpuTestResult::Pass { test_idx }),
+            0x008148 | 0x0081B8 => Some(CpuTestResult::Fail { test_idx }),
+            0x008150 => Some(CpuTestResult::InvalidOrder { test_idx }),
+            _ => None,
+        };
     }
 }
