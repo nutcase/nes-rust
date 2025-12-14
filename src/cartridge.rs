@@ -286,11 +286,27 @@ impl Cartridge {
         if std::env::var_os("ALLOW_BAD_CHECKSUM").is_some() {
             return Ok(());
         }
+
+        // 多くの ROM（特にテストROM/改造ROM）ではヘッダの checksum/complement が壊れていることがある。
+        // その場合でも実行自体は可能なので、デフォルトは警告に留める。
+        //
+        // 厳密に弾きたい場合だけ STRICT_CHECKSUM=1 を指定する。
         if checksum ^ checksum_complement != 0xFFFF {
-            return Err(format!(
-                "Invalid checksums: 0x{:04X} ^ 0x{:04X} != 0xFFFF",
-                checksum, checksum_complement
-            ));
+            let strict = std::env::var("STRICT_CHECKSUM")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(false);
+            if strict {
+                return Err(format!(
+                    "Invalid checksums: 0x{:04X} ^ 0x{:04X} != 0xFFFF",
+                    checksum, checksum_complement
+                ));
+            }
+            if !crate::debug_flags::quiet() {
+                println!(
+                    "Warning: Invalid checksums: 0x{:04X} ^ 0x{:04X} != 0xFFFF (set STRICT_CHECKSUM=1 to reject)",
+                    checksum, checksum_complement
+                );
+            }
         }
         Ok(())
     }
