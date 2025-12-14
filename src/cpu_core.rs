@@ -554,7 +554,10 @@ fn read_absolute_x_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T
     let base = read_u16_generic(state, bus);
     let low_sum = (base & 0x00FF) as u32 + (state.x & 0x00FF) as u32;
     let penalty = if low_sum >= 0x100 { 1 } else { 0 };
-    let addr = ((state.db as u32) << 16) | (base.wrapping_add(state.x) as u32);
+    // Absolute,X uses DBR for the bank. Indexing is applied to the full 24-bit address
+    // (carry can propagate into the bank). This matters for WRAM $7E/$7F crossings.
+    let base_full = ((state.db as u32) << 16) | (base as u32);
+    let addr = base_full.wrapping_add(state.x as u32);
     (addr, penalty)
 }
 
@@ -562,7 +565,9 @@ fn read_absolute_y_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T
     let base = read_u16_generic(state, bus);
     let low_sum = (base & 0x00FF) as u32 + (state.y & 0x00FF) as u32;
     let penalty = if low_sum >= 0x100 { 1 } else { 0 };
-    let addr = ((state.db as u32) << 16) | (base.wrapping_add(state.y) as u32);
+    // Absolute,Y uses DBR for the bank; indexing is applied to the full 24-bit address.
+    let base_full = ((state.db as u32) << 16) | (base as u32);
+    let addr = base_full.wrapping_add(state.y as u32);
     (addr, penalty)
 }
 
@@ -610,7 +615,9 @@ fn read_indirect_y_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T
     if ((base16 & 0x00FF) as u32) + (state.y & 0x00FF) as u32 >= 0x100 {
         penalty = penalty.saturating_add(1);
     }
-    let full = ((state.db as u32) << 16) | (base16.wrapping_add(state.y) as u32);
+    // (dp),Y uses DBR for the bank; indexing is applied to the full 24-bit address.
+    let base_full = ((state.db as u32) << 16) | (base16 as u32);
+    let full = base_full.wrapping_add(state.y as u32);
     (full, penalty)
 }
 
@@ -662,7 +669,9 @@ fn read_stack_relative_indirect_y_generic<T: CpuBus>(
     if ((base16 & 0x00FF) as u32) + (state.y & 0x00FF) as u32 >= 0x100 {
         penalty = penalty.saturating_add(1);
     }
-    let full = ((state.db as u32) << 16) | (base16.wrapping_add(state.y) as u32);
+    // (sr),Y uses DBR for the bank; indexing is applied to the full 24-bit address.
+    let base_full = ((state.db as u32) << 16) | (base16 as u32);
+    let full = base_full.wrapping_add(state.y as u32);
     (full, penalty)
 }
 
