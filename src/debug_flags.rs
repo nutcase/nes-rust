@@ -117,6 +117,11 @@ pub fn quiet() -> bool {
     *ON.get_or_init(|| env_flag("QUIET", false))
 }
 
+pub fn headless() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("HEADLESS", false))
+}
+
 // Trace long jumps/returns (JSL/RTL) for DQ3 investigation
 pub fn trace_jsl() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

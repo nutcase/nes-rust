@@ -226,7 +226,8 @@ impl Bus {
             v_timer_set: false,
 
             joy_busy_counter: 0,
-            joy_data: [0; 8],
+            // $4218-$421F (JOY1..4): power-on should read as "no buttons pressed" (active-low => 0xFF).
+            joy_data: [0xFF; 8],
             // JOYBUSY はオートジョイパッド読み取り中だけ立つ。
             // 実機では約 3 本分のスキャンライン相当 (4224 master cycles) 継続する。
             // CPU テスト ROM では VBlank 突入から数ライン後に $4212 を覗くため、
@@ -417,7 +418,8 @@ impl Bus {
             v_timer_set: false,
 
             joy_busy_counter: 0,
-            joy_data: [0; 8],
+            // $4218-$421F (JOY1..4): power-on should read as "no buttons pressed" (active-low => 0xFF).
+            joy_data: [0xFF; 8],
             joy_busy_scanlines: std::env::var("JOYBUSY_SCANLINES")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -3362,9 +3364,14 @@ impl Bus {
             }
             // JOY1/2/3/4 data
             0x4218 => {
-                // cputest-full 初期操作補助: 最初の読みで未押下、次の読みで右ボタン押下(bit7=0)を返し、
-                // BPL/BMI の二段階チェックを通過させる。cpu_test_mode または CPUTEST_AUTORIGHT=1 で有効。
-                if self.cpu_test_mode || std::env::var_os("CPUTEST_AUTORIGHT").is_some() {
+                // cputest-full 初期操作補助（ヘッドレス向け）:
+                // 最初の読みで未押下、次の読みで右ボタン押下(bit7=0)を返し、
+                // BPL/BMI の二段階チェックを通過させる。
+                // - CPU_TEST_MODE により cpu_test_mode が有効になるが、ウィンドウ表示では入力を尊重するため無効
+                // - 明示的に有効化したい場合は CPUTEST_AUTORIGHT=1
+                if (self.cpu_test_mode && crate::debug_flags::headless())
+                    || std::env::var_os("CPUTEST_AUTORIGHT").is_some()
+                {
                     let always = std::env::var_os("CPUTEST_AUTORIGHT").is_some();
                     let auto_active = always
                         || (self.cpu_test_mode
@@ -4168,8 +4175,10 @@ impl Bus {
             self.joy_data[5] = ((b3 >> 8) & 0x00FF) as u8;
             self.joy_data[6] = (b4 & 0x00FF) as u8;
             self.joy_data[7] = ((b4 >> 8) & 0x00FF) as u8;
-            // CPUテストROM専用: ラッチ値を「未押下」に固定し、$4218 の2回目読みで右押下を返す
-            if self.cpu_test_mode {
+            // CPUテストROM専用（ヘッドレスのみ）:
+            // ラッチ値を「未押下」に固定し、$4218 の2回目読みで右押下を返す。
+            // ウィンドウ表示時はユーザー入力を優先する。
+            if self.cpu_test_mode && crate::debug_flags::headless() {
                 self.joy_data[0] = 0xFF;
                 self.joy_data[1] = 0xFF;
             }
