@@ -4678,8 +4678,9 @@ mod tests {
     }
 
     #[test]
-    fn bcd_adc_overflow_flag_from_binary() {
-        // 0x50 + 0x50 => binary 0xA0 (V=1), BCD -> 0x00 with carry
+    fn bcd_adc_overflow_flag_from_bcd_result() {
+        // In decimal mode, V follows the normal overflow rule using the final (BCD-adjusted) result.
+        // 0x50 + 0x50 => BCD 0x00 with carry, so V=0 (no sign overflow in the final result).
         let mut bus = make_hirom_bus_with_rom(0x200000, |rom| {
             let code = [0xF8, 0x18, 0xA9, 0x50, 0x69, 0x50, 0x00];
             let mut p = 0x008400usize;
@@ -4698,7 +4699,7 @@ mod tests {
         }
         assert_eq!(cpu.a & 0xFF, 0x00);
         assert!(cpu.p.contains(StatusFlags::CARRY));
-        assert!(cpu.p.contains(StatusFlags::OVERFLOW));
+        assert!(!cpu.p.contains(StatusFlags::OVERFLOW));
     }
 
     #[test]

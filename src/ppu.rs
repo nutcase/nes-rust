@@ -5957,13 +5957,13 @@ impl Ppu {
                 && !crate::debug_flags::quiet()
             {
                 GRAPHICS_DETECTED_PRINTS += 1;
-                if GRAPHICS_DETECTED_PRINTS <= 10 {
+                if GRAPHICS_DETECTED_PRINTS <= 1 {
                     println!(
                         "🎨 GRAPHICS DETECTED: Non-black pixel 0x{:08X} at ({}, {}) layer={}",
                         final_color, x, y, layer_id
                     );
-                } else if GRAPHICS_DETECTED_PRINTS == 11 {
-                    println!("🎨 GRAPHICS DETECTED: (suppressed; set DEBUG_GRAPHICS_DETECTED=1 and use DEBUG_RENDER/other targeted logs for more detail)");
+                } else if GRAPHICS_DETECTED_PRINTS == 2 {
+                    println!("🎨 GRAPHICS DETECTED: (suppressed; use DEBUG_RENDER/other targeted logs for more detail)");
                 }
             }
         }

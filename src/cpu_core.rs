@@ -170,6 +170,34 @@ mod tests {
     }
 
     #[test]
+    fn trb_absolute_16bit_can_cross_bank_boundary() {
+        // TRB absolute in 16-bit mode should operate on a 16-bit operand and use a 24-bit
+        // increment for the upper byte read/write, allowing bank carry (e.g., 0x01FFFF -> 0x020000).
+        let mut bus = TestBus::new();
+        // TRB $FFFF
+        bus.load(0x8000, &[0x1C, 0xFF, 0xFF, 0xEA]);
+
+        // Operand at DBR:FFFF spans two bytes: 0x01FFFF (lo) and 0x020000 (hi).
+        bus.load(0x01FFFF, &[0x34]);
+        bus.load(0x020000, &[0x92]);
+
+        let mut core = make_core(0x8000);
+        {
+            let st = core.state_mut();
+            st.emulation_mode = false;
+            st.p = StatusFlags::IRQ_DISABLE; // 16-bit A/X/Y
+            st.a = 0x1630;
+            st.db = 0x01;
+        }
+
+        core.step(&mut bus);
+
+        assert_eq!(bus.read_u8(0x01FFFF), 0x04);
+        assert_eq!(bus.read_u8(0x020000), 0x80);
+        assert!(!core.state().p.contains(StatusFlags::ZERO));
+    }
+
+    #[test]
     fn adc_dp_indirect_consumes_one_operand_byte() {
         // 0x72 ADC (dp) uses an 8-bit direct page operand (not 16-bit).
         // Regression: we previously used read_u16_generic and skipped the next opcode byte.
@@ -417,13 +445,13 @@ mod tests {
     }
 
     #[test]
-    fn mvn_operand_order_is_src_then_dest_and_sets_dbr() {
-        // MVN takes two immediate operands: source bank, then destination bank.
+    fn mvn_operand_order_is_dest_then_src_and_sets_dbr() {
+        // MVN takes two immediate operands in object code: destination bank, then source bank.
         // It copies A+1 bytes from src: X.. to dest: Y.., increments X/Y each step,
         // decrements A and repeats until A becomes 0xFFFF, and sets DBR=dest bank.
         let mut bus = TestBus::new();
-        // MVN #$00,#$01
-        bus.load(0x8000, &[0x54, 0x00, 0x01, 0xEA]); // NOP after
+        // MVN #$00,#$01 (src=00, dest=01) => bytes are 0x54, dest=01, src=00
+        bus.load(0x8000, &[0x54, 0x01, 0x00, 0xEA]); // NOP after
         // Source bytes at 00:1000..1003
         bus.load(0x001000, &[0xDE, 0xAD, 0xBE, 0xEF]);
         // Destination area at 01:2000..2003 (init to 0)
@@ -433,6 +461,7 @@ mod tests {
         {
             let st = core.state_mut();
             st.emulation_mode = false;
+            st.p = StatusFlags::IRQ_DISABLE; // 16-bit A/X/Y
             st.a = 0x0003; // copy 4 bytes total
             st.x = 0x1000;
             st.y = 0x2000;
@@ -451,6 +480,99 @@ mod tests {
         assert_eq!(bus.read_u8(0x012001), 0xAD);
         assert_eq!(bus.read_u8(0x012002), 0xBE);
         assert_eq!(bus.read_u8(0x012003), 0xEF);
+    }
+
+    #[test]
+    fn cmp_indirect_x_uses_dbr_for_effective_address() {
+        // cputest-full Test 00C8 expects CMP ($10,X) to read the operand from DBR:ptr,
+        // not from bank 00. Also exercises DP wrapping with D=$FFFF.
+        let mut bus = TestBus::new();
+        // CMP ($10,X)
+        bus.load(0x8000, &[0xC1, 0x10]);
+        // D=$FFFF, X=$FF91 => pointer read from $FFA0 (00:FFA0)
+        // ptr=$1212
+        bus.load(0x00FFA0, &[0x12, 0x12]);
+        // DBR=$01 => operand at 01:1212 is $ABCD (little-endian)
+        bus.load(0x011212, &[0xCD, 0xAB]);
+
+        let mut core = make_core(0x8000);
+        {
+            let st = core.state_mut();
+            st.emulation_mode = false;
+            st.p = StatusFlags::IRQ_DISABLE; // 16-bit A/X/Y
+            st.a = 0xABCD;
+            st.x = 0xFF91;
+            st.dp = 0xFFFF;
+            st.db = 0x01;
+        }
+
+        run_steps(&mut core, &mut bus, 1);
+        let st = core.state();
+        assert_eq!(st.a, 0xABCD);
+        assert_eq!(st.pc, 0x8002);
+        assert!(st.p.contains(StatusFlags::CARRY));
+        assert!(st.p.contains(StatusFlags::ZERO));
+        assert!(!st.p.contains(StatusFlags::NEGATIVE));
+    }
+
+    #[test]
+    fn cmp_stack_relative_reads_from_sp_plus_offset() {
+        // cputest-full Test 00CA: CMP $12,S with SP=$01EF should read from $0201.
+        let mut bus = TestBus::new();
+        // CMP $12,S
+        bus.load(0x8000, &[0xC3, 0x12]);
+        // SP=$01EF => $01EF + 0x12 = $0201
+        bus.load(0x000201, &[0xCD, 0xAB]);
+
+        let mut core = make_core(0x8000);
+        {
+            let st = core.state_mut();
+            st.emulation_mode = false;
+            st.p = StatusFlags::IRQ_DISABLE; // 16-bit A
+            st.a = 0xABCD;
+            st.sp = 0x01EF;
+        }
+
+        run_steps(&mut core, &mut bus, 1);
+        let st = core.state();
+        assert_eq!(st.a, 0xABCD);
+        assert_eq!(st.pc, 0x8002);
+        assert!(st.p.contains(StatusFlags::CARRY));
+        assert!(st.p.contains(StatusFlags::ZERO));
+        assert!(!st.p.contains(StatusFlags::NEGATIVE));
+    }
+
+    #[test]
+    fn lda_stack_relative_indirect_y_uses_dbr_and_bank_carry() {
+        // cputest-full Test 01C8 expects (sr,S),Y to use DBR for the bank and allow carry into bank.
+        // Use a small DBR to keep addresses within TestBus memory.
+        //
+        // DBR=$01, ptr=$FEDC, Y=$1100 => effective $02:0FDC (bank carry).
+        let mut bus = TestBus::new();
+        // LDA ($10,S),Y
+        bus.load(0x8000, &[0xB3, 0x10]);
+        // SP=$01EF => base=$01FF, ptr=$FEDC
+        bus.load(0x0001FF, &[0xDC, 0xFE]);
+        // value at 02:0FDC is $8000
+        bus.load(0x020FDC, &[0x00, 0x80]);
+
+        let mut core = make_core(0x8000);
+        {
+            let st = core.state_mut();
+            st.emulation_mode = false;
+            st.p = StatusFlags::IRQ_DISABLE; // 16-bit A
+            st.a = 0x1234;
+            st.sp = 0x01EF;
+            st.y = 0x1100;
+            st.db = 0x01;
+        }
+
+        run_steps(&mut core, &mut bus, 1);
+        let st = core.state();
+        assert_eq!(st.a, 0x8000);
+        assert_eq!(st.pc, 0x8002);
+        assert!(st.p.contains(StatusFlags::NEGATIVE));
+        assert!(!st.p.contains(StatusFlags::ZERO));
     }
 
     #[test]
@@ -1163,22 +1285,24 @@ fn adc_generic(state: &mut CoreState, operand: u16) {
         if memory_8bit {
             let a8 = (original_a & 0x00FF) as u8;
             let b8 = (operand & 0x00FF) as u8;
-            let binary_sum = (a8 as u16) + (b8 as u16) + (carry_in as u16);
             let (res, carry_out) = bcd_adc8(a8, b8, carry_in as u8);
             state.p.set(StatusFlags::CARRY, carry_out);
-            let overflow = ((!(a8 ^ b8)) & ((a8 ^ (binary_sum as u8)) as u8) & 0x80) != 0;
+            // On W65C816, the V flag in decimal mode is defined and matches the binary-mode
+            // overflow formula, using the *final* (BCD-adjusted) result.
+            let overflow = ((!(a8 ^ b8)) & (a8 ^ res) & 0x80) != 0;
             state.p.set(StatusFlags::OVERFLOW, overflow);
             state.a = (original_a & 0xFF00) | (res as u16);
         } else {
             let a = original_a;
             let b = operand;
-            let binary_sum = (a as u32) + (b as u32) + (carry_in as u32);
             let (lo, carry1) = bcd_adc8((a & 0x00FF) as u8, (b & 0x00FF) as u8, carry_in as u8);
             let (hi, carry2) = bcd_adc8((a >> 8) as u8, (b >> 8) as u8, carry1 as u8);
             state.p.set(StatusFlags::CARRY, carry2);
-            let overflow = (((!(a ^ b)) & (a ^ (binary_sum as u16))) & 0x8000) != 0;
+            let result16 = ((hi as u16) << 8) | (lo as u16);
+            // See 8-bit case above: use final BCD-adjusted result for V.
+            let overflow = (((!(a ^ b)) & (a ^ result16)) & 0x8000) != 0;
             state.p.set(StatusFlags::OVERFLOW, overflow);
-            state.a = ((hi as u16) << 8) | (lo as u16);
+            state.a = result16;
         }
     } else {
         if memory_8bit {
@@ -1223,7 +1347,9 @@ fn sbc_generic(state: &mut CoreState, operand: u16) {
             let binary = (a8 as i16) - (b8 as i16) - (carry_clear as i16);
             let (res, borrow) = bcd_sbc8(a8, b8, carry_clear as u8);
             state.p.set(StatusFlags::CARRY, borrow);
-            let result8 = binary as i16 as u8;
+            // In decimal mode, V follows the binary subtraction overflow rule based on the
+            // binary (pre-BCD-adjust) result.
+            let result8 = binary as u8;
             let overflow = ((a8 ^ b8) & (a8 ^ result8) & 0x80) != 0;
             state.p.set(StatusFlags::OVERFLOW, overflow);
             state.a = (original_a & 0xFF00) | (res as u16);
@@ -1235,7 +1361,7 @@ fn sbc_generic(state: &mut CoreState, operand: u16) {
                 bcd_sbc8((a & 0x00FF) as u8, (b & 0x00FF) as u8, carry_clear as u8);
             let (hi, borrow_hi) = bcd_sbc8((a >> 8) as u8, (b >> 8) as u8, (!borrow_lo) as u8);
             state.p.set(StatusFlags::CARRY, borrow_hi);
-            let result16 = binary as i32 as u16;
+            let result16 = binary as u16;
             let overflow = ((a ^ b) & (a ^ result16) & 0x8000) != 0;
             state.p.set(StatusFlags::OVERFLOW, overflow);
             state.a = ((hi as u16) << 8) | (lo as u16);
@@ -1787,17 +1913,32 @@ pub fn execute_instruction_generic<T: CpuBus>(
 
         0x44 => {
             // MVP (Block Move Positive)
-            // Operand order in object code: src bank then dest bank
-            let src_bank = read_u8_generic(state, bus);
+            // Operand order in object code: dest bank then src bank
             let dest_bank = read_u8_generic(state, bus);
+            let src_bank = read_u8_generic(state, bus);
             // DBR becomes destination bank.
             state.db = dest_bank;
-            let src_addr = ((src_bank as u32) << 16) | (state.x as u32);
-            let dest_addr = ((dest_bank as u32) << 16) | (state.y as u32);
+            let x_addr = if index_is_8bit(state) {
+                state.x & 0x00FF
+            } else {
+                state.x
+            };
+            let y_addr = if index_is_8bit(state) {
+                state.y & 0x00FF
+            } else {
+                state.y
+            };
+            let src_addr = ((src_bank as u32) << 16) | (x_addr as u32);
+            let dest_addr = ((dest_bank as u32) << 16) | (y_addr as u32);
             let value = bus.read_u8(src_addr);
             bus.write_u8(dest_addr, value);
-            state.x = state.x.wrapping_sub(1);
-            state.y = state.y.wrapping_sub(1);
+            if index_is_8bit(state) {
+                state.x = (state.x & 0xFF00) | ((state.x as u8).wrapping_sub(1) as u16);
+                state.y = (state.y & 0xFF00) | ((state.y as u8).wrapping_sub(1) as u16);
+            } else {
+                state.x = state.x.wrapping_sub(1);
+                state.y = state.y.wrapping_sub(1);
+            }
             state.a = state.a.wrapping_sub(1);
             if state.a != 0xFFFF {
                 state.pc = state.pc.wrapping_sub(3);
@@ -1810,17 +1951,32 @@ pub fn execute_instruction_generic<T: CpuBus>(
 
         0x54 => {
             // MVN (Block Move Negative)
-            // Operand order in object code: src bank then dest bank
-            let src_bank = read_u8_generic(state, bus);
+            // Operand order in object code: dest bank then src bank
             let dest_bank = read_u8_generic(state, bus);
+            let src_bank = read_u8_generic(state, bus);
             // DBR becomes destination bank.
             state.db = dest_bank;
-            let src_addr = ((src_bank as u32) << 16) | (state.x as u32);
-            let dest_addr = ((dest_bank as u32) << 16) | (state.y as u32);
+            let x_addr = if index_is_8bit(state) {
+                state.x & 0x00FF
+            } else {
+                state.x
+            };
+            let y_addr = if index_is_8bit(state) {
+                state.y & 0x00FF
+            } else {
+                state.y
+            };
+            let src_addr = ((src_bank as u32) << 16) | (x_addr as u32);
+            let dest_addr = ((dest_bank as u32) << 16) | (y_addr as u32);
             let value = bus.read_u8(src_addr);
             bus.write_u8(dest_addr, value);
-            state.x = state.x.wrapping_add(1);
-            state.y = state.y.wrapping_add(1);
+            if index_is_8bit(state) {
+                state.x = (state.x & 0xFF00) | ((state.x as u8).wrapping_add(1) as u16);
+                state.y = (state.y & 0xFF00) | ((state.y as u8).wrapping_add(1) as u16);
+            } else {
+                state.x = state.x.wrapping_add(1);
+                state.y = state.y.wrapping_add(1);
+            }
             state.a = state.a.wrapping_sub(1);
             if state.a != 0xFFFF {
                 state.pc = state.pc.wrapping_sub(3);
@@ -1918,11 +2074,18 @@ pub fn execute_instruction_generic<T: CpuBus>(
             if penalty != 0 {
                 add_cycles(state, penalty);
             }
-            let value = bus.read_u8(addr);
-            let a_low = (state.a & 0xFF) as u8;
-            state.p.set(StatusFlags::ZERO, (value & a_low) == 0);
-            bus.write_u8(addr, value | a_low);
-            let base_cycles: u8 = 5;
+            let memory_8bit = memory_is_8bit(state);
+            if memory_8bit {
+                let value = bus.read_u8(addr);
+                let a_low = (state.a & 0xFF) as u8;
+                state.p.set(StatusFlags::ZERO, (value & a_low) == 0);
+                bus.write_u8(addr, value | a_low);
+            } else {
+                let value = bus.read_u16(addr);
+                state.p.set(StatusFlags::ZERO, (value & state.a) == 0);
+                bus.write_u16(addr, value | state.a);
+            }
+            let base_cycles: u8 = if memory_8bit { 5 } else { 6 };
             let total_cycles = base_cycles.saturating_add(penalty);
             let already_accounted: u8 = 1 + penalty;
             add_cycles(state, total_cycles.saturating_sub(already_accounted));
@@ -3940,11 +4103,9 @@ pub fn execute_instruction_generic<T: CpuBus>(
         0x7B => {
             // TDC - Transfer Direct Page register to Accumulator
             state.a = state.dp;
-            if memory_is_8bit(state) {
-                set_flags_nz_8(state, (state.a & 0xFF) as u8);
-            } else {
-                set_flags_nz_16(state, state.a);
-            }
+            // TDC transfers to the 16-bit accumulator (C) and sets N/Z based on the 16-bit value,
+            // regardless of the M flag.
+            set_flags_nz_16(state, state.a);
             add_cycles(state, 2);
             2
         }
@@ -4011,52 +4172,41 @@ pub fn execute_instruction_generic<T: CpuBus>(
             }
         }
         0xC3 => {
-            // CMP stack relative indirect indexed
-            let stack_offset = read_u8_generic(state, bus);
-            let base_addr = state.sp.wrapping_add(stack_offset as u16);
-            let indirect_addr = bus.read_u16(base_addr as u32);
-            let final_addr = indirect_addr.wrapping_add(state.y);
-
-            if state.p.contains(StatusFlags::MEMORY_8BIT) {
-                let value = bus.read_u8(final_addr as u32);
-                let result = (state.a as u8).wrapping_sub(value);
-                state.p.set(StatusFlags::CARRY, (state.a as u8) >= value);
-                state.p.set(StatusFlags::ZERO, result == 0);
-                state.p.set(StatusFlags::NEGATIVE, (result & 0x80) != 0);
-                add_cycles(state, 7);
-                7
+            // CMP stack relative
+            let addr = read_stack_relative_address_generic(state, bus);
+            let operand = if memory_is_8bit(state) {
+                bus.read_u8(addr) as u16
             } else {
-                let value = bus.read_u16(final_addr as u32);
-                let result = state.a.wrapping_sub(value);
-                state.p.set(StatusFlags::CARRY, state.a >= value);
-                state.p.set(StatusFlags::ZERO, result == 0);
-                state.p.set(StatusFlags::NEGATIVE, (result & 0x8000) != 0);
-                add_cycles(state, 8);
-                8
-            }
+                bus.read_u16(addr)
+            };
+            cmp_operand(state, operand);
+            let base_cycles: u8 = if memory_is_8bit(state) { 4 } else { 5 };
+            let already_accounted: u8 = 1;
+            add_cycles(state, base_cycles.saturating_sub(already_accounted));
+            base_cycles
         }
 
         // Second batch of critical instructions used by DQ3 SA-1
         0xB3 => {
             // LDA stack relative indirect indexed (sr,S),Y
-            let stack_offset = read_u8_generic(state, bus);
-            let base_addr = state.sp.wrapping_add(stack_offset as u16);
-            let indirect_addr = bus.read_u16(base_addr as u32);
-            let final_addr = indirect_addr.wrapping_add(state.y);
-
-            if state.p.contains(StatusFlags::MEMORY_8BIT) {
-                let value = bus.read_u8(final_addr as u32);
-                state.a = (state.a & 0xFF00) | (value as u16);
-                set_flags_nz_8(state, value);
-                add_cycles(state, 7);
-                7
+            let (addr, penalty) = read_stack_relative_indirect_y_generic(state, bus);
+            if penalty != 0 {
+                add_cycles(state, penalty);
+            }
+            let memory_8bit = memory_is_8bit(state);
+            let value = read_operand_m(state, bus, addr, memory_8bit);
+            if memory_8bit {
+                state.a = (state.a & 0xFF00) | (value & 0x00FF);
+                set_flags_nz_8(state, value as u8);
             } else {
-                let value = bus.read_u16(final_addr as u32);
                 state.a = value;
                 set_flags_nz_16(state, value);
-                add_cycles(state, 8);
-                8
             }
+            let base_cycles: u8 = if memory_8bit { 7 } else { 8 };
+            let total_cycles = base_cycles.saturating_add(penalty);
+            let already_accounted: u8 = 1 + penalty;
+            add_cycles(state, total_cycles.saturating_sub(already_accounted));
+            total_cycles
         }
         0xC4 => {
             // CPY direct page
@@ -4318,27 +4468,21 @@ pub fn execute_instruction_generic<T: CpuBus>(
 
         0xC1 => {
             // CMP indirect,X
-            let dp_base = read_u8_generic(state, bus) as u32;
-            let indirect_addr = ((state.dp as u32 + dp_base + state.x as u32) & 0xFFFF) as u32;
-            let target_addr = bus.read_u16(indirect_addr);
-            if state.p.contains(StatusFlags::MEMORY_8BIT) {
-                let value = bus.read_u8(target_addr as u32);
-                let a_low = state.a as u8;
-                let result = a_low.wrapping_sub(value);
-                state.p.set(StatusFlags::CARRY, a_low >= value);
-                state.p.set(StatusFlags::ZERO, result == 0);
-                state.p.set(StatusFlags::NEGATIVE, (result & 0x80) != 0);
-                add_cycles(state, 6);
-                6
-            } else {
-                let value = bus.read_u16(target_addr as u32);
-                let result = state.a.wrapping_sub(value);
-                state.p.set(StatusFlags::CARRY, state.a >= value);
-                state.p.set(StatusFlags::ZERO, result == 0);
-                state.p.set(StatusFlags::NEGATIVE, (result & 0x8000) != 0);
-                add_cycles(state, 7);
-                7
+            let (addr, penalty) = read_indirect_x_address_generic(state, bus);
+            if penalty != 0 {
+                add_cycles(state, penalty);
             }
+            let operand = if memory_is_8bit(state) {
+                bus.read_u8(addr) as u16
+            } else {
+                bus.read_u16(addr)
+            };
+            cmp_operand(state, operand);
+            let base_cycles: u8 = if memory_is_8bit(state) { 6 } else { 7 };
+            let total_cycles = base_cycles.saturating_add(penalty);
+            let already_accounted: u8 = 1 + penalty;
+            add_cycles(state, total_cycles.saturating_sub(already_accounted));
+            total_cycles
         }
 
         0xC5 => {
@@ -4769,11 +4913,9 @@ pub fn execute_instruction_generic<T: CpuBus>(
         0x3B => {
             // TSC - Transfer Stack Pointer to Accumulator
             state.a = state.sp;
-            if memory_is_8bit(state) {
-                set_flags_nz_8(state, (state.a & 0xFF) as u8);
-            } else {
-                set_flags_nz_16(state, state.a);
-            }
+            // TSC transfers to the 16-bit accumulator (C) and sets N/Z based on the 16-bit value,
+            // regardless of the M flag.
+            set_flags_nz_16(state, state.a);
             add_cycles(state, 2);
             2
         }
@@ -5009,14 +5151,24 @@ pub fn execute_instruction_generic<T: CpuBus>(
         0x1C => {
             // TRB absolute
             let addr = read_absolute_address_generic(state, bus);
-            let value = bus.read_u8(addr);
-            let a_low = (state.a & 0xFF) as u8;
-            state.p.set(StatusFlags::ZERO, (value & a_low) == 0);
-            bus.write_u8(addr, value & !a_low);
-            let base_cycles: u8 = 6;
-            let already_accounted: u8 = 3;
-            add_cycles(state, base_cycles.saturating_sub(already_accounted));
-            base_cycles
+            if memory_is_8bit(state) {
+                let value = bus.read_u8(addr);
+                let a_low = (state.a & 0xFF) as u8;
+                state.p.set(StatusFlags::ZERO, (value & a_low) == 0);
+                bus.write_u8(addr, value & !a_low);
+                let base_cycles: u8 = 6;
+                let already_accounted: u8 = 3;
+                add_cycles(state, base_cycles.saturating_sub(already_accounted));
+                base_cycles
+            } else {
+                let value = bus.read_u16(addr);
+                state.p.set(StatusFlags::ZERO, (value & state.a) == 0);
+                bus.write_u16(addr, value & !state.a);
+                let base_cycles: u8 = 8;
+                let already_accounted: u8 = 3;
+                add_cycles(state, base_cycles.saturating_sub(already_accounted));
+                base_cycles
+            }
         }
 
         0x88 => {
