@@ -167,13 +167,10 @@ pub struct Ppu {
     vram_writes_total_high: u64,
     cgram_writes_total: u64,
     oam_writes_total: u64,
-    // OAM write staging (low table is written as 2-byte pairs)
+    // OAMDATA write latch (low table uses 16-bit word staging)
     oam_write_latch: u8,
-    oam_write_second: bool,
-    // Track which sprite index low-table writes are targeting now (0..127)
-    oam_cur_sprite: u8,
-    // $2103 bit7 affects write flip; use it to alter low-table phase and high-table pair selection
-    oam_high_pair_flip: bool,
+    // $2103 bit7: priority rotation enable
+    oam_priority_rotation_enabled: bool,
     // OBJ timing metrics per frame
     obj_overflow_lines: u32,
     obj_time_over_lines: u32,
@@ -195,10 +192,8 @@ pub struct Ppu {
     main_obj_window_lut: [u8; 256], // 1: OBJ masked on main at x
     sub_obj_window_lut: [u8; 256], // 1: OBJ masked on sub at x
 
-    // OAM read staging (for $2138)
-    oam_read_latch: u8,
-    oam_read_second: bool,
-    oam_read_addr: u16,
+    // internal OAM byte address (internal_oamadd, 10-bit)
+    oam_internal_addr: u16,
 
     // --- HBlank head HDMA phase guard ---
     // A tiny sub-window after HBlank starts where only HDMA should be active; MDMA is held off.
@@ -475,9 +470,7 @@ impl Ppu {
             cgram_writes_total: 0,
             oam_writes_total: 0,
             oam_write_latch: 0,
-            oam_write_second: false,
-            oam_cur_sprite: 0,
-            oam_high_pair_flip: false,
+            oam_priority_rotation_enabled: false,
             obj_overflow_lines: 0,
             obj_time_over_lines: 0,
             oam_eval_base: 0,
@@ -492,9 +485,7 @@ impl Ppu {
             sub_bg_window_lut: [[0; 256]; 4],
             main_obj_window_lut: [0; 256],
             sub_obj_window_lut: [0; 256],
-            oam_read_latch: 0,
-            oam_read_second: false,
-            oam_read_addr: 0,
+            oam_internal_addr: 0,
             hdma_head_busy_until: 0,
 
             // Latched display regs (disabled by default)
@@ -1175,15 +1166,17 @@ impl Ppu {
         // Use game-provided screen designation as-is.
 
         // Debug: Check main screen designation during rendering
-        static mut RENDER_DEBUG_COUNT: u32 = 0;
-        unsafe {
-            if RENDER_DEBUG_COUNT < 10 {
-                RENDER_DEBUG_COUNT += 1;
-                let effective = self.effective_main_screen_designation();
-                println!("🎬 RENDER[{}]: y={} main_screen=0x{:02X} effective=0x{:02X} last_nonzero=0x{:02X} bg_mode={} brightness={} forced_blank={}",
-                    RENDER_DEBUG_COUNT, y, self.main_screen_designation, effective,
-                    self.main_screen_designation_last_nonzero, self.bg_mode,
-                    self.brightness, (self.screen_display & 0x80) != 0);
+        if crate::debug_flags::render_verbose() && !crate::debug_flags::quiet() {
+            static mut RENDER_DEBUG_COUNT: u32 = 0;
+            unsafe {
+                if RENDER_DEBUG_COUNT < 10 {
+                    RENDER_DEBUG_COUNT += 1;
+                    let effective = self.effective_main_screen_designation();
+                    println!("🎬 RENDER[{}]: y={} main_screen=0x{:02X} effective=0x{:02X} last_nonzero=0x{:02X} bg_mode={} brightness={} forced_blank={}",
+                        RENDER_DEBUG_COUNT, y, self.main_screen_designation, effective,
+                        self.main_screen_designation_last_nonzero, self.bg_mode,
+                        self.brightness, (self.screen_display & 0x80) != 0);
+                }
             }
         }
 
@@ -3500,18 +3493,39 @@ impl Ppu {
     }
 
     fn get_sprite_bpp(&self) -> u8 {
-        match self.bg_mode {
-            0..=3 => 2,
-            4..=6 => 4,
-            7 => 8,
-            _ => 2,
+        // SNES OBJ (sprites) are always 4bpp.
+        4
+    }
+
+    #[inline]
+    fn sprite_tile_base_word_addr(&self, tile_num: u16) -> u16 {
+        // VRAM word address (0x0000-0x7FFF) at the start of the given OBJ tile.
+        //
+        // - OBJ tile numbers are 9-bit (0..0x1FF). Bit8 selects "bank" 0x000-0x0FF vs 0x100-0x1FF.
+        // - OBSEL ($2101) selects:
+        //   - Base address for tiles 0x000-0x0FF in 8K-word (16KB) steps
+        //   - Gap between tiles 0x0FF and 0x100 in 4K-word (8KB) steps
+        //
+        // Object tiles are 4bpp: 16 words per 8x8 tile.
+        let base_word = self.sprite_name_base & 0x7FFF;
+        let gap_word = self.sprite_name_select & 0x7FFF;
+
+        let t = tile_num & 0x01FF;
+        let bank = (t >> 8) & 1;
+        let index = t & 0x00FF;
+
+        let mut word = base_word.wrapping_add(index.wrapping_mul(16));
+        if bank != 0 {
+            // +0x1000 words = 256 tiles * 16 words/tile
+            word = word.wrapping_add(0x1000).wrapping_add(gap_word);
         }
+        word & 0x7FFF
     }
 
     fn render_sprite_2bpp(&self, tile_num: u16, pixel_x: u8, pixel_y: u8, palette: u8) -> u32 {
-        // sprite_name_base is in words (from register << 13 but stored as word address)
-        // 2bpp sprite tile = 16 bytes = 8 words
-        let tile_addr = (self.sprite_name_base >> 1) + (tile_num * 8);
+        // NOTE: SNES OBJ are 4bpp. This path is kept only for experiments/debugging.
+        // 2bpp tile = 8 words.
+        let tile_addr = (self.sprite_tile_base_word_addr(tile_num) & 0x7FFF) & !0x0007;
 
         // tile_addr is in words, convert to byte index
         let plane0_addr = ((tile_addr + pixel_y as u16) as usize) * 2;
@@ -3539,9 +3553,8 @@ impl Ppu {
     }
 
     fn render_sprite_4bpp(&self, tile_num: u16, pixel_x: u8, pixel_y: u8, palette: u8) -> u32 {
-        // sprite_name_base is in bytes, convert to words
         // 4bpp sprite tile = 32 bytes = 16 words
-        let tile_addr = (self.sprite_name_base >> 1) + (tile_num * 16);
+        let tile_addr = self.sprite_tile_base_word_addr(tile_num);
 
         // 4bpp sprite tile layout matches BG 4bpp: (plane0/1) then (plane2/3), 8 words each.
         let row01_word = (tile_addr.wrapping_add(pixel_y as u16)) & 0x7FFF;
@@ -3578,9 +3591,9 @@ impl Ppu {
     }
 
     fn render_sprite_8bpp(&self, tile_num: u16, pixel_x: u8, pixel_y: u8) -> u32 {
-        // sprite_name_base is in bytes, convert to words
+        // NOTE: SNES OBJ are 4bpp. This path is kept only for experiments/debugging.
         // 8bpp sprite tile = 64 bytes = 32 words
-        let tile_addr = (self.sprite_name_base >> 1) + (tile_num * 32);
+        let tile_addr = self.sprite_tile_base_word_addr(tile_num);
 
         // 8bpp layout is 4 plane-pairs of 8 words each:
         // - +0:  plane0/1 rows 0..7
@@ -3906,36 +3919,19 @@ impl Ppu {
             }
             0x38 => {
                 // OAMDATAREAD ($2138)
-                // Low table: two-step read (latch then next), increments by 2
-                // High table: single byte read, increments by 1
-                let raddr = self.oam_read_addr & 0x21F;
-                if raddr < 0x200 {
-                    if !self.oam_read_second {
-                        let v = if (raddr as usize) < self.oam.len() {
-                            self.oam[raddr as usize]
-                        } else {
-                            0
-                        };
-                        self.oam_read_latch = v;
-                        self.oam_read_second = true;
-                        v
-                    } else {
-                        let a1 = ((raddr + 1) & 0x21F) as usize;
-                        let v = if a1 < self.oam.len() { self.oam[a1] } else { 0 };
-                        self.oam_read_second = false;
-                        self.oam_read_addr = (raddr + 2) & 0x21F;
-                        v
-                    }
+                // SNESdev wiki:
+                // - $2102/$2103 set OAM *word* address, and internal OAM address becomes (word<<1).
+                // - $2138 reads from the internal OAM *byte* address and increments it by 1.
+                // - High table (0x200..0x21F) repeats for internal addresses 0x200..0x3FF.
+                let internal = self.oam_internal_addr & 0x03FF;
+                let mapped = if internal < 0x200 {
+                    internal
                 } else {
-                    let v = if (raddr as usize) < self.oam.len() {
-                        self.oam[raddr as usize]
-                    } else {
-                        0
-                    };
-                    self.oam_read_addr = (raddr + 1) & 0x21F;
-                    self.oam_read_second = false;
-                    v
-                }
+                    0x200 | (internal & 0x001F)
+                };
+                let v = self.oam.get(mapped as usize).copied().unwrap_or(0);
+                self.oam_internal_addr = (internal + 1) & 0x03FF;
+                v
             }
             0x39 | 0x3A => {
                 // VRAM read with 1-word pipeline buffering.
@@ -4328,8 +4324,10 @@ impl Ppu {
                 // OBSEL ($2101): Sprite size and name base
                 // bits 5-7: sprite size, bits 3-4: name select, bits 0-2: name base high bits
                 self.sprite_size = (value >> 5) & 0x07;
-                self.sprite_name_select = ((value & 0x18) as u16) << 9; // bits 3-4 -> bits 12-13
-                self.sprite_name_base = ((value & 0x07) as u16) << 13; // bits 0-2 -> bits 13-15
+                // Gap between tiles 0x0FF and 0x100 (4K-word steps).
+                self.sprite_name_select = (((value >> 3) & 0x03) as u16) << 12;
+                // Base address for tiles 0x000..0x0FF (8K-word steps).
+                self.sprite_name_base = ((value & 0x07) as u16) << 13;
                 if crate::debug_flags::ppu_write() || crate::debug_flags::boot_verbose() {
                     println!(
                         "PPU: Sprite size: {}, name base: 0x{:04X}, select: 0x{:04X}",
@@ -4339,32 +4337,39 @@ impl Ppu {
             }
             0x02 => {
                 // OAMADDL ($2102)
-                self.oam_addr = (self.oam_addr & 0xFF00) | (value as u16);
-                self.oam_eval_base = ((self.oam_addr & 0x01FF) / 4) as u8;
-                self.oam_write_second = false; // reset write phase on addr set
-                self.oam_read_second = false; // reset read phase
-                self.oam_read_addr = self.oam_addr & 0x21F;
+                // Sets OAM *word* address (low 8 bits). Internal address becomes (word<<1).
+                self.oam_addr = (self.oam_addr & 0x0100) | (value as u16);
+                self.oam_addr &= 0x01FF;
+                self.oam_internal_addr = (self.oam_addr & 0x01FF) << 1;
+                self.oam_eval_base = if self.oam_priority_rotation_enabled {
+                    ((self.oam_addr & 0x00FE) >> 1) as u8
+                } else {
+                    0
+                };
                 // Start small OAM data gap (for MDMA/CPU) after address change
                 self.oam_data_gap_ticks = crate::debug_flags::oam_gap_after_oamadd();
             }
             0x03 => {
                 // OAMADDH ($2103)
-                // Only bit0 is the 9th address bit on real hardware; others control write flipping.
-                // We emulate the essential part: keep 9-bit address in range 0x000..0x21F.
+                // SNESdev wiki:
+                // - bit0: OAM word address bit8
+                // - bit7: OBJ priority rotation enable
+                self.oam_priority_rotation_enabled = (value & 0x80) != 0;
                 self.oam_addr = (self.oam_addr & 0x00FF) | (((value as u16) & 0x01) << 8);
-                self.oam_addr &= 0x01FF; // keep 9-bit in range
-                self.oam_eval_base = ((self.oam_addr & 0x01FF) / 4) as u8;
-                // Bit7 on real hw affects write flip; map to our phase + pair-flip
-                self.oam_high_pair_flip = (value & 0x80) != 0;
-                self.oam_write_second = self.oam_high_pair_flip; // start from commit phase when flip is set
-                self.oam_read_second = false;
-                self.oam_read_addr = self.oam_addr & 0x21F;
+                self.oam_addr &= 0x01FF;
+                self.oam_internal_addr = (self.oam_addr & 0x01FF) << 1;
+                self.oam_eval_base = if self.oam_priority_rotation_enabled {
+                    ((self.oam_addr & 0x00FE) >> 1) as u8
+                } else {
+                    0
+                };
                 self.oam_data_gap_ticks = crate::debug_flags::oam_gap_after_oamadd();
             }
             0x04 => {
                 // OAMDATA ($2104)
-                // Low table (0x000..0x1FF) is commonly written as 2-byte pairs.
-                // We model a 2-step write: first write latches, second write commits [latched, value]
+                // SNESdev wiki:
+                // - Low table (internal < 0x200): writes are staged; the *odd* byte write commits a word.
+                // - High table (internal >= 0x200): direct byte writes; internal increments by 1 each time.
                 if !self.can_write_oam_now() {
                     if crate::debug_flags::ppu_write() || crate::debug_flags::boot_verbose() {
                         println!("PPU TIMING: Skip OAMDATA write outside VBlank (strict)");
@@ -4394,47 +4399,29 @@ impl Ppu {
                     }
                     return;
                 }
-                let addr9 = self.oam_addr & 0x01FF;
-                if addr9 < 0x200 {
-                    // Track current sprite index for subsequent high-table pair writes
-                    self.oam_cur_sprite = (addr9 / 4) as u8;
-                    // Low table staged writes
-                    if !self.oam_write_second {
+                let internal = self.oam_internal_addr & 0x03FF;
+                if internal < 0x200 {
+                    if (internal & 1) == 0 {
                         self.oam_write_latch = value;
-                        self.oam_write_second = true;
                     } else {
-                        let a0 = addr9 as usize;
-                        let a1 = ((addr9 + 1) & 0x01FF) as usize;
-                        if a0 < self.oam.len() {
-                            self.oam[a0] = self.oam_write_latch;
+                        let even = (internal & !1) as usize;
+                        let odd = internal as usize;
+                        if even < self.oam.len() {
+                            self.oam[even] = self.oam_write_latch;
                         }
-                        if a1 < self.oam.len() {
-                            self.oam[a1] = value;
+                        if odd < self.oam.len() {
+                            self.oam[odd] = value;
                         }
                         self.oam_writes_total = self.oam_writes_total.saturating_add(2);
-                        // advance by 2 within 9-bit space (wrap through 0x200..0x21F as on hw)
-                        self.oam_addr = (addr9 + 2) & 0x01FF;
-                        self.oam_write_second = false;
                     }
                 } else {
-                    // High table: partial 2-bit pair update for the current sprite only.
-                    let spr = (self.oam_cur_sprite as usize) & 0x7F;
-                    let hidx = 0x200 + (spr >> 2);
-                    let mut pair = (spr & 0x03) as u8;
-                    if self.oam_high_pair_flip {
-                        pair ^= 0x01;
+                    let mapped = (0x200 | (internal & 0x001F)) as usize;
+                    if mapped < self.oam.len() {
+                        self.oam[mapped] = value;
                     }
-                    let shift = pair << 1;
-                    if hidx < self.oam.len() {
-                        let old = self.oam[hidx];
-                        let mask = !(0x03u8 << shift);
-                        let newv = (old & mask) | ((value & 0x03) << shift);
-                        self.oam[hidx] = newv;
-                        self.oam_writes_total = self.oam_writes_total.saturating_add(1);
-                    }
-                    self.oam_addr = (addr9 + 1) & 0x01FF;
-                    self.oam_write_second = false; // high table resets phase
+                    self.oam_writes_total = self.oam_writes_total.saturating_add(1);
                 }
+                self.oam_internal_addr = (internal + 1) & 0x03FF;
             }
             0x05 => {
                 // BGMODE: bit0-2: mode, bit4-7: tile size for BG1..BG4 (1=16x16)
@@ -5916,11 +5903,6 @@ impl Ppu {
         let (bg_color, bg_priority, bg_id) = self.get_main_bg_pixel(x, y);
         let (sprite_color, sprite_priority) = self.get_sprite_pixel(x, y);
 
-        // Debug rendering for title screen detection
-        static mut RENDER_DEBUG_COUNT: u32 = 0;
-        static mut NON_BLACK_PIXELS: u32 = 0;
-        static mut GRAPHICS_DETECTED_PRINTS: u32 = 0;
-
         // プライオリティベースの合成（レイヤIDも取得）
         let (final_color, layer_id) = self.composite_pixel_with_layer(
             bg_color,
@@ -5930,48 +5912,55 @@ impl Ppu {
             sprite_priority,
         );
 
-        unsafe {
-            RENDER_DEBUG_COUNT += 1;
-            if final_color != 0xFF000000 {
-                NON_BLACK_PIXELS += 1;
-            }
+        // NOTE: This function is called per pixel, so keep debug work behind flags.
+        if crate::debug_flags::render_verbose() || crate::debug_flags::debug_graphics_detected() {
+            // Debug rendering for title screen detection / sanity checks
+            static mut RENDER_DEBUG_COUNT: u32 = 0;
+            static mut NON_BLACK_PIXELS: u32 = 0;
+            static mut GRAPHICS_DETECTED_PRINTS: u32 = 0;
 
-            // Debug: Show coordinate info for specific pixels
-            if (crate::debug_flags::render_verbose()) && x == 10 && y == 10 {
-                static mut PIXEL_10_10_SHOWN: bool = false;
-                if !PIXEL_10_10_SHOWN {
-                    println!(
-                        "🎯 PIXEL (10,10): bg_color=0x{:06X}, final_color=0x{:06X}, layer={}",
-                        bg_color, final_color, layer_id
-                    );
-                    PIXEL_10_10_SHOWN = true;
+            unsafe {
+                RENDER_DEBUG_COUNT = RENDER_DEBUG_COUNT.saturating_add(1);
+                if final_color != 0xFF000000 {
+                    NON_BLACK_PIXELS = NON_BLACK_PIXELS.saturating_add(1);
                 }
-            }
 
-            // Report rendering activity periodically
-            if crate::debug_flags::render_verbose() && RENDER_DEBUG_COUNT.is_multiple_of(100000) {
-                println!(
-                    "🖼️  RENDER STATS: {} pixels rendered, {} non-black ({:.1}%)",
-                    RENDER_DEBUG_COUNT,
-                    NON_BLACK_PIXELS,
-                    (NON_BLACK_PIXELS as f32 / RENDER_DEBUG_COUNT as f32) * 100.0
-                );
-            }
+                // Debug: Show coordinate info for specific pixels
+                if crate::debug_flags::render_verbose() && x == 10 && y == 10 {
+                    static mut PIXEL_10_10_SHOWN: bool = false;
+                    if !PIXEL_10_10_SHOWN && !crate::debug_flags::quiet() {
+                        println!(
+                            "🎯 PIXEL (10,10): bg_color=0x{:06X}, final_color=0x{:06X}, layer={}",
+                            bg_color, final_color, layer_id
+                        );
+                        PIXEL_10_10_SHOWN = true;
+                    }
+                }
 
-            // Detect title screen graphics (debug-only; intentionally off by default)
-            if final_color != 0xFF000000
-                && NON_BLACK_PIXELS.is_multiple_of(1000)
-                && crate::debug_flags::debug_graphics_detected()
-                && !crate::debug_flags::quiet()
-            {
-                GRAPHICS_DETECTED_PRINTS += 1;
-                if GRAPHICS_DETECTED_PRINTS <= 1 {
+                // Report rendering activity periodically
+                if crate::debug_flags::render_verbose()
+                    && !crate::debug_flags::quiet()
+                    && RENDER_DEBUG_COUNT.is_multiple_of(100000)
+                {
                     println!(
-                        "🎨 GRAPHICS DETECTED: Non-black pixel 0x{:08X} at ({}, {}) layer={}",
+                        "🖼️  RENDER STATS: {} pixels rendered, {} non-black ({:.1}%)",
+                        RENDER_DEBUG_COUNT,
+                        NON_BLACK_PIXELS,
+                        (NON_BLACK_PIXELS as f32 / RENDER_DEBUG_COUNT as f32) * 100.0
+                    );
+                }
+
+                // Detect first non-black pixel (debug-only; intentionally off by default)
+                if crate::debug_flags::debug_graphics_detected()
+                    && !crate::debug_flags::quiet()
+                    && final_color != 0xFF000000
+                    && GRAPHICS_DETECTED_PRINTS == 0
+                {
+                    GRAPHICS_DETECTED_PRINTS = 1;
+                    println!(
+                        "🎨 GRAPHICS DETECTED: first non-black pixel 0x{:08X} at ({}, {}) layer={}",
                         final_color, x, y, layer_id
                     );
-                } else if GRAPHICS_DETECTED_PRINTS == 2 {
-                    println!("🎨 GRAPHICS DETECTED: (suppressed; use DEBUG_RENDER/other targeted logs for more detail)");
                 }
             }
         }
