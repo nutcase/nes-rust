@@ -170,6 +170,71 @@ mod tests {
     }
 
     #[test]
+    fn adc_dp_indirect_x_wraps_pointer_read_in_emulation_mode() {
+        // cputest-full Test 0024 expects (dp,X) to wrap the pointer read within the direct page
+        // when crossing the low-byte boundary (6502-style) in emulation mode.
+        let mut bus = TestBus::new();
+        // ADC ($EF,X)
+        bus.load(0x8000, &[0x61, 0xEF, 0xEA]);
+
+        // D=$0100, X=$0010 => pointer fetch at $01FF, high byte wraps to $0100.
+        bus.load(0x0001FF, &[0x34]); // low
+        bus.load(0x000100, &[0x12]); // high (wrapped)
+
+        // DBR=$01, effective addr $01:1234 holds operand 0xED
+        bus.load(0x011234, &[0xED]);
+
+        let mut core = make_core(0x8000);
+        {
+            let st = core.state_mut();
+            st.emulation_mode = true;
+            st.p = StatusFlags::IRQ_DISABLE | StatusFlags::CARRY; // emulation => M/X=1
+            st.a = 0x1112;
+            st.x = 0x0010;
+            st.dp = 0x0100;
+            st.db = 0x01;
+        }
+
+        run_steps(&mut core, &mut bus, 1);
+        let st = core.state();
+        assert_eq!(st.a, 0x1100);
+        assert!(st.p.contains(StatusFlags::CARRY));
+        assert!(st.p.contains(StatusFlags::ZERO));
+    }
+
+    #[test]
+    fn adc_dp_indirect_x_wraps_index_sum_in_emulation_mode_when_dp_aligned() {
+        // cputest-full Test 0025 expects (dp,X) to wrap the direct-page index sum when D is
+        // page-aligned in emulation mode: (base + X) uses 8-bit wrapping.
+        let mut bus = TestBus::new();
+        // ADC ($F0,X)
+        bus.load(0x8000, &[0x61, 0xF0, 0xEA]);
+
+        // D=$0100, X=$0010 => (0xF0 + 0x10)=0x00 (8-bit wrap), so pointer at $0100.
+        bus.load(0x000100, &[0x34, 0x12]);
+
+        // DBR=$01, effective addr $01:1234 holds operand 0xED
+        bus.load(0x011234, &[0xED]);
+
+        let mut core = make_core(0x8000);
+        {
+            let st = core.state_mut();
+            st.emulation_mode = true;
+            st.p = StatusFlags::IRQ_DISABLE | StatusFlags::CARRY; // emulation => M/X=1
+            st.a = 0x1112;
+            st.x = 0x0010;
+            st.dp = 0x0100;
+            st.db = 0x01;
+        }
+
+        run_steps(&mut core, &mut bus, 1);
+        let st = core.state();
+        assert_eq!(st.a, 0x1100);
+        assert!(st.p.contains(StatusFlags::CARRY));
+        assert!(st.p.contains(StatusFlags::ZERO));
+    }
+
+    #[test]
     fn trb_absolute_16bit_can_cross_bank_boundary() {
         // TRB absolute in 16-bit mode should operate on a 16-bit operand and use a 24-bit
         // increment for the upper byte read/write, allowing bank carry (e.g., 0x01FFFF -> 0x020000).
@@ -730,6 +795,34 @@ fn push_u16_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T, value: u16) {
     push_u8_generic(state, bus, (value & 0xFF) as u8);
 }
 
+// W65C816S datasheet note (emulation mode): some opcodes that push/pull 2+ bytes use a 16-bit
+// stack increment/decrement sequence and can access outside $0100-$01FF when SP is near the edge.
+// Examples: PEA/PEI/PER/PHD/PLD, JSL/RTL, JSR (abs,X).
+#[inline]
+fn push_u16_emulation_edge<T: CpuBus>(state: &mut CoreState, bus: &mut T, value: u16) {
+    bus.write_u8(state.sp as u32, (value >> 8) as u8);
+    state.sp = state.sp.wrapping_sub(1);
+    add_cycles(state, 1);
+    bus.write_u8(state.sp as u32, (value & 0xFF) as u8);
+    state.sp = state.sp.wrapping_sub(1);
+    add_cycles(state, 1);
+    // Re-assert emulation-mode stack high byte after the sequence.
+    state.sp = 0x0100 | (state.sp & 0x00FF);
+}
+
+#[inline]
+fn pop_u16_emulation_edge<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u16 {
+    state.sp = state.sp.wrapping_add(1);
+    let lo = bus.read_u8(state.sp as u32) as u16;
+    add_cycles(state, 1);
+    state.sp = state.sp.wrapping_add(1);
+    let hi = bus.read_u8(state.sp as u32) as u16;
+    add_cycles(state, 1);
+    // Re-assert emulation-mode stack high byte after the sequence.
+    state.sp = 0x0100 | (state.sp & 0x00FF);
+    (hi << 8) | lo
+}
+
 fn pop_u8_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
     state.sp = if state.emulation_mode {
         0x0100 | ((state.sp.wrapping_add(1)) & 0xFF)
@@ -761,14 +854,26 @@ fn read_direct_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) ->
 fn read_direct_x_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> (u32, u8) {
     let offset = read_u8_generic(state, bus) as u16;
     let penalty = if state.dp & 0x00FF != 0 { 1 } else { 0 };
-    let addr = state.dp.wrapping_add(offset).wrapping_add(state.x) as u32;
+    let addr = if state.emulation_mode && (state.dp & 0x00FF) == 0 {
+        // 6502-style wrap within the direct page when D is page-aligned in emulation mode.
+        let low = offset.wrapping_add(state.x & 0x00FF) & 0x00FF;
+        ((state.dp & 0xFF00) | low) as u32
+    } else {
+        state.dp.wrapping_add(offset).wrapping_add(state.x) as u32
+    };
     (addr, penalty)
 }
 
 fn read_direct_y_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> (u32, u8) {
     let offset = read_u8_generic(state, bus) as u16;
     let penalty = if state.dp & 0x00FF != 0 { 1 } else { 0 };
-    let addr = state.dp.wrapping_add(offset).wrapping_add(state.y) as u32;
+    let addr = if state.emulation_mode && (state.dp & 0x00FF) == 0 {
+        // 6502-style wrap within the direct page when D is page-aligned in emulation mode.
+        let low = offset.wrapping_add(state.y & 0x00FF) & 0x00FF;
+        ((state.dp & 0xFF00) | low) as u32
+    } else {
+        state.dp.wrapping_add(offset).wrapping_add(state.y) as u32
+    };
     (addr, penalty)
 }
 
@@ -809,7 +914,14 @@ fn read_indirect_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) 
     let penalty = if (state.dp & 0x00FF) != 0 { 1 } else { 0 };
     let ptr = state.dp.wrapping_add(base);
     let lo = bus.read_u8(ptr as u32) as u16;
-    let hi = bus.read_u8(ptr.wrapping_add(1) as u32) as u16;
+    // Undocumented: in emulation mode, only a page-aligned D register exhibits 6502-style
+    // wrapping for (dp) pointer reads.
+    let hi_addr = if state.emulation_mode && (state.dp & 0x00FF) == 0 {
+        (state.dp & 0xFF00) | ((base.wrapping_add(1)) & 0x00FF)
+    } else {
+        ptr.wrapping_add(1)
+    };
+    let hi = bus.read_u8(hi_addr as u32) as u16;
     let full = ((state.db as u32) << 16) | ((hi << 8) | lo) as u32;
     (full, penalty)
 }
@@ -817,9 +929,21 @@ fn read_indirect_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) 
 fn read_indirect_x_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> (u32, u8) {
     let base = read_u8_generic(state, bus) as u16;
     let penalty = if state.dp & 0x00FF != 0 { 1 } else { 0 };
-    let addr = state.dp.wrapping_add(base).wrapping_add(state.x) as u16;
+    let addr = if state.emulation_mode && (state.dp & 0x00FF) == 0 {
+        // 6502-style wrap within the direct page when D is page-aligned in emulation mode.
+        let low = base.wrapping_add(state.x & 0x00FF) & 0x00FF;
+        (state.dp & 0xFF00) | low
+    } else {
+        state.dp.wrapping_add(base).wrapping_add(state.x)
+    };
     let lo = bus.read_u8(addr as u32) as u16;
-    let hi = bus.read_u8(addr.wrapping_add(1) as u32) as u16;
+    // In emulation mode, indirect pointer reads wrap within the direct page (6502-style).
+    let hi_addr = if state.emulation_mode {
+        (addr & 0xFF00) | (addr.wrapping_add(1) & 0x00FF)
+    } else {
+        addr.wrapping_add(1)
+    };
+    let hi = bus.read_u8(hi_addr as u32) as u16;
     let full = ((state.db as u32) << 16) | ((hi << 8) | lo) as u32;
     (full, penalty)
 }
@@ -832,7 +956,14 @@ fn read_indirect_y_address_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T
     }
     let addr = state.dp.wrapping_add(base);
     let lo = bus.read_u8(addr as u32) as u16;
-    let hi = bus.read_u8(addr.wrapping_add(1) as u32) as u16;
+    // Undocumented: in emulation mode, only a page-aligned D register exhibits 6502-style
+    // wrapping for (dp),Y pointer reads.
+    let hi_addr = if state.emulation_mode && (state.dp & 0x00FF) == 0 {
+        (state.dp & 0xFF00) | ((base.wrapping_add(1)) & 0x00FF)
+    } else {
+        addr.wrapping_add(1)
+    };
+    let hi = bus.read_u8(hi_addr as u32) as u16;
     let base16 = (hi << 8) | lo;
     if ((base16 & 0x00FF) as u32) + (state.y & 0x00FF) as u32 >= 0x100 {
         penalty = penalty.saturating_add(1);
@@ -1235,7 +1366,11 @@ fn brl_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
 fn per_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
     let offset = read_u16_generic(state, bus) as i16;
     let value = state.pc.wrapping_add(offset as u16);
-    push_u16_generic(state, bus, value);
+    if state.emulation_mode {
+        push_u16_emulation_edge(state, bus, value);
+    } else {
+        push_u16_generic(state, bus, value);
+    }
     let total_cycles: u8 = 6;
     // read_u16_generic accounted for 2 cycles, push_u16 added 2 cycles
     add_cycles(state, total_cycles.saturating_sub(4));
@@ -1244,32 +1379,39 @@ fn per_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
 
 #[inline]
 fn bcd_adc8(a: u8, b: u8, carry_in: u8) -> (u8, bool) {
-    let mut sum = a as u16 + b as u16 + carry_in as u16;
-    if (sum & 0x0F) > 0x09 {
-        sum += 0x06;
+    // W65C816 decimal adjust (works for invalid BCD digits as well):
+    // - low adjust: based on low-nibble sum > 9
+    // - high adjust: based on the *binary* sum > 0x99
+    let sum = a as u16 + b as u16 + carry_in as u16;
+    let low = (a & 0x0F) as u16 + (b & 0x0F) as u16 + carry_in as u16;
+    let mut adjust = 0u16;
+    if low > 0x09 {
+        adjust += 0x06;
     }
-    if (sum & 0xF0) > 0x90 {
-        sum += 0x60;
+    if sum > 0x99 {
+        adjust += 0x60;
     }
-    ((sum & 0xFF) as u8, sum > 0x99)
+    let result = sum.wrapping_add(adjust);
+    ((result & 0xFF) as u8, sum > 0x99)
 }
 
 #[inline]
 fn bcd_sbc8(a: u8, b: u8, borrow_in: u8) -> (u8, bool) {
-    let mut low = (a & 0x0F) as i16 - (b & 0x0F) as i16 - borrow_in as i16;
-    let mut borrow = 0i16;
+    // W65C816 decimal adjust (works for invalid BCD digits as well):
+    // - low adjust: based on low-nibble borrow
+    // - high adjust: based on the *binary* borrow (result < 0)
+    let diff = (a as i16) - (b as i16) - (borrow_in as i16);
+    let low = (a & 0x0F) as i16 - (b & 0x0F) as i16 - (borrow_in as i16);
+    let mut adjust = 0i16;
     if low < 0 {
-        low += 10;
-        borrow = 1;
+        adjust -= 0x06;
     }
-    let mut high = (a >> 4) as i16 - (b >> 4) as i16 - borrow;
-    let mut borrow_high = 0i16;
-    if high < 0 {
-        high += 10;
-        borrow_high = 1;
+    if diff < 0 {
+        adjust -= 0x60;
     }
-    let result = ((high as u8) << 4) | (low as u8 & 0x0F);
-    (result, borrow_high == 0)
+    let result = (diff + adjust) as u8;
+    let carry_out = diff >= 0;
+    (result, carry_out)
 }
 
 fn adc_generic(state: &mut CoreState, operand: u16) {
@@ -1285,22 +1427,42 @@ fn adc_generic(state: &mut CoreState, operand: u16) {
         if memory_8bit {
             let a8 = (original_a & 0x00FF) as u8;
             let b8 = (operand & 0x00FF) as u8;
+            // Overflow in decimal mode (W65C816): computed like binary-mode, but using the
+            // intermediate result after the low-nibble adjust and *before* the high adjust.
+            let sum = a8 as u16 + b8 as u16 + carry_in as u16;
+            let low = (a8 & 0x0F) as u16 + (b8 & 0x0F) as u16 + carry_in as u16;
+            let res_v = (sum.wrapping_add(if low > 0x09 { 0x06 } else { 0x00 }) & 0xFF) as u8;
             let (res, carry_out) = bcd_adc8(a8, b8, carry_in as u8);
             state.p.set(StatusFlags::CARRY, carry_out);
-            // On W65C816, the V flag in decimal mode is defined and matches the binary-mode
-            // overflow formula, using the *final* (BCD-adjusted) result.
-            let overflow = ((!(a8 ^ b8)) & (a8 ^ res) & 0x80) != 0;
+            let overflow = ((!(a8 ^ b8)) & (a8 ^ res_v) & 0x80) != 0;
             state.p.set(StatusFlags::OVERFLOW, overflow);
             state.a = (original_a & 0xFF00) | (res as u16);
         } else {
             let a = original_a;
             let b = operand;
-            let (lo, carry1) = bcd_adc8((a & 0x00FF) as u8, (b & 0x00FF) as u8, carry_in as u8);
-            let (hi, carry2) = bcd_adc8((a >> 8) as u8, (b >> 8) as u8, carry1 as u8);
+            let a_lo = (a & 0x00FF) as u8;
+            let b_lo = (b & 0x00FF) as u8;
+            let a_hi = (a >> 8) as u8;
+            let b_hi = (b >> 8) as u8;
+
+            let (lo, carry1) = bcd_adc8(a_lo, b_lo, carry_in as u8);
+            let (hi, carry2) = bcd_adc8(a_hi, b_hi, carry1 as u8);
             state.p.set(StatusFlags::CARRY, carry2);
             let result16 = ((hi as u16) << 8) | (lo as u16);
-            // See 8-bit case above: use final BCD-adjusted result for V.
-            let overflow = (((!(a ^ b)) & (a ^ result16)) & 0x8000) != 0;
+
+            // See 8-bit case above: V uses the intermediate result after low-nibble adjust only.
+            let sum_lo = a_lo as u16 + b_lo as u16 + carry_in as u16;
+            let low_lo = (a_lo & 0x0F) as u16 + (b_lo & 0x0F) as u16 + carry_in as u16;
+            let lo_v =
+                (sum_lo.wrapping_add(if low_lo > 0x09 { 0x06 } else { 0x00 }) & 0xFF) as u8;
+            let carry1_v = sum_lo > 0x99;
+            let sum_hi = a_hi as u16 + b_hi as u16 + carry1_v as u16;
+            let low_hi = (a_hi & 0x0F) as u16 + (b_hi & 0x0F) as u16 + carry1_v as u16;
+            let hi_v =
+                (sum_hi.wrapping_add(if low_hi > 0x09 { 0x06 } else { 0x00 }) & 0xFF) as u8;
+            let result_v = ((hi_v as u16) << 8) | (lo_v as u16);
+
+            let overflow = (((!(a ^ b)) & (a ^ result_v)) & 0x8000) != 0;
             state.p.set(StatusFlags::OVERFLOW, overflow);
             state.a = result16;
         }
@@ -1564,8 +1726,25 @@ fn jsl_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
         );
     }
 
-    push_u8_generic(state, bus, state.pb);
-    push_u16_generic(state, bus, state.pc.wrapping_sub(1));
+    let ret = state.pc.wrapping_sub(1);
+    if state.emulation_mode {
+        // Undocumented emulation edge: JSL pushes 3 bytes using a 16-bit stack decrement.
+        // This can write outside $0100-$01FF when SP starts at $0100.
+        bus.write_u8(state.sp as u32, state.pb);
+        state.sp = state.sp.wrapping_sub(1);
+        add_cycles(state, 1);
+        bus.write_u8(state.sp as u32, (ret >> 8) as u8);
+        state.sp = state.sp.wrapping_sub(1);
+        add_cycles(state, 1);
+        bus.write_u8(state.sp as u32, (ret & 0xFF) as u8);
+        state.sp = state.sp.wrapping_sub(1);
+        add_cycles(state, 1);
+        // Re-assert emulation-mode stack high byte after the sequence.
+        state.sp = 0x0100 | (state.sp & 0x00FF);
+    } else {
+        push_u8_generic(state, bus, state.pb);
+        push_u16_generic(state, bus, ret);
+    }
 
     state.pb = (target >> 16) as u8;
     state.pc = (target & 0xFFFF) as u16;
@@ -1598,8 +1777,25 @@ fn rtl_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
         }
     }
 
-    let addr = pop_u16_generic(state, bus);
-    state.pb = pop_u8_generic(state, bus);
+    let (addr, pb) = if state.emulation_mode {
+        // Undocumented emulation edge: RTL pulls 3 bytes using a 16-bit stack increment.
+        // This can read from $0200.. when SP starts at $01FF.
+        state.sp = state.sp.wrapping_add(1);
+        let lo = bus.read_u8(state.sp as u32) as u16;
+        add_cycles(state, 1);
+        state.sp = state.sp.wrapping_add(1);
+        let hi = bus.read_u8(state.sp as u32) as u16;
+        add_cycles(state, 1);
+        state.sp = state.sp.wrapping_add(1);
+        let pb = bus.read_u8(state.sp as u32);
+        add_cycles(state, 1);
+        // Re-assert emulation-mode stack high byte after the sequence.
+        state.sp = 0x0100 | (state.sp & 0x00FF);
+        ((hi << 8) | lo, pb)
+    } else {
+        (pop_u16_generic(state, bus), pop_u8_generic(state, bus))
+    };
+    state.pb = pb;
     state.pc = addr.wrapping_add(1);
     6
 }
@@ -1839,9 +2035,9 @@ pub fn execute_instruction_generic<T: CpuBus>(
             let _signature = read_u8_generic(state, bus);
             let return_pc = state.pc;
             // - Native mode: push P as-is (bits 4/5 are X/M)
-            // - Emulation mode: push with B=0 and bit5 forced 1
+            // - Emulation mode: push with B=1 and bit5 forced 1 (6502-style)
             let pushed_status = if state.emulation_mode {
-                (state.p.bits() | 0x20) & !0x10
+                state.p.bits() | 0x30
             } else {
                 state.p.bits()
             };
@@ -3376,7 +3572,11 @@ pub fn execute_instruction_generic<T: CpuBus>(
         // Stack operations - Critical for SA-1 function calls
         0x0B => {
             // PHD - Push Direct Page register
-            push_u16_generic(state, bus, state.dp);
+            if state.emulation_mode {
+                push_u16_emulation_edge(state, bus, state.dp);
+            } else {
+                push_u16_generic(state, bus, state.dp);
+            }
             add_cycles(state, 4);
             4
         }
@@ -3433,7 +3633,17 @@ pub fn execute_instruction_generic<T: CpuBus>(
         }
         0xAB => {
             // PLB - Pull Data Bank register
-            state.db = pop_u8_generic(state, bus);
+            if state.emulation_mode {
+                // Undocumented emulation edge: PLB can pull using a 16-bit stack increment.
+                // This can read from $0200.. when SP starts at $01FF.
+                state.sp = state.sp.wrapping_add(1);
+                state.db = bus.read_u8(state.sp as u32);
+                add_cycles(state, 1);
+                // Re-assert emulation-mode stack high byte after the sequence.
+                state.sp = 0x0100 | (state.sp & 0x00FF);
+            } else {
+                state.db = pop_u8_generic(state, bus);
+            }
             set_flags_nz_8(state, state.db);
             add_cycles(state, 4);
             4
@@ -3468,14 +3678,22 @@ pub fn execute_instruction_generic<T: CpuBus>(
         0xF4 => {
             // PEA
             let value = read_u16_generic(state, bus);
-            push_u16_generic(state, bus, value);
+            if state.emulation_mode {
+                push_u16_emulation_edge(state, bus, value);
+            } else {
+                push_u16_generic(state, bus, value);
+            }
             add_cycles(state, 5);
             5
         }
         0x1B => {
             // TCS - Transfer Accumulator to Stack Pointer
             let old_sp = state.sp;
-            state.sp = state.a;
+            state.sp = if state.emulation_mode {
+                0x0100 | (state.a & 0x00FF)
+            } else {
+                state.a
+            };
             if std::env::var_os("TRACE_SP_CHANGE").is_some()
                 || std::env::var_os("DQ3_SP_GUARD").is_some()
             {
@@ -4265,21 +4483,24 @@ pub fn execute_instruction_generic<T: CpuBus>(
         // Fourth batch: Critical instructions found in DQ3 SA-1 execution
         0xB6 => {
             // LDX direct page,Y
-            let addr =
-                (read_u8_generic(state, bus) as u32 + state.dp as u32 + state.y as u32) & 0xFFFFFF;
-            if state.p.contains(StatusFlags::INDEX_8BIT) {
+            let (addr, penalty) = read_direct_y_address_generic(state, bus);
+            if penalty != 0 {
+                add_cycles(state, penalty);
+            }
+            if index_is_8bit(state) {
                 let value = bus.read_u8(addr);
                 state.x = (state.x & 0xFF00) | (value as u16);
                 set_flags_nz_8(state, value);
-                add_cycles(state, 4);
-                4
             } else {
                 let value = bus.read_u16(addr);
                 state.x = value;
                 set_flags_nz_16(state, value);
-                add_cycles(state, 5);
-                5
             }
+            let base_cycles: u8 = if index_is_8bit(state) { 4 } else { 5 };
+            let total_cycles = base_cycles.saturating_add(penalty);
+            let already_accounted: u8 = 1 + penalty;
+            add_cycles(state, total_cycles.saturating_sub(already_accounted));
+            total_cycles
         }
 
         0xBE => {
@@ -4325,47 +4546,42 @@ pub fn execute_instruction_generic<T: CpuBus>(
 
         0xB4 => {
             // LDY direct page,X
-            let addr =
-                (read_u8_generic(state, bus) as u32 + state.dp as u32 + state.x as u32) & 0xFFFFFF;
-            if state.p.contains(StatusFlags::INDEX_8BIT) {
+            let (addr, penalty) = read_direct_x_address_generic(state, bus);
+            if penalty != 0 {
+                add_cycles(state, penalty);
+            }
+            if index_is_8bit(state) {
                 let value = bus.read_u8(addr);
                 state.y = (state.y & 0xFF00) | (value as u16);
                 set_flags_nz_8(state, value);
-                add_cycles(state, 4);
-                4
             } else {
                 let value = bus.read_u16(addr);
                 state.y = value;
                 set_flags_nz_16(state, value);
-                add_cycles(state, 5);
-                5
             }
+            let base_cycles: u8 = if index_is_8bit(state) { 4 } else { 5 };
+            let total_cycles = base_cycles.saturating_add(penalty);
+            let already_accounted: u8 = 1 + penalty;
+            add_cycles(state, total_cycles.saturating_sub(already_accounted));
+            total_cycles
         }
 
         0x10 => branch_if_generic(state, bus, !state.p.contains(StatusFlags::NEGATIVE)),
 
         0xD5 => {
             // CMP direct page,X
-            let addr =
-                (read_u8_generic(state, bus) as u32 + state.dp as u32 + state.x as u32) & 0xFFFFFF;
-            if state.p.contains(StatusFlags::MEMORY_8BIT) {
-                let value = bus.read_u8(addr);
-                let a_low = state.a as u8;
-                let result = a_low.wrapping_sub(value);
-                state.p.set(StatusFlags::CARRY, a_low >= value);
-                state.p.set(StatusFlags::ZERO, result == 0);
-                state.p.set(StatusFlags::NEGATIVE, (result & 0x80) != 0);
-                add_cycles(state, 4);
-                4
-            } else {
-                let value = bus.read_u16(addr);
-                let result = state.a.wrapping_sub(value);
-                state.p.set(StatusFlags::CARRY, state.a >= value);
-                state.p.set(StatusFlags::ZERO, result == 0);
-                state.p.set(StatusFlags::NEGATIVE, (result & 0x8000) != 0);
-                add_cycles(state, 5);
-                5
+            let (addr, penalty) = read_direct_x_address_generic(state, bus);
+            if penalty != 0 {
+                add_cycles(state, penalty);
             }
+            let memory_8bit = memory_is_8bit(state);
+            let operand = read_operand_m(state, bus, addr, memory_8bit);
+            cmp_operand(state, operand);
+            let base_cycles: u8 = if memory_8bit { 4 } else { 5 };
+            let total_cycles = base_cycles.saturating_add(penalty);
+            let already_accounted: u8 = 1 + penalty;
+            add_cycles(state, total_cycles.saturating_sub(already_accounted));
+            total_cycles
         }
 
         0xD6 => {
@@ -4441,7 +4657,11 @@ pub fn execute_instruction_generic<T: CpuBus>(
             let dp_offset = read_u8_generic(state, bus) as u32;
             let indirect_addr = (state.dp as u32 + dp_offset) & 0xFFFFFF;
             let effective_addr = bus.read_u16(indirect_addr);
-            push_u16_generic(state, bus, effective_addr);
+            if state.emulation_mode {
+                push_u16_emulation_edge(state, bus, effective_addr);
+            } else {
+                push_u16_generic(state, bus, effective_addr);
+            }
             add_cycles(state, 6);
             6
         }
@@ -4785,9 +5005,11 @@ pub fn execute_instruction_generic<T: CpuBus>(
 
         0x2B => {
             // PLD - Pull Direct Page Register
-            let lo = pop_u8_generic(state, bus) as u16;
-            let hi = pop_u8_generic(state, bus) as u16;
-            state.dp = (hi << 8) | lo;
+            state.dp = if state.emulation_mode {
+                pop_u16_emulation_edge(state, bus)
+            } else {
+                pop_u16_generic(state, bus)
+            };
             set_flags_nz_16(state, state.dp);
             add_cycles(state, 5);
             5
@@ -5723,7 +5945,19 @@ pub fn execute_instruction_generic<T: CpuBus>(
             // Indirect target fetch uses the current program bank (PB).
             let target = bus.read_u16(full_address(state, addr));
             let return_addr = state.pc.wrapping_sub(1);
-            push_u16_generic(state, bus, return_addr);
+            if state.emulation_mode {
+                // Undocumented emulation edge: JSR (abs,X) uses a 16-bit stack decrement for the push.
+                bus.write_u8(state.sp as u32, (return_addr >> 8) as u8);
+                state.sp = state.sp.wrapping_sub(1);
+                add_cycles(state, 1);
+                bus.write_u8(state.sp as u32, (return_addr & 0xFF) as u8);
+                state.sp = state.sp.wrapping_sub(1);
+                add_cycles(state, 1);
+                // Re-assert emulation-mode stack high byte after the sequence.
+                state.sp = 0x0100 | (state.sp & 0x00FF);
+            } else {
+                push_u16_generic(state, bus, return_addr);
+            }
             state.pc = target;
             let base_cycles: u8 = 8;
             let accounted: u8 = 2 + 2; // operand read + push
