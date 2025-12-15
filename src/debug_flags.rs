@@ -121,7 +121,16 @@ pub fn graphics_dma_verbose() -> bool {
 
 pub fn quiet() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_flag("QUIET", false))
+    *ON.get_or_init(|| {
+        // Treat any non-zero / non-false value as quiet.
+        // (run.sh uses QUIET=1/2/3 levels, so numeric values should enable quiet mode.)
+        std::env::var("QUIET")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v.is_empty() || v == "0" || v == "false" || v == "off")
+            })
+            .unwrap_or(false)
+    })
 }
 
 pub fn headless() -> bool {
