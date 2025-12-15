@@ -16,6 +16,11 @@ pub struct Ppu {
     // Current dot within the scanline (0..=340 approx). This is our dot counter.
     cycle: u16,
     frame: u64,
+    // Latched H/V counters (set by reading $2137 or by WRIO latch via $4201 bit7 transition).
+    hv_latched_h: u16,
+    hv_latched_v: u16,
+    ophct_second: bool,
+    opvct_second: bool,
 
     bg_mode: u8,
     // Mode 1 only: BG3 priority enable ($2105 bit3). Used by z-rank model.
@@ -47,11 +52,10 @@ pub struct Ppu {
     // BG screen sizes: 0=32x32, 1=64x32, 2=32x64, 3=64x64
     bg_screen_size: [u8; 4],
 
-    // Scroll register latches (two-write behavior)
-    hscroll_latch: [bool; 4],
-    vscroll_latch: [bool; 4],
-    hscroll_temp: [u8; 4],
-    vscroll_temp: [u8; 4],
+    // Scroll register latches shared across BG1..BG4 ($210D..$2114).
+    // See SNESdev wiki: BGnHOFS/BGnVOFS behavior uses shared latches.
+    bgofs_latch: u8,
+    bghofs_latch: u8,
 
     main_screen_designation: u8,
     main_screen_designation_last_nonzero: u8, // Remember last non-zero value for rendering
@@ -65,11 +69,9 @@ pub struct Ppu {
     vram_addr: u16,
     vram_increment: u16,
     vram_mapping: u8,
-    // VRAM read pipeline buffer for $2139/$213A
+    // VRAM read latch for $2139/$213A (VMDATAREAD)
     vram_read_buf_lo: u8,
     vram_read_buf_hi: u8,
-    vram_read_prefetched: bool,
-    vram_read_valid: bool,
 
     cgram_addr: u8,          // CGRAM word address (0..255)
     cgram_second: bool,      // false: next $2122 is low; true: next $2122 is high
@@ -78,8 +80,11 @@ pub struct Ppu {
     oam_addr: u16,
 
     // スプライト関連の追加フィールド
-    sprite_overflow: bool,     // スプライトオーバーフローフラグ
-    sprite_time_over: bool,    // スプライトタイムオーバーフラグ
+    sprite_overflow: bool,  // スプライトオーバーフローフラグ
+    sprite_time_over: bool, // スプライトタイムオーバーフラグ
+    // STAT77 flags are sticky until end of VBlank.
+    sprite_overflow_latched: bool,
+    sprite_time_over_latched: bool,
     sprites_on_line_count: u8, // 現在のスキャンラインのスプライト数
 
     // スプライト関連
@@ -132,6 +137,14 @@ pub struct Ppu {
     pseudo_hires: bool,
     extbg: bool,
     interlace: bool,
+    // H/V counter latch enable (mirrors $4201 bit7) and STAT78 latch flag.
+    wio_latch_enable: bool,
+    stat78_latch_flag: bool,
+    // STAT78 "interlace field" bit (toggles every VBlank).
+    interlace_field: bool,
+    // SETINI bits
+    overscan: bool,
+    obj_interlace: bool,
 
     pub nmi_enabled: bool,
     pub nmi_flag: bool,
@@ -284,18 +297,36 @@ enum SpriteSize {
 
 impl Ppu {
     #[inline]
+    fn sprite_x_signed(x_raw: u16) -> i16 {
+        // OBJ X is 9-bit and treated as signed on the screen:
+        // 0..255 => 0..255, 256..511 => -256..-1.
+        let x9 = (x_raw & 0x01FF) as i16;
+        if (x9 & 0x0100) != 0 {
+            x9 - 512
+        } else {
+            x9
+        }
+    }
+
+    #[inline]
     fn force_display_active(&self) -> bool {
         self.force_display_override || crate::debug_flags::force_display()
     }
 
     // --- Coarse NTSC timing helpers ---
     #[inline]
+    fn first_visible_dot(&self) -> u16 {
+        // SNES visible area starts at H=22 (0..339).
+        22
+    }
+    #[inline]
     fn dots_per_line(&self) -> u16 {
         341
     }
     #[inline]
     fn first_hblank_dot(&self) -> u16 {
-        256
+        // Visible width is 256 pixels. Visible starts at H=22, so HBlank begins at 22+256=278.
+        self.first_visible_dot() + 256
     }
     #[inline]
     fn last_dot_index(&self) -> u16 {
@@ -305,15 +336,23 @@ impl Ppu {
     pub fn get_visible_height(&self) -> u16 {
         // デバッグ用に表示高さを短くして早めにVBlankへ入れるオプション。
         // 環境変数 PPU_VIS_HEIGHT を指定するとその値を使う（例: 200）。
-        static VIS: OnceLock<u16> = OnceLock::new();
-        *VIS.get_or_init(|| {
+        static OVERRIDE: OnceLock<Option<u16>> = OnceLock::new();
+        let override_val = *OVERRIDE.get_or_init(|| {
             std::env::var("PPU_VIS_HEIGHT")
                 .ok()
                 .and_then(|v| v.parse::<u16>().ok())
                 .filter(|v| *v >= 160 && *v <= 239)
-                .unwrap_or(224)
-        })
-    } // TODO: overscan=239 when supported
+        });
+        if let Some(v) = override_val {
+            return v;
+        }
+
+        if self.overscan {
+            239
+        } else {
+            224
+        }
+    }
     #[inline]
     fn fixed8_floor(val: i64) -> i32 {
         // Floor division by 256 for signed 8.8 fixed
@@ -323,6 +362,37 @@ impl Ppu {
             -(((-val + 255) >> 8) as i32)
         }
     }
+
+    #[inline]
+    fn write_bghofs(&mut self, bg_num: usize, value: u8) {
+        // BGnHOFS ($210D/$210F/$2111/$2113)
+        // SNESdev wiki: BGnHOFS = (value<<8) | (bgofs_latch & ~7) | (bghofs_latch & 7)
+        let lo = (self.bgofs_latch & !0x07) | (self.bghofs_latch & 0x07);
+        let ofs = (((value as u16) << 8) | (lo as u16)) & 0x03FF;
+        match bg_num {
+            0 => self.bg1_hscroll = ofs,
+            1 => self.bg2_hscroll = ofs,
+            2 => self.bg3_hscroll = ofs,
+            _ => self.bg4_hscroll = ofs,
+        }
+        self.bgofs_latch = value;
+        self.bghofs_latch = value;
+    }
+
+    #[inline]
+    fn write_bgvofs(&mut self, bg_num: usize, value: u8) {
+        // BGnVOFS ($210E/$2110/$2112/$2114)
+        // SNESdev wiki: BGnVOFS = (value<<8) | bgofs_latch
+        let ofs = (((value as u16) << 8) | (self.bgofs_latch as u16)) & 0x03FF;
+        match bg_num {
+            0 => self.bg1_vscroll = ofs,
+            1 => self.bg2_vscroll = ofs,
+            2 => self.bg3_vscroll = ofs,
+            _ => self.bg4_vscroll = ofs,
+        }
+        self.bgofs_latch = value;
+    }
+
     pub fn new() -> Self {
         Self {
             vram: vec![0; 0x10000],
@@ -335,6 +405,10 @@ impl Ppu {
             scanline: 0,
             cycle: 0,
             frame: 0,
+            hv_latched_h: 0,
+            hv_latched_v: 0,
+            ophct_second: false,
+            opvct_second: false,
 
             bg_mode: 0,
             mode1_bg3_priority: false,
@@ -363,10 +437,8 @@ impl Ppu {
             bg_tile_16: [false; 4],
             bg_screen_size: [0; 4],
 
-            hscroll_latch: [false; 4],
-            vscroll_latch: [false; 4],
-            hscroll_temp: [0; 4],
-            vscroll_temp: [0; 4],
+            bgofs_latch: 0,
+            bghofs_latch: 0,
 
             main_screen_designation: 0x1F, // 初期は全BG/Spriteレイヤー有効
             main_screen_designation_last_nonzero: 0x1F,
@@ -382,8 +454,6 @@ impl Ppu {
             vram_mapping: 0,
             vram_read_buf_lo: 0,
             vram_read_buf_hi: 0,
-            vram_read_prefetched: false,
-            vram_read_valid: false,
 
             cgram_addr: 0,
             cgram_second: false,
@@ -393,6 +463,8 @@ impl Ppu {
 
             sprite_overflow: false,
             sprite_time_over: false,
+            sprite_overflow_latched: false,
+            sprite_time_over_latched: false,
             sprites_on_line_count: 0,
 
             // スプライト関連初期化
@@ -439,6 +511,11 @@ impl Ppu {
             pseudo_hires: false,
             extbg: false,
             interlace: false,
+            wio_latch_enable: false,
+            stat78_latch_flag: false,
+            interlace_field: false,
+            overscan: false,
+            obj_interlace: false,
 
             nmi_enabled: false,
             // 実機ではリセット直後に RDNMI フラグ(bit7)が1の状態から始まるため、初期値をtrueにしておく。
@@ -547,38 +624,53 @@ impl Ppu {
         // Per-CPU-cycle PPU stepping (approx 1 CPU cycle -> 1 PPU dot)
         let dots_per_line = self.dots_per_line();
         let first_hblank = self.first_hblank_dot();
+        let first_visible = self.first_visible_dot();
         for _ in 0..cycles {
             // Advance any deferred control effects before processing this dot
             self.tick_deferred_ctrl_effects();
             let x = self.cycle;
             let y = self.scanline;
-            let vis_h = self.get_visible_height();
+            let vis_last = self.get_visible_height();
+            let vblank_start = vis_last.saturating_add(1);
+
+            // Update HBlank state from dot counters.
+            //
+            // Official burn-in tests (HVBJOY/VH FLAG) expect $4212 bit6 (HBlank) to be set only
+            // for the right-side blanking period. Do not treat the pre-visible dots as "HBlank"
+            // for this flag.
+            let hblank_now = x >= first_hblank;
+            if hblank_now != self.h_blank {
+                self.h_blank = hblank_now;
+                if hblank_now && x == first_hblank {
+                    // Entering right-side HBlank; guard a few dots at HBlank head for HDMA operations only.
+                    let guard = crate::debug_flags::hblank_hdma_guard_dots();
+                    self.hdma_head_busy_until = first_hblank.saturating_add(guard);
+                }
+            }
 
             // Start-of-line duties
             if x == 0 {
                 // Commit latched regs at the beginning of each scanline
                 self.commit_latched_display_regs();
-                if y < vis_h {
+                if y >= 1 && y <= vis_last {
                     // Prepare window LUTs at line start (OBJ list is prepared during previous HBlank)
                     self.prepare_line_window_luts();
                 }
             }
 
-            // Visible pixel render
-            if y < vis_h && x < first_hblank {
-                self.update_obj_time_over_at_x(x as u16);
-                self.render_dot(x as usize, y as usize);
+            // After guard period, commit any pending control registers (VMADD/CGADD)
+            if self.h_blank && x == self.hdma_head_busy_until {
+                self.commit_pending_ctrl_if_any();
             }
 
-            // Enter HBlank at dot 256
-            if x == first_hblank {
-                self.h_blank = true;
-                // Guard a few dots at HBlank head for HDMA operations only
-                let guard = crate::debug_flags::hblank_hdma_guard_dots();
-                self.hdma_head_busy_until = first_hblank.saturating_add(guard);
-            } else if self.h_blank && x == self.hdma_head_busy_until {
-                // After guard period, commit any pending control registers (VMADD/CGADD)
-                self.commit_pending_ctrl_if_any();
+            // Visible pixel render
+            if !self.v_blank && y >= 1 && y <= vis_last && x >= first_visible && x < first_hblank {
+                let fb_x = (x - first_visible) as usize;
+                let fb_y = (y - 1) as usize;
+                if fb_y < 224 {
+                    self.update_obj_time_over_at_x(fb_x as u16);
+                    self.render_dot(fb_x, fb_y);
+                }
             }
 
             // Advance dot; end-of-line at DOTS_PER_LINE
@@ -586,12 +678,12 @@ impl Ppu {
             if self.cycle >= dots_per_line {
                 // End of scanline
                 self.cycle = 0;
-                self.h_blank = false;
+                self.h_blank = false; // dot 0 is not treated as HBlank for HVBJOY
                 self.scanline = self.scanline.wrapping_add(1);
 
                 // VBlank transitions
                 // 通常: 可視領域終了の次のラインでVBlank突入
-                if self.scanline == vis_h {
+                if !self.v_blank && self.scanline == vblank_start {
                     if crate::debug_flags::boot_verbose() {
                         println!("📺 ENTERING VBLANK at scanline {}", self.scanline);
                     }
@@ -605,18 +697,31 @@ impl Ppu {
                     self.scanline = 0;
                     self.frame = self.frame.wrapping_add(1);
                     // Prepare first visible line sprites ahead (scanline 0)
-                    self.evaluate_sprites_for_scanline(0);
                     self.prepare_line_obj_pipeline(0);
                 } else {
                     // Prepare next visible scanline sprites during HBlank end
                     let ny = self.scanline;
-                    if ny < vis_h {
-                        self.evaluate_sprites_for_scanline(ny);
-                        self.prepare_line_obj_pipeline(ny);
+                    if ny >= 1 && ny <= vis_last {
+                        let vy = ny - 1;
+                        self.prepare_line_obj_pipeline(vy);
                     }
                 }
             }
         }
+    }
+
+    pub fn latch_hv_counters(&mut self) {
+        // Latch current H/V counters. Writing $2137 always updates the latched values.
+        // STAT78 bit6 (latch flag) is set until $213F is read (which clears it).
+        // H/V counters are 9-bit values on real hardware.
+        self.hv_latched_h = self.cycle & 0x01FF;
+        self.hv_latched_v = self.scanline & 0x01FF;
+        // STAT78 latch flag: set when counters are latched.
+        self.stat78_latch_flag = true;
+    }
+
+    pub fn set_wio_latch_enable(&mut self, enabled: bool) {
+        self.wio_latch_enable = enabled;
     }
 
     // Render one pixel at the current (x,y)
@@ -708,6 +813,8 @@ impl Ppu {
 
     fn enter_vblank(&mut self) {
         self.v_blank = true;
+        // STAT78 field flag toggles every VBlank.
+        self.interlace_field = !self.interlace_field;
         self.rdnmi_read_in_vblank = false; // 新しいVBlankでリセット
                                            // RDNMIフラグ（$4210 bit7）はNMI許可に関わらずVBlank突入で立つ。
                                            // 読み出しでクリアされるが、VBlank中は常に再セットされる挙動に近づける。
@@ -735,15 +842,18 @@ impl Ppu {
         self.nmi_flag = false;
         self.nmi_latched = false;
         self.rdnmi_read_in_vblank = false;
+        // STAT77 flags are reset at end of VBlank.
+        self.sprite_overflow_latched = false;
+        self.sprite_time_over_latched = false;
     }
 
     // Returns true if we're currently in the active display area (not V/HBlank)
     #[inline]
     fn in_active_display(&self) -> bool {
-        self.scanline < self.get_visible_height()
-            && self.cycle < self.first_hblank_dot()
-            && !self.v_blank
-            && !self.h_blank
+        let vis_last = self.get_visible_height();
+        let v_vis = self.scanline >= 1 && self.scanline <= vis_last;
+        let h_vis = self.cycle >= self.first_visible_dot() && self.cycle < self.first_hblank_dot();
+        v_vis && h_vis && !self.v_blank && !self.h_blank
     }
 
     #[inline]
@@ -758,16 +868,14 @@ impl Ppu {
         if !crate::debug_flags::strict_ppu_timing() {
             return true;
         }
-        if self.v_blank || self.scanline >= self.get_visible_height() {
+        let vblank_start = self.get_visible_height().saturating_add(1);
+        if self.v_blank || self.scanline >= vblank_start {
             // Optional VBlank head/tail sub-windows for MDMA/CPU
             if self.write_ctx != 2 {
                 let head = crate::debug_flags::vram_vblank_head();
                 let tail = crate::debug_flags::vram_vblank_tail();
                 let last = self.last_dot_index();
-                if head > 0
-                    && (self.scanline == self.get_visible_height())
-                    && (self.cycle as u16) < head
-                {
+                if head > 0 && (self.scanline == vblank_start) && (self.cycle as u16) < head {
                     return false;
                 }
                 if tail > 0
@@ -810,16 +918,14 @@ impl Ppu {
         if !crate::debug_flags::strict_ppu_timing() {
             return true;
         }
-        if self.v_blank || self.scanline >= self.get_visible_height() {
+        let vblank_start = self.get_visible_height().saturating_add(1);
+        if self.v_blank || self.scanline >= vblank_start {
             // Optional: enforce CGRAM MDMA/CPU head/tail guard in VBlank
             if self.write_ctx != 2 {
                 let head = crate::debug_flags::cgram_vblank_head();
                 let tail = crate::debug_flags::cgram_vblank_tail();
                 let last = self.last_dot_index();
-                if head > 0
-                    && (self.scanline == self.get_visible_height())
-                    && (self.cycle as u16) < head
-                {
+                if head > 0 && (self.scanline == vblank_start) && (self.cycle as u16) < head {
                     return false;
                 }
                 if tail > 0
@@ -855,7 +961,8 @@ impl Ppu {
         if !crate::debug_flags::strict_ppu_timing() {
             return true;
         }
-        if self.v_blank || self.scanline >= self.get_visible_height() {
+        let vblank_start = self.get_visible_height().saturating_add(1);
+        if self.v_blank || self.scanline >= vblank_start {
             // Optional: enforce OAM gap in VBlank for MDMA/CPU
             if crate::debug_flags::oam_gap_in_vblank()
                 && self.oam_data_gap_ticks > 0
@@ -867,10 +974,7 @@ impl Ppu {
                 let head = crate::debug_flags::oam_vblank_head();
                 let tail = crate::debug_flags::oam_vblank_tail();
                 let last = self.last_dot_index();
-                if head > 0
-                    && (self.scanline == self.get_visible_height())
-                    && (self.cycle as u16) < head
-                {
+                if head > 0 && (self.scanline == vblank_start) && (self.cycle as u16) < head {
                     return false;
                 }
                 if tail > 0
@@ -953,6 +1057,8 @@ impl Ppu {
             self.setini = v;
             self.pseudo_hires = (v & 0x08) != 0;
             self.extbg = (v & 0x40) != 0;
+            self.overscan = (v & 0x04) != 0;
+            self.obj_interlace = (v & 0x02) != 0;
             self.interlace = (v & 0x01) != 0;
             any = true;
         }
@@ -978,7 +1084,8 @@ impl Ppu {
         if !crate::debug_flags::strict_ppu_timing() {
             return true;
         }
-        if self.v_blank || self.scanline >= self.get_visible_height() {
+        let vblank_start = self.get_visible_height().saturating_add(1);
+        if self.v_blank || self.scanline >= vblank_start {
             return true;
         }
         if !self.h_blank {
@@ -999,7 +1106,8 @@ impl Ppu {
         if !crate::debug_flags::strict_ppu_timing() {
             return true;
         }
-        if self.v_blank || self.scanline >= self.get_visible_height() {
+        let vblank_start = self.get_visible_height().saturating_add(1);
+        if self.v_blank || self.scanline >= vblank_start {
             return true;
         }
         if !self.h_blank {
@@ -1026,11 +1134,17 @@ impl Ppu {
         // VMADD
         if self.latched_vmadd_lo.is_some() || self.latched_vmadd_hi.is_some() {
             if self.can_commit_vmadd_now() {
+                let mut changed = false;
                 if let Some(lo) = self.latched_vmadd_lo.take() {
                     self.vram_addr = (self.vram_addr & 0xFF00) | (lo as u16);
+                    changed = true;
                 }
                 if let Some(hi) = self.latched_vmadd_hi.take() {
                     self.vram_addr = (self.vram_addr & 0x00FF) | ((hi as u16) << 8);
+                    changed = true;
+                }
+                if changed {
+                    self.reload_vram_read_latch();
                 }
             }
         }
@@ -1625,6 +1739,8 @@ impl Ppu {
         if self.should_mask_sprite(x, is_main) {
             return (0, 0);
         }
+        let x_i16 = x as i16;
+        let y_u8 = y as u8;
         let sprites = &self.line_sprites;
 
         // 優先度順に描画（高優先度から低優先度へ）
@@ -1634,25 +1750,29 @@ impl Ppu {
                     continue;
                 }
                 let (sprite_width, sprite_height) = self.get_sprite_pixel_size(&sprite.size);
-                if x < sprite.x
-                    || x >= sprite.x + sprite_width as u16
-                    || y < sprite.y as u16
-                    || y >= sprite.y as u16 + sprite_height as u16
-                {
+                let sx = Self::sprite_x_signed(sprite.x);
+                let sy = sprite.y;
+                // Y is 8-bit and wraps; test overlap via wrapped subtraction.
+                let dy = y_u8.wrapping_sub(sy);
+                if (dy as u16) >= sprite_height as u16 {
+                    continue;
+                }
+                if x_i16 < sx || x_i16 >= sx.saturating_add(sprite_width as i16) {
                     continue;
                 }
 
                 // スプライト内相対座標→タイル/ピクセル座標
-                let rel_x = (x - sprite.x) as u8;
-                let rel_y = (y - sprite.y as u16) as u8;
+                let rel_x = (x_i16 - sx) as u8;
+                let rel_y = dy;
                 let tile_x = rel_x / 8;
                 let tile_y = rel_y / 8;
                 let pixel_x = rel_x % 8;
                 let pixel_y = rel_y % 8;
                 // Time-over gating: allow only tiles whose 8px block started before stop_x
                 if self.sprite_timeover_stop_x < 256 {
-                    let tile_start_x = sprite.x.wrapping_add((tile_x as u16) * 8);
-                    if tile_start_x >= self.sprite_timeover_stop_x {
+                    let stop_x = self.sprite_timeover_stop_x as i16;
+                    let tile_start_x = sx.saturating_add((tile_x as i16) * 8);
+                    if tile_start_x >= stop_x {
                         continue;
                     }
                 }
@@ -3219,6 +3339,7 @@ impl Ppu {
                 // スプライト制限チェック
                 if self.sprites_on_line_count > 32 {
                     self.sprite_overflow = true;
+                    self.sprite_overflow_latched = true;
                     self.obj_overflow_lines = self.obj_overflow_lines.saturating_add(1);
                     break;
                 }
@@ -3229,6 +3350,7 @@ impl Ppu {
                 tile_budget_used = tile_budget_used.saturating_add(tiles_across);
                 if tile_budget_used > 34 {
                     self.sprite_time_over = true;
+                    self.sprite_time_over_latched = true;
                     self.obj_time_over_lines = self.obj_time_over_lines.saturating_add(1);
                     break;
                 }
@@ -3242,6 +3364,7 @@ impl Ppu {
                 // タイムオーバーチェック（概算）
                 if sprite_time > 34 {
                     self.sprite_time_over = true;
+                    self.sprite_time_over_latched = true;
                     self.obj_time_over_lines = self.obj_time_over_lines.saturating_add(1);
                     break;
                 }
@@ -3876,34 +3999,51 @@ impl Ppu {
         render_func(self, x, y, bg_num)
     }
 
-    // VRAM Full Graphic address remapping helper
+    // VRAM address remapping helper (VMAIN bits 3-2 "Full Graphic Mode")
+    //
+    // SNESdev wiki:
+    // - mode 0: none
+    // - mode 1: rotate low 8 bits by 3 (2bpp)  : aaaaaaaaYYYccccc -> aaaaaaaacccccYYY
+    // - mode 2: rotate low 9 bits by 3 (4bpp)  : aaaaaaaYYYcccccP -> aaaaaaacccccPYYY
+    // - mode 3: rotate low 10 bits by 3 (8bpp) : aaaaaaYYYcccccPP -> aaaaaacccccPPYYY
     fn vram_remap_word_addr(&self, addr: u16) -> u16 {
         let mode = (self.vram_mapping >> 2) & 0x03;
-        let a = addr & 0x7FFF; // 32KB words
+        if mode == 0 {
+            return addr & 0x7FFF;
+        }
 
-        match mode {
-            0 => a,
-            1 => {
-                // 32x32 page
-                let base = a & !0x03FF; // clear low 10 bits
-                let col = a & 0x001F; // 5 bits
-                let row = (a & 0x03E0) >> 5; // 5 bits
-                base | (col << 5) | row
+        let rotate_bits = match mode {
+            1 => 8u8,
+            2 => 9u8,
+            _ => 10u8,
+        };
+        let mask: u16 = (1u16 << rotate_bits) - 1;
+        let low = addr & mask;
+        let y = low >> (rotate_bits - 3);
+        let rest = low & ((1u16 << (rotate_bits - 3)) - 1);
+        let remapped = (addr & !mask) | (rest << 3) | y;
+        remapped & 0x7FFF
+    }
+
+    #[inline]
+    fn reload_vram_read_latch(&mut self) {
+        // In strict timing mode, only allow VRAM latch reads during VBlank or forced blank.
+        if crate::debug_flags::strict_ppu_timing() {
+            let vblank_start = self.get_visible_height().saturating_add(1);
+            let forced_blank = (self.screen_display & 0x80) != 0;
+            if !(self.v_blank || self.scanline >= vblank_start || forced_blank) {
+                return;
             }
-            2 => {
-                // 64x32 page
-                let base = a & !0x07FF; // clear low 11 bits
-                let col = a & 0x001F; // 5 bits
-                let row = (a & 0x07E0) >> 5; // 6 bits
-                base | (col << 6) | row
-            }
-            _ => {
-                // 128x32 page (mode 3)
-                let base = a & !0x0FFF; // clear low 12 bits
-                let col = a & 0x001F; // 5 bits
-                let row = (a & 0x0FE0) >> 5; // 7 bits
-                base | (col << 7) | row
-            }
+        }
+
+        let masked = self.vram_remap_word_addr(self.vram_addr) as usize;
+        let idx = masked.saturating_mul(2);
+        if idx + 1 < self.vram.len() {
+            self.vram_read_buf_lo = self.vram[idx];
+            self.vram_read_buf_hi = self.vram[idx + 1];
+        } else {
+            self.vram_read_buf_lo = 0;
+            self.vram_read_buf_hi = 0;
         }
     }
 
@@ -3914,7 +4054,13 @@ impl Ppu {
             0x36 => ((self.mode7_mul_result >> 16) & 0xFF) as u8, // product bit23-16
             0x37 => {
                 // $2137 (SLHV) - latch H/V counters on read.
-                // 本実装ではラッチ未実装のため 0 を返すが、RDNMI とは無関係なので nmi_flag は触らない。
+                // On read: counter_latch = 1 (always).
+                // The returned value is open bus on real hardware.
+                // Super Famicom Dev Wiki reports this latch as being gated by $4201 bit7.
+                // Gate behind the WRIO latch-enable to satisfy official burn-in behavior.
+                if self.wio_latch_enable {
+                    self.latch_hv_counters();
+                }
                 0
             }
             0x38 => {
@@ -3934,48 +4080,24 @@ impl Ppu {
                 v
             }
             0x39 | 0x3A => {
-                // VRAM read with 1-word pipeline buffering.
-                // First access returns buffered word at current address; increment timing obeys VMAIN bit7.
-                if !self.vram_read_prefetched {
-                    let masked = self.vram_remap_word_addr(self.vram_addr) as usize;
-                    let idx = masked.saturating_mul(2);
-                    if idx + 1 < self.vram.len() {
-                        self.vram_read_buf_lo = self.vram[idx];
-                        self.vram_read_buf_hi = self.vram[idx + 1];
-                    } else {
-                        self.vram_read_buf_lo = 0;
-                        self.vram_read_buf_hi = 0;
-                    }
-                    self.vram_read_prefetched = true;
-                }
-                // First read after VMADD/VMAIN changes returns dummy (simulate pipeline delay)
-                if !self.vram_read_valid {
-                    self.vram_read_valid = true;
-                    return 0;
-                }
+                // VRAM data read ($2139/$213A): one-word latch behavior.
+                // - VMADD writes preload the latch from the current address.
+                // - Reading returns the current latch byte.
+                // - On the incrementing access (VMAIN bit7 selects low/high), the latch is reloaded
+                //   from the current VMADD *before* VMADD is incremented.
                 let ret = if addr == 0x39 {
                     self.vram_read_buf_lo
                 } else {
                     self.vram_read_buf_hi
                 };
-                // Increment after the selected byte depending on VMAIN bit7, and invalidate buffer
+
                 let inc_on_high = (self.vram_mapping & 0x80) != 0;
                 let should_inc = (addr == 0x39 && !inc_on_high) || (addr == 0x3A && inc_on_high);
                 if should_inc {
+                    self.reload_vram_read_latch();
                     self.vram_addr = self.vram_addr.wrapping_add(self.vram_increment);
-                    // Preload next word to keep pipeline filled
-                    let masked = self.vram_remap_word_addr(self.vram_addr) as usize;
-                    let idx = masked.saturating_mul(2);
-                    if idx + 1 < self.vram.len() {
-                        self.vram_read_buf_lo = self.vram[idx];
-                        self.vram_read_buf_hi = self.vram[idx + 1];
-                    } else {
-                        self.vram_read_buf_lo = 0;
-                        self.vram_read_buf_hi = 0;
-                    }
-                    self.vram_read_prefetched = true;
-                    self.vram_read_valid = true;
                 }
+
                 ret
             }
             0x3B => {
@@ -4000,21 +4122,71 @@ impl Ppu {
                     hi
                 }
             }
-            0x3C => 0,
-            0x3D => 0,
+            0x3C => {
+                // OPHCT ($213C) - Latched horizontal counter (2-step read: low then high bit)
+                let v = if !self.ophct_second {
+                    (self.hv_latched_h & 0x00FF) as u8
+                } else {
+                    ((self.hv_latched_h >> 8) & 0x01) as u8
+                };
+                self.ophct_second = !self.ophct_second;
+                v
+            }
+            0x3D => {
+                // OPVCT ($213D) - Latched vertical counter (2-step read: low then high bit)
+                let v = if !self.opvct_second {
+                    (self.hv_latched_v & 0x00FF) as u8
+                } else {
+                    ((self.hv_latched_v >> 8) & 0x01) as u8
+                };
+                self.opvct_second = !self.opvct_second;
+                v
+            }
             0x3E => {
-                // Sprite status: bit6=time over, bit5=overflow (using 0x40/0x20 commonly seen; we use 0x80/0x40 per our mapping)
-                self.get_sprite_status()
+                // STAT77 - PPU Status Flag and Version
+                // trm-vvvv
+                // t = time over, r = range over, m = master/slave (always 0 here), v = version.
+                const STAT77_VER: u8 = 0x01;
+                let mut v = 0u8;
+                // SNESdev wiki:
+                // bit7: Time over flag (sprite tile fetch overflow, >34 tiles on scanline)
+                // bit6: Range over flag (sprite overflow, >32 sprites on scanline)
+                if self.sprite_overflow_latched {
+                    v |= 0x40;
+                }
+                if self.sprite_time_over_latched {
+                    v |= 0x80;
+                }
+                v | (STAT77_VER & 0x0F)
             }
             0x3F => {
-                let mut value = 0x03;
-                if self.v_blank {
-                    value |= 0x80;
+                // STAT78 - PPU Status Flag and Version
+                // fl-pvvvv
+                // f = interlace field (toggles every VBlank)
+                // l = external latch flag (set on HV latch, cleared on read when $4201 bit7=1)
+                // p = PAL (0 on NTSC)
+                // v = version
+                const STAT78_VER: u8 = 0x03;
+                let mut v = 0u8;
+                if self.interlace_field {
+                    v |= 0x80;
                 }
-                if self.h_blank {
-                    value |= 0x40;
+                if self.stat78_latch_flag {
+                    v |= 0x40;
                 }
-                value
+                // NTSC: bit4 stays 0
+                v |= STAT78_VER & 0x0F;
+
+                // Side effect: reset OPHCT/OPVCT high/low selectors.
+                self.ophct_second = false;
+                self.opvct_second = false;
+
+                // Side effect: counter_latch = 0.
+                // Super Famicom Dev Wiki reports the latch flag clears only when $4201 bit7 is set.
+                if self.wio_latch_enable {
+                    self.stat78_latch_flag = false;
+                }
+                v
             }
             _ => 0,
         }
@@ -4464,6 +4636,8 @@ impl Ppu {
                 // - bits 2-7: tilemap base in units of 0x400 bytes (1KB)
                 // Tilemap VRAM address is a *word* address: AAAAAA << 10 (1 KiW = 2 KiB pages).
                 // We store word addresses to match the renderer.
+                // Store base as VRAM *word* address.
+                // Fullsnes/SNESdev: base word address = (value & 0xFC) << 8
                 self.bg1_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[0] = value & 0x03;
                 if !crate::debug_flags::quiet() {
@@ -4536,92 +4710,28 @@ impl Ppu {
                 }
             }
             0x0D => {
-                let i = 0usize;
-                if !self.hscroll_latch[i] {
-                    self.hscroll_temp[i] = value;
-                    self.hscroll_latch[i] = true;
-                } else {
-                    self.bg1_hscroll =
-                        (((value as u16) << 8) | self.hscroll_temp[i] as u16) & 0x03FF;
-                    self.hscroll_latch[i] = false;
-                }
+                self.write_bghofs(0, value);
             }
             0x0E => {
-                let i = 0usize;
-                if !self.vscroll_latch[i] {
-                    self.vscroll_temp[i] = value;
-                    self.vscroll_latch[i] = true;
-                } else {
-                    self.bg1_vscroll =
-                        (((value as u16) << 8) | self.vscroll_temp[i] as u16) & 0x03FF;
-                    self.vscroll_latch[i] = false;
-                }
+                self.write_bgvofs(0, value);
             }
             0x0F => {
-                let i = 1usize;
-                if !self.hscroll_latch[i] {
-                    self.hscroll_temp[i] = value;
-                    self.hscroll_latch[i] = true;
-                } else {
-                    self.bg2_hscroll =
-                        (((value as u16) << 8) | self.hscroll_temp[i] as u16) & 0x03FF;
-                    self.hscroll_latch[i] = false;
-                }
+                self.write_bghofs(1, value);
             }
             0x10 => {
-                let i = 1usize;
-                if !self.vscroll_latch[i] {
-                    self.vscroll_temp[i] = value;
-                    self.vscroll_latch[i] = true;
-                } else {
-                    self.bg2_vscroll =
-                        (((value as u16) << 8) | self.vscroll_temp[i] as u16) & 0x03FF;
-                    self.vscroll_latch[i] = false;
-                }
+                self.write_bgvofs(1, value);
             }
             0x11 => {
-                let i = 2usize;
-                if !self.hscroll_latch[i] {
-                    self.hscroll_temp[i] = value;
-                    self.hscroll_latch[i] = true;
-                } else {
-                    self.bg3_hscroll =
-                        (((value as u16) << 8) | self.hscroll_temp[i] as u16) & 0x03FF;
-                    self.hscroll_latch[i] = false;
-                }
+                self.write_bghofs(2, value);
             }
             0x12 => {
-                let i = 2usize;
-                if !self.vscroll_latch[i] {
-                    self.vscroll_temp[i] = value;
-                    self.vscroll_latch[i] = true;
-                } else {
-                    self.bg3_vscroll =
-                        (((value as u16) << 8) | self.vscroll_temp[i] as u16) & 0x03FF;
-                    self.vscroll_latch[i] = false;
-                }
+                self.write_bgvofs(2, value);
             }
             0x13 => {
-                let i = 3usize;
-                if !self.hscroll_latch[i] {
-                    self.hscroll_temp[i] = value;
-                    self.hscroll_latch[i] = true;
-                } else {
-                    self.bg4_hscroll =
-                        (((value as u16) << 8) | self.hscroll_temp[i] as u16) & 0x03FF;
-                    self.hscroll_latch[i] = false;
-                }
+                self.write_bghofs(3, value);
             }
             0x14 => {
-                let i = 3usize;
-                if !self.vscroll_latch[i] {
-                    self.vscroll_temp[i] = value;
-                    self.vscroll_latch[i] = true;
-                } else {
-                    self.bg4_vscroll =
-                        (((value as u16) << 8) | self.vscroll_temp[i] as u16) & 0x03FF;
-                    self.vscroll_latch[i] = false;
-                }
+                self.write_bgvofs(3, value);
             }
             0x15 => {
                 // $2115: VRAM Address Increment/Mapping
@@ -4647,9 +4757,6 @@ impl Ppu {
                         1 => 32,
                         _ => 128,
                     };
-                    // Any VMADD/VMAIN change should invalidate the VRAM read pipeline.
-                    self.vram_read_prefetched = false;
-                    self.vram_read_valid = false;
                     self.vmain_effect_pending = None;
                     self.vmain_effect_ticks = 0;
                     self.latched_vmain = None;
@@ -4676,6 +4783,7 @@ impl Ppu {
             0x16 => {
                 if self.can_commit_vmadd_now() {
                     self.vram_addr = (self.vram_addr & 0xFF00) | (value as u16);
+                    self.reload_vram_read_latch();
                 } else {
                     self.latched_vmadd_lo = Some(value);
                 }
@@ -4696,6 +4804,7 @@ impl Ppu {
             0x17 => {
                 if self.can_commit_vmadd_now() {
                     self.vram_addr = (self.vram_addr & 0x00FF) | ((value as u16) << 8);
+                    self.reload_vram_read_latch();
                 } else {
                     self.latched_vmadd_hi = Some(value);
                 }
@@ -5113,15 +5222,16 @@ impl Ppu {
             }
             0x33 => {
                 // SETINI (pseudo hires, EXTBG, interlace)
-                if crate::debug_flags::strict_ppu_timing()
-                    && self.scanline < self.get_visible_height()
-                {
+                let vblank_start = self.get_visible_height().saturating_add(1);
+                if crate::debug_flags::strict_ppu_timing() && self.scanline < vblank_start {
                     // Defer any change during visible region (including HBlank) to line start
                     self.latched_setini = Some(value);
                 } else {
                     self.setini = value;
                     self.pseudo_hires = (value & 0x08) != 0;
                     self.extbg = (value & 0x40) != 0;
+                    self.overscan = (value & 0x04) != 0;
+                    self.obj_interlace = (value & 0x02) != 0;
                     self.interlace = (value & 0x01) != 0;
                 }
             }
@@ -5449,14 +5559,23 @@ impl Ppu {
     // Build per-line OBJ pipeline: pick first 32 overlapping sprites and precompute tile starts
     fn prepare_line_obj_pipeline(&mut self, scanline: u16) {
         self.line_sprites.clear();
-        self.sprite_tile_entry_counts = [0; 256];
-        self.sprite_tile_budget_remaining = 34; // approx per-line budget
-        self.sprite_draw_disabled = false;
+        self.sprite_overflow = false;
+        self.sprite_time_over = false;
+        // We currently do not emulate the partial-tile fetch artifact precisely; keep rendering ungated.
         self.sprite_timeover_stop_x = 256;
 
-        // Gather overlapping sprites in rotated OAM order (starting at oam_eval_base), cap at 32
+        // Gather sprites in rotated OAM order (starting at oam_eval_base), cap at 32 like hardware.
+        //
+        // SNESdev/Super Famicom wiki behavior:
+        // - Range over (bit6): set if there are >32 sprites on a scanline, but *off-screen* sprites do not count.
+        //   Only sprites with -size < X < 256 are considered in the range test.
+        // - Time over (bit7): set if there are >34 8x8 tiles on a scanline, evaluated from the 32-range list.
+        //   Only tiles with -8 < X < 256 are counted.
+        // - Special case: if X == -256 (raw 256), it is treated as X == 0 for range/time evaluation.
+        //
+        // We approximate this by applying the horizontal inclusion rules and counting tiles across.
         let mut count_seen = 0u8;
-        let mut overlapped_total = 0u16;
+        let mut in_range_total = 0u16;
         for n in 0..128u16 {
             let i = ((self.oam_eval_base as u16 + n) & 0x7F) as usize;
             let oam_offset = i * 4;
@@ -5464,6 +5583,7 @@ impl Ppu {
                 break;
             }
             let y = self.oam[oam_offset + 1];
+            // Y>=240 is hidden.
             if y >= 240 {
                 continue;
             }
@@ -5481,23 +5601,53 @@ impl Ppu {
             } else {
                 SpriteSize::Small
             };
-            let (_, sprite_h) = self.get_sprite_pixel_size(&size);
-            if scanline < y as u16 || scanline >= y as u16 + sprite_h as u16 {
+            let (sprite_w, sprite_h) = self.get_sprite_pixel_size(&size);
+            // Y is 8-bit and wraps; test overlap via wrapped subtraction.
+            let dy = (scanline as u8).wrapping_sub(y);
+            if (dy as u16) >= sprite_h as u16 {
                 continue;
             }
 
-            overlapped_total = overlapped_total.saturating_add(1);
+            // Range stage horizontal inclusion: -size < X < 256 (X is signed 9-bit).
+            let x_lo = self.oam[oam_offset] as u16;
+            let x_raw = x_lo | (((high_bits & 0x01) as u16) << 8);
+            let mut x = Self::sprite_x_signed(x_raw);
+            // Bug: treat X == -256 as X == 0 for range/time evaluation.
+            if x == -256 {
+                x = 0;
+            }
+            // Only partially-on-screen sprites count towards range overflow.
+            if x <= -(sprite_w as i16) {
+                continue;
+            }
+            // x is signed (-256..255), so x < 256 always holds; keep the check for clarity.
+            if x >= 256 {
+                continue;
+            }
+
+            in_range_total = in_range_total.saturating_add(1);
 
             // Pull rest of fields
-            let x_lo = self.oam[oam_offset] as u16;
             let tile_lo = self.oam[oam_offset + 2] as u16;
             let attr = self.oam[oam_offset + 3];
-            let x = x_lo | (((high_bits & 0x01) as u16) << 8);
+            let x = x_raw;
             let tile = tile_lo | (((attr & 0x01) as u16) << 8);
             let palette = (attr >> 1) & 0x07;
             let priority = (attr >> 4) & 0x03;
             let flip_x = (attr & 0x40) != 0;
             let flip_y = (attr & 0x80) != 0;
+            if in_range_total == 33 && crate::debug_flags::trace_burnin_obj() {
+                println!(
+                    "[BURNIN-OBJ][OVERFLOW33] frame={} line={} idx={} x_raw={} y={} dy={} size={:?}",
+                    self.frame,
+                    scanline,
+                    i,
+                    x,
+                    y,
+                    dy,
+                    size
+                );
+            }
 
             if count_seen < 32 {
                 self.line_sprites.push(SpriteData {
@@ -5516,21 +5666,46 @@ impl Ppu {
         }
 
         // Sprite overflow flag/metric
-        self.sprite_overflow = overlapped_total > 32;
+        self.sprite_overflow = in_range_total > 32;
         if self.sprite_overflow {
+            if !self.sprite_overflow_latched && crate::debug_flags::trace_burnin_obj() {
+                println!(
+                    "[BURNIN-OBJ][LATCH] range_over set: frame={} line={} overlapped_total={} oam_base={}",
+                    self.frame, scanline, in_range_total, self.oam_eval_base
+                );
+            }
+            self.sprite_overflow_latched = true;
             self.obj_overflow_lines = self.obj_overflow_lines.saturating_add(1);
         }
 
-        // Precompute 8px tile starts along the line for budget accounting
-        for s in &self.line_sprites {
+        // Time-over (tile overflow) evaluation for this scanline.
+        // Count up to 34 tiles across the 32-sprite range list; if there are more, latch time over.
+        let mut tiles_seen: u16 = 0;
+        'time_eval: for s in self.line_sprites.iter().rev() {
+            let mut sx = Self::sprite_x_signed(s.x);
+            if sx == -256 {
+                sx = 0;
+            }
             let (w, _h) = self.get_sprite_pixel_size(&s.size);
-            let tiles_across = (w as u16).div_ceil(8);
+            let tiles_across = (w as i16) / 8;
             for k in 0..tiles_across {
-                let start_x = s.x.wrapping_add(k * 8);
-                if start_x < 256 {
-                    let idx = start_x as usize;
-                    self.sprite_tile_entry_counts[idx] =
-                        self.sprite_tile_entry_counts[idx].saturating_add(1);
+                let tx = sx + k * 8;
+                // Only tiles with -8 < X < 256 are counted.
+                if tx <= -8 || tx >= 256 {
+                    continue;
+                }
+                tiles_seen = tiles_seen.saturating_add(1);
+                if tiles_seen > 34 {
+                    self.sprite_time_over = true;
+                    if !self.sprite_time_over_latched && crate::debug_flags::trace_burnin_obj() {
+                        println!(
+                            "[BURNIN-OBJ][LATCH] time_over set: frame={} line={} tiles_seen={}",
+                            self.frame, scanline, tiles_seen
+                        );
+                    }
+                    self.sprite_time_over_latched = true;
+                    self.obj_time_over_lines = self.obj_time_over_lines.saturating_add(1);
+                    break 'time_eval;
                 }
             }
         }
@@ -5538,23 +5713,9 @@ impl Ppu {
 
     // Consume time budget on first pixel of each 8px tile; disable OBJ for rest of line when exhausted
     fn update_obj_time_over_at_x(&mut self, x: u16) {
-        if self.sprite_draw_disabled {
-            return;
-        }
-        if x >= 256 {
-            return;
-        }
-        let cnt = self.sprite_tile_entry_counts[x as usize] as i16;
-        if cnt > 0 {
-            self.sprite_tile_budget_remaining -= cnt;
-            if self.sprite_tile_budget_remaining < 0 {
-                self.sprite_time_over = true;
-                // From this x onward, newly starting tiles are not drawn.
-                self.sprite_timeover_stop_x = x;
-                self.sprite_draw_disabled = false; // keep already-started tiles visible
-                self.obj_time_over_lines = self.obj_time_over_lines.saturating_add(1);
-            }
-        }
+        // Time-over is evaluated per scanline in `prepare_line_obj_pipeline` above.
+        // Keep this as a no-op for now (pixel-level gating is not implemented yet).
+        let _ = x;
     }
 
     // Precompute per-x window masks for BG/OBJ and color window (dot gating)
@@ -6307,6 +6468,10 @@ impl Ppu {
 
     pub fn get_scanline(&self) -> u16 {
         self.scanline
+    }
+
+    pub fn get_frame(&self) -> u64 {
+        self.frame
     }
 
     // Accessors for HVB flags

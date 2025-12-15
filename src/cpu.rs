@@ -297,6 +297,80 @@ impl Cpu {
         let pc24 = ((state_before.pb as u32) << 16) | state_before.pc as u32;
         bus.set_last_cpu_pc(pc24);
 
+        // burn-in-test.sfc: trace ROM-side OBJ overflow checks (quiet, few lines).
+        if crate::debug_flags::trace_burnin_obj_checks()
+            && state_before.pb == 0x00
+            && matches!(
+                state_before.pc,
+                0x9AC4 | 0x9AEC | 0x9B61 | 0x9B8E | 0x9BD0 | 0x9BD8
+            )
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static PRINTS: AtomicU32 = AtomicU32::new(0);
+            if PRINTS.fetch_add(1, Ordering::Relaxed) < 64 {
+                let dp48 = state_before.dp.wrapping_add(0x0048) as u32;
+                let raw48 = bus.read_u8(dp48);
+                let got = raw48 & 0xC0;
+                let expected = match state_before.pc {
+                    0x9AC4 => Some(0x00),
+                    0x9AEC => Some(0x40),
+                    0x9B61 => Some(0x00),
+                    0x9B8E => Some(0x80),
+                    _ => None,
+                };
+                let mut w1000 = [0u8; 16];
+                let mut w1200 = [0u8; 16];
+                for i in 0..16u32 {
+                    w1000[i as usize] = bus.read_u8(0x1000 + i);
+                    w1200[i as usize] = bus.read_u8(0x1200 + i);
+                }
+                let fmt_hex = |bytes: &[u8]| -> String {
+                    use std::fmt::Write;
+                    let mut out = String::with_capacity(bytes.len() * 2);
+                    for b in bytes {
+                        let _ = write!(&mut out, "{:02X}", b);
+                    }
+                    out
+                };
+                let w1000_hex = fmt_hex(&w1000);
+                let w1200_hex = fmt_hex(&w1200);
+                if let Some(exp) = expected {
+                    println!(
+                        "[BURNIN-OBJ-CHECK] PC=00:{:04X} expect={:02X} got={:02X} raw48={:02X} A={:04X} X={:04X} Y={:04X} DP={:04X} P={:02X} emu={} M8={} X8={} w1000={} w1200={}",
+                        state_before.pc,
+                        exp,
+                        got,
+                        raw48,
+                        state_before.a,
+                        state_before.x,
+                        state_before.y,
+                        state_before.dp,
+                        state_before.p.bits(),
+                        state_before.emulation_mode,
+                        state_before.p.contains(StatusFlags::MEMORY_8BIT),
+                        state_before.p.contains(StatusFlags::INDEX_8BIT),
+                        w1000_hex,
+                        w1200_hex,
+                    );
+                } else {
+                    println!(
+                        "[BURNIN-OBJ-CHECK] PC=00:{:04X} (fail path) raw48={:02X} got={:02X} A={:04X} X={:04X} Y={:04X} DP={:04X} P={:02X} emu={} w1000={} w1200={}",
+                        state_before.pc,
+                        raw48,
+                        got,
+                        state_before.a,
+                        state_before.x,
+                        state_before.y,
+                        state_before.dp,
+                        state_before.p.bits(),
+                        state_before.emulation_mode,
+                        w1000_hex,
+                        w1200_hex,
+                    );
+                }
+            }
+        }
+
         // Optional: ring buffer trace (enable with DUMP_ON_PC_FFFF=1 or DUMP_ON_PC=...).
         // Keeps the last 256 instructions and dumps them when a trigger PC is reached.
         {

@@ -428,6 +428,18 @@ pub fn trace_apu_handshake() -> bool {
     *ON.get_or_init(|| env_flag("TRACE_APU_HANDSHAKE", false))
 }
 
+// burn-in-test.sfc debug: trace STAT77 ($213E) reads for OBJ L OVER
+pub fn trace_burnin_obj() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_BURNIN_OBJ", false))
+}
+
+// burn-in-test.sfc OBJ L OVER debug: trace the ROM-side checks (few lines)
+pub fn trace_burnin_obj_checks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_BURNIN_OBJ_CHECKS", false))
+}
+
 // Enable coarse memory timing (SlowROM penalty unless $420D FastROM)
 pub fn mem_timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -465,6 +477,12 @@ pub fn trace_sa1_dma() -> bool {
 pub fn trace_ppu_inidisp() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("TRACE_PPU_INIDISP", false))
+}
+
+// Burn-in test (V224/V239) focused trace (RDNMI/SLHV/OPVCT). Very verbose; enable only when needed.
+pub fn trace_burnin_v224() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_BURNIN_V224", false))
 }
 
 // CPU trace / verbose instruction logs (very noisy)

@@ -254,7 +254,8 @@ impl Bus {
             mdmaen_nonzero_count: 0,
             hdmaen_nonzero_count: 0,
 
-            wio: 0,
+            // WRIO ($4201) behaves as if initialized to all-1s at power-on.
+            wio: 0xFF,
             fastrom: false,
             dma_reg_writes: 0,
             dma_dest_hist: [0; 256],
@@ -305,6 +306,9 @@ impl Bus {
             sa1_cycle_deficit: 0,
             sa1_nmi_delay_active: false,
         };
+
+        // Mirror WRIO bit7 to PPU latch enable.
+        bus.ppu.set_wio_latch_enable(true);
 
         // DQ3専用ブートハック: BW-RAM に SA-1 ROM 0C:6000-FFFF を展開して待機ループを回避
         if bus.mapper_type == crate::cartridge::MapperType::DragonQuest3 {
@@ -444,7 +448,8 @@ impl Bus {
             mdmaen_nonzero_count: 0,
             hdmaen_nonzero_count: 0,
 
-            wio: 0,
+            // WRIO ($4201) behaves as if initialized to all-1s at power-on.
+            wio: 0xFF,
             fastrom: false,
             dma_reg_writes: 0,
             dma_dest_hist: [0; 256],
@@ -494,6 +499,9 @@ impl Bus {
             sa1_cycle_deficit: 0,
             sa1_nmi_delay_active: false,
         };
+
+        // Mirror WRIO bit7 to PPU latch enable.
+        bus.ppu.set_wio_latch_enable(true);
 
         // DQ3 boot hack: seed WRAM 7F:002C with a sane stack pointer until SA-1 initializes it.
         if mapper == crate::cartridge::MapperType::DragonQuest3 {
@@ -1869,7 +1877,46 @@ impl Bus {
                         return v;
                     }
                     // PPU registers
-                    0x2100..=0x213F => self.ppu.read(offset & 0xFF),
+                    0x2100..=0x213F => {
+                        let v = self.ppu.read(offset & 0xFF);
+                        if crate::debug_flags::trace_burnin_v224() {
+                            let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
+                            if (0x97D0..=0x98FF).contains(&pc16) {
+                                match offset {
+                                    0x2137 | 0x213D | 0x213F => {
+                                        println!(
+                                            "[BURNIN-V224][PPU-R] PC={:06X} ${:04X} -> {:02X} sl={} cyc={} vblank={} vis_h={}",
+                                            self.last_cpu_pc,
+                                            offset,
+                                            v,
+                                            self.ppu.scanline,
+                                            self.ppu.get_cycle(),
+                                            self.ppu.is_vblank() as u8,
+                                            self.ppu.get_visible_height()
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if crate::debug_flags::trace_burnin_obj() && offset == 0x213E {
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static CNT: AtomicU32 = AtomicU32::new(0);
+                            let n = CNT.fetch_add(1, Ordering::Relaxed);
+                            if n < 256 {
+                                println!(
+                                    "[BURNIN-OBJ][STAT77] PC={:06X} -> {:02X} frame={} sl={} cyc={} vblank={}",
+                                    self.last_cpu_pc,
+                                    v,
+                                    self.ppu.get_frame(),
+                                    self.ppu.scanline,
+                                    self.ppu.get_cycle(),
+                                    self.ppu.is_vblank() as u8
+                                );
+                            }
+                        }
+                        v
+                    }
                     // APU registers
                     0x2140..=0x217F => {
                         // Optional: fake APU boot handshake (SMW/DQ3 early init)
@@ -2529,6 +2576,22 @@ impl Bus {
                     }
                     // PPU registers (no DQ3-specific overrides)
                     0x2100..=0x213F => {
+                        if crate::debug_flags::trace_burnin_v224() {
+                            let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
+                            if (0x97D0..=0x98FF).contains(&pc16) && offset == 0x2133 {
+                                println!(
+                                    "[BURNIN-V224][PPU-W] PC={:06X} ${:04X} <- {:02X} frame={} sl={} cyc={} vblank={} vis_h={}",
+                                    self.last_cpu_pc,
+                                    offset,
+                                    value,
+                                    self.ppu.get_frame(),
+                                    self.ppu.scanline,
+                                    self.ppu.get_cycle(),
+                                    self.ppu.is_vblank() as u8,
+                                    self.ppu.get_visible_height()
+                                );
+                            }
+                        }
                         self.ppu.write(offset & 0xFF, value);
                     }
                     0x2200..=0x23FF if self.is_sa1_active() => {
@@ -2973,17 +3036,15 @@ impl Bus {
                         bank, offset, wram_addr, value
                     );
                 }
-                // Watch suspected handshake flag 7F:7DC0
-                if wram_addr == 0x1FDC0 {
-                    use std::sync::atomic::{AtomicU32, Ordering};
-                    static WATCH_WRITES: AtomicU32 = AtomicU32::new(0);
-                    let idx = WATCH_WRITES.fetch_add(1, Ordering::Relaxed);
-                    if idx < 16 || std::env::var_os("TRACE_HANDSHAKE").is_some() {
-                        println!(
-                            "[WRAM 7F:7DC0 WRITE] val=0x{:02X} bank={:02X} off={:04X}",
-                            value, bank, offset
-                        );
-                    }
+                // Watch suspected handshake flag 7F:7DC0 (opt-in)
+                if wram_addr == 0x1FDC0
+                    && std::env::var_os("TRACE_HANDSHAKE").is_some()
+                    && !crate::debug_flags::quiet()
+                {
+                    println!(
+                        "[WRAM 7F:7DC0 WRITE] val=0x{:02X} bank={:02X} off={:04X}",
+                        value, bank, offset
+                    );
                 }
                 if std::env::var_os("TRACE_NMI_WRAM").is_some() {
                     use std::sync::atomic::{AtomicU32, Ordering};
@@ -3280,6 +3341,28 @@ impl Bus {
                     self.rdnmi_consumed = true;
                 }
 
+                if crate::debug_flags::trace_burnin_v224() {
+                    let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
+                    if (0x97D0..=0x98FF).contains(&pc16) {
+                        use std::sync::atomic::{AtomicU8, Ordering};
+                        static LAST: AtomicU8 = AtomicU8::new(0xFF);
+                        let prev = LAST.swap(value, Ordering::Relaxed);
+                        // Log only on NMI-flag (bit7) edges to avoid spamming tight loops.
+                        if (prev ^ value) & 0x80 != 0 {
+                            println!(
+                                "[BURNIN-V224][RDNMI] PC={:06X} sl={} cyc={} vblank={} nmi_en={} {:02X}->{:02X}",
+                                self.last_cpu_pc,
+                                self.ppu.scanline,
+                                self.ppu.get_cycle(),
+                                self.ppu.is_vblank() as u8,
+                                self.ppu.nmi_enabled as u8,
+                                prev,
+                                value
+                            );
+                        }
+                    }
+                }
+
                 if std::env::var_os("TRACE_4210").is_some() {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static COUNT: AtomicU32 = AtomicU32::new(0);
@@ -3573,7 +3656,16 @@ impl Bus {
             }
             // WRIO - Joypad Programmable I/O Port; read back via $4213
             0x4201 => {
+                // Bit7 ("a") is connected to the PPU latch line (active-low).
+                // Latch occurs on transition 1->0, similar to reading $2137.
+                let prev = self.wio;
                 self.wio = value;
+                let prev_a = (prev & 0x80) != 0;
+                let new_a = (value & 0x80) != 0;
+                self.ppu.set_wio_latch_enable(new_a);
+                if prev_a && !new_a {
+                    self.ppu.latch_hv_counters();
+                }
             }
             0x4202 => {
                 // WRMPYA - Multiplicand A (8-bit)

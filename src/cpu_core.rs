@@ -517,7 +517,7 @@ mod tests {
         let mut bus = TestBus::new();
         // MVN #$00,#$01 (src=00, dest=01) => bytes are 0x54, dest=01, src=00
         bus.load(0x8000, &[0x54, 0x01, 0x00, 0xEA]); // NOP after
-        // Source bytes at 00:1000..1003
+                                                     // Source bytes at 00:1000..1003
         bus.load(0x001000, &[0xDE, 0xAD, 0xBE, 0xEF]);
         // Destination area at 01:2000..2003 (init to 0)
         bus.load(0x012000, &[0x00, 0x00, 0x00, 0x00]);
@@ -1453,13 +1453,11 @@ fn adc_generic(state: &mut CoreState, operand: u16) {
             // See 8-bit case above: V uses the intermediate result after low-nibble adjust only.
             let sum_lo = a_lo as u16 + b_lo as u16 + carry_in as u16;
             let low_lo = (a_lo & 0x0F) as u16 + (b_lo & 0x0F) as u16 + carry_in as u16;
-            let lo_v =
-                (sum_lo.wrapping_add(if low_lo > 0x09 { 0x06 } else { 0x00 }) & 0xFF) as u8;
+            let lo_v = (sum_lo.wrapping_add(if low_lo > 0x09 { 0x06 } else { 0x00 }) & 0xFF) as u8;
             let carry1_v = sum_lo > 0x99;
             let sum_hi = a_hi as u16 + b_hi as u16 + carry1_v as u16;
             let low_hi = (a_hi & 0x0F) as u16 + (b_hi & 0x0F) as u16 + carry1_v as u16;
-            let hi_v =
-                (sum_hi.wrapping_add(if low_hi > 0x09 { 0x06 } else { 0x00 }) & 0xFF) as u8;
+            let hi_v = (sum_hi.wrapping_add(if low_hi > 0x09 { 0x06 } else { 0x00 }) & 0xFF) as u8;
             let result_v = ((hi_v as u16) << 8) | (lo_v as u16);
 
             let overflow = (((!(a ^ b)) & (a ^ result_v)) & 0x8000) != 0;

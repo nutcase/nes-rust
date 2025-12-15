@@ -959,6 +959,14 @@ impl Emulator {
                     }
                 }
             }
+
+            // Optional PPU register/state dump for headless debugging
+            if std::env::var("HEADLESS_DUMP_PPU_STATE")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false)
+            {
+                self.bus.get_ppu().debug_ppu_state();
+            }
             println!(
                 "HEADLESS mode finished ({} / {} frames)",
                 self.frame_count, self.headless_max_frames
@@ -1766,51 +1774,95 @@ impl Emulator {
 
     /// Auto-inject button input for testing (controlled by AUTO_INPUT_FRAMES env var)
     fn maybe_inject_auto_input(&mut self) {
-        // Parse AUTO_INPUT_FRAMES environment variable (format: "200-210,300-305")
-        let auto_input = std::env::var("AUTO_INPUT_FRAMES").ok();
-        if auto_input.is_none() {
-            return;
-        }
-
-        let auto_input = auto_input.unwrap();
         let frame = self.frame_count;
 
-        // Which buttons to press during the range (comma-separated names, default START)
-        let button_mask = std::env::var("AUTO_INPUT_BUTTONS")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|name| match name.trim().to_uppercase().as_str() {
-                        "A" => Some(crate::input::button::A),
-                        "B" => Some(crate::input::button::B),
-                        "X" => Some(crate::input::button::X),
-                        "Y" => Some(crate::input::button::Y),
-                        "L" => Some(crate::input::button::L),
-                        "R" => Some(crate::input::button::R),
-                        "START" => Some(crate::input::button::START),
-                        "SELECT" => Some(crate::input::button::SELECT),
-                        "UP" => Some(crate::input::button::UP),
-                        "DOWN" => Some(crate::input::button::DOWN),
-                        "LEFT" => Some(crate::input::button::LEFT),
-                        "RIGHT" => Some(crate::input::button::RIGHT),
-                        _ => None,
-                    })
-                    .fold(0u16, |acc, v| acc | v)
-            })
-            .filter(|m| *m != 0)
-            .unwrap_or(crate::input::button::START);
+        fn parse_buttons(spec: &str) -> u16 {
+            spec.split(|c| c == ',' || c == '+' || c == '|')
+                .filter_map(|name| match name.trim().to_uppercase().as_str() {
+                    "A" => Some(crate::input::button::A),
+                    "B" => Some(crate::input::button::B),
+                    "X" => Some(crate::input::button::X),
+                    "Y" => Some(crate::input::button::Y),
+                    "L" => Some(crate::input::button::L),
+                    "R" => Some(crate::input::button::R),
+                    "START" => Some(crate::input::button::START),
+                    "SELECT" => Some(crate::input::button::SELECT),
+                    "UP" => Some(crate::input::button::UP),
+                    "DOWN" => Some(crate::input::button::DOWN),
+                    "LEFT" => Some(crate::input::button::LEFT),
+                    "RIGHT" => Some(crate::input::button::RIGHT),
+                    _ => None,
+                })
+                .fold(0u16, |acc, v| acc | v)
+        }
 
-        // Parse frame ranges like "200-210,300-305"
-        let should_inject = auto_input.split(',').any(|range| {
-            if let Some((start, end)) = range.split_once('-') {
-                if let (Ok(s), Ok(e)) = (start.trim().parse::<u64>(), end.trim().parse::<u64>()) {
-                    return frame >= s && frame <= e;
+        fn parse_range(spec: &str) -> Option<(u64, u64)> {
+            let s = spec.trim();
+            if s.is_empty() {
+                return None;
+            }
+            if let Some((a, b)) = s.split_once('-') {
+                let start = a.trim().parse::<u64>().ok()?;
+                let end = b.trim().parse::<u64>().ok()?;
+                Some((start, end))
+            } else {
+                let t = s.parse::<u64>().ok()?;
+                Some((t, t))
+            }
+        }
+
+        // New format: AUTO_INPUT_EVENTS="20-22:SELECT;40-42:SELECT;100-110:START"
+        // - Entries are separated by ';'
+        // - Buttons can be separated by ',', '+', or '|'
+        let mut inject_mask: u16 = 0;
+        let mut injected = false;
+        if let Ok(events) = std::env::var("AUTO_INPUT_EVENTS") {
+            for ent in events.split(';') {
+                let ent = ent.trim();
+                if ent.is_empty() {
+                    continue;
+                }
+                let (range_s, buttons_s) = ent
+                    .split_once(':')
+                    .map(|(r, b)| (r.trim(), b.trim()))
+                    .unwrap_or((ent, "START"));
+                let (start, end) = match parse_range(range_s) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if frame >= start && frame <= end {
+                    inject_mask |= parse_buttons(buttons_s);
+                    injected = true;
                 }
             }
-            false
-        });
+        } else {
+            // Legacy format: AUTO_INPUT_FRAMES="200-210,300-305" + AUTO_INPUT_BUTTONS="START"
+            let auto_input = match std::env::var("AUTO_INPUT_FRAMES").ok() {
+                Some(v) => v,
+                None => return,
+            };
 
-        if should_inject {
+            let button_mask = std::env::var("AUTO_INPUT_BUTTONS")
+                .ok()
+                .map(|s| parse_buttons(&s))
+                .filter(|m| *m != 0)
+                .unwrap_or(crate::input::button::START);
+
+            injected = auto_input.split(',').any(|range| {
+                if let Some((start, end)) = range.split_once('-') {
+                    if let (Ok(s), Ok(e)) = (start.trim().parse::<u64>(), end.trim().parse::<u64>())
+                    {
+                        return frame >= s && frame <= e;
+                    }
+                }
+                false
+            });
+            if injected {
+                inject_mask = button_mask;
+            }
+        }
+
+        if injected && inject_mask != 0 {
             // Inject button press.
             let input_port = std::env::var("INPUT_PORT")
                 .ok()
@@ -1821,26 +1873,29 @@ impl Emulator {
                     .bus
                     .get_input_system_mut()
                     .controller2
-                    .set_buttons(button_mask),
+                    .set_buttons(inject_mask),
                 _ => self
                     .bus
                     .get_input_system_mut()
                     .controller1
-                    .set_buttons(button_mask),
+                    .set_buttons(inject_mask),
             }
             // Optional: mirror P1 injection to P2 as well (useful for manual test ROMs)
             if std::env::var_os("INPUT_MIRROR_P1_TO_P2").is_some() {
                 self.bus
                     .get_input_system_mut()
                     .controller2
-                    .set_buttons(button_mask);
+                    .set_buttons(inject_mask);
             }
 
             static mut INJECT_LOG_COUNT: u32 = 0;
             unsafe {
                 INJECT_LOG_COUNT += 1;
                 if INJECT_LOG_COUNT <= 5 && !crate::debug_flags::quiet() {
-                    println!("🎮 Auto-input: Injecting START button at frame {}", frame);
+                    println!(
+                        "🎮 Auto-input: Injecting buttons=0x{:04X} at frame {}",
+                        inject_mask, frame
+                    );
                 }
             }
         } else {
@@ -2666,9 +2721,12 @@ impl Emulator {
         let new_scanline = self.bus.get_ppu().scanline;
         let new_cycle = self.bus.get_ppu().get_cycle();
         let is_hblank = self.bus.get_ppu().is_hblank();
+        let vis_last = self.bus.get_ppu().get_visible_height();
+        let vblank_start = vis_last.saturating_add(1);
+        let new_line_is_visible = new_scanline >= 1 && new_scanline <= vis_last;
 
         // H-Blank入りでHDMA実行（画面内ラインのみ）
-        if !was_hblank && is_hblank && new_scanline < self.bus.get_ppu().get_visible_height() {
+        if !was_hblank && is_hblank && new_line_is_visible {
             // Guard a few dots at HBlank head for HDMA operations
             self.bus.get_ppu_mut().on_hblank_start_guard();
             self.bus.hdma_hblank();
@@ -2679,8 +2737,7 @@ impl Emulator {
             // JOYBUSYの更新
             self.bus.on_scanline_advance();
             // VBlank突入検知
-            let vis_h = self.bus.get_ppu().get_visible_height();
-            if old_scanline < vis_h && new_scanline >= vis_h {
+            if old_scanline < vblank_start && new_scanline >= vblank_start {
                 self.bus.on_vblank_start();
             }
         }
