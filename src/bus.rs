@@ -105,6 +105,9 @@ pub struct Bus {
     rdnmi_consumed: bool,
     rdnmi_high_byte_for_test: u8,
 
+    // Extra master cycles consumed by DMA stalls (CPU is halted while PPU/APU continue).
+    pending_stall_master_cycles: u64,
+
     // Optional APU handshake + SPC upload HLE (protocol-faithful)
     fake_apu: bool,
     fake_apu_ports: [u8; 4],
@@ -267,6 +270,7 @@ impl Bus {
             hdma_bytes_oam: 0,
             rdnmi_consumed: false,
             rdnmi_high_byte_for_test: 0,
+            pending_stall_master_cycles: 0,
             fake_apu,
             fake_apu_ports: if fake_apu {
                 [0xAA, 0xBB, 0x00, 0x00]
@@ -461,6 +465,7 @@ impl Bus {
             hdma_bytes_oam: 0,
             rdnmi_consumed: false,
             rdnmi_high_byte_for_test: 0,
+            pending_stall_master_cycles: 0,
             fake_apu,
             fake_apu_ports: if fake_apu {
                 [0xAA, 0xBB, 0x00, 0x00]
@@ -4973,6 +4978,20 @@ impl Bus {
             cur_src = bank | next_lo16;
             i += 1;
         }
+
+        // --- Timing: S-CPU stalls during MDMA ---
+        //
+        // On real hardware, general DMA blocks the S-CPU while the PPU/APU continue to run.
+        // We approximate the duration as:
+        //   8 master cycles per transferred byte + 8 master cycles overhead.
+        //
+        // (This is intentionally tracked in master cycles so it can be applied without rounding.)
+        let bytes_transferred = i.max(0) as u64;
+        if bytes_transferred > 0 {
+            let stall_master_cycles = 8u64.saturating_mul(bytes_transferred.saturating_add(1));
+            self.add_pending_stall_master_cycles(stall_master_cycles);
+        }
+
         if capture_cgram && cgram_total > 0 {
             let shown = cgram_captured.min(8);
             let bytes: Vec<String> = cgram_first
@@ -5123,6 +5142,20 @@ impl Bus {
                 lines, vram, cgram, oam
             )
         }
+    }
+
+    /// Extra master cycles consumed by DMA/other stalls since last call.
+    /// This is used by the main emulator loop to advance PPU/APU while the S-CPU is halted.
+    #[inline]
+    pub fn take_pending_stall_master_cycles(&mut self) -> u64 {
+        let v = self.pending_stall_master_cycles;
+        self.pending_stall_master_cycles = 0;
+        v
+    }
+
+    #[inline]
+    fn add_pending_stall_master_cycles(&mut self, cycles: u64) {
+        self.pending_stall_master_cycles = self.pending_stall_master_cycles.saturating_add(cycles);
     }
 }
 

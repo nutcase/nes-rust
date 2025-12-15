@@ -149,6 +149,8 @@ pub struct Emulator {
     window: Option<Window>,
     frame_buffer: Vec<u32>,
     master_cycles: u64,
+    // Pending "stall" time in master cycles (e.g., MDMA); CPU is halted while PPU/APU advance.
+    pending_stall_master_cycles: u64,
     // PPU クロックの端数を蓄積して CPU:PPU=6:4 の比率を正確に保つ
     ppu_cycle_accum: f64,
     last_frame_time: Instant,
@@ -555,6 +557,7 @@ impl Emulator {
             window: window_opt,
             frame_buffer,
             master_cycles: 0,
+            pending_stall_master_cycles: 0,
             ppu_cycle_accum: 0.0,
             last_frame_time: Instant::now(),
             target_frame_duration,
@@ -2209,6 +2212,19 @@ impl Emulator {
                 std::process::exit(1);
             }
 
+            // If a previous instruction triggered a DMA stall, the CPU is halted while time
+            // continues to advance. Consume that stall budget here before running more CPU.
+            if self.pending_stall_master_cycles > 0 {
+                let remaining = cycles_per_frame.saturating_sub(self.master_cycles - start_cycles);
+                let consume = self.pending_stall_master_cycles.min(remaining);
+                self.advance_time_without_cpu(consume);
+                self.pending_stall_master_cycles -= consume;
+                self.pending_stall_master_cycles = self
+                    .pending_stall_master_cycles
+                    .saturating_add(self.bus.take_pending_stall_master_cycles());
+                continue;
+            }
+
             // デバッガのブレークポイントチェック
             let pc = self.cpu.get_pc();
 
@@ -2504,10 +2520,53 @@ impl Emulator {
             }
 
             self.master_cycles += (cpu_cycles as u64) * (CPU_CLOCK_DIVIDER as u64);
+
+            // Drain any time consumed by DMA stalls that occurred during this instruction slice.
+            // The CPU should remain halted for that duration, but PPU/APU continue to advance.
+            self.pending_stall_master_cycles = self
+                .pending_stall_master_cycles
+                .saturating_add(self.bus.take_pending_stall_master_cycles());
         }
 
         // Frame完了時に主要レジスタのサマリを出力（デバッグ用）
         self.maybe_dump_register_summary(frame_count);
+    }
+
+    /// Advance emulated time without executing any S-CPU instructions.
+    ///
+    /// Used to model stalls such as general DMA (MDMA), where the S-CPU is halted while
+    /// the PPU/APU (and SA-1) continue to run.
+    fn advance_time_without_cpu(&mut self, master_cycles: u64) {
+        if master_cycles == 0 {
+            return;
+        }
+
+        // Step SA-1 scheduler (if present) during the stall.
+        // Use S-CPU cycle equivalents as a rough proxy for elapsed time.
+        let mut sa1_cycles = master_cycles / (CPU_CLOCK_DIVIDER as u64);
+        while sa1_cycles > 0 {
+            let chunk = sa1_cycles.min(u8::MAX as u64) as u8;
+            self.bus.run_sa1_scheduler(chunk);
+            self.bus.process_sa1_dma();
+            sa1_cycles -= chunk as u64;
+        }
+
+        // Step PPU: PPU clock is master/4.
+        let mut ppu_cycles = master_cycles / (PPU_CLOCK_DIVIDER as u64);
+        while ppu_cycles > 0 {
+            let chunk = ppu_cycles.min(u16::MAX as u64) as u16;
+            self.step_ppu(chunk);
+            ppu_cycles -= chunk as u64;
+        }
+
+        // Step APU for the same elapsed master time.
+        if !self.bus.is_fake_apu() {
+            if let Ok(mut apu) = self.bus.get_apu_shared().lock() {
+                apu.step_master_cycles(master_cycles);
+            }
+        }
+
+        self.master_cycles = self.master_cycles.saturating_add(master_cycles);
     }
 
     /// DQ3専用デバッグ: S-CPUがIRQ/NMIで進まない場合にベクタへ強制ジャンプ

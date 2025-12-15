@@ -253,6 +253,43 @@ impl Apu {
         }
     }
 
+    /// Master clock に合わせてSPC700を回す（S-CPU が停止している期間の進行用）。
+    ///
+    /// MDMAなどでS-CPUが止まっていても、実機ではAPUは独立して動作し続けるため、
+    /// エミュレータ側でも「経過時間」ぶんだけSPC700/DSPを進める必要がある。
+    pub fn step_master_cycles(&mut self, master_cycles: u64) {
+        if master_cycles == 0 {
+            return;
+        }
+
+        // APU_CYCLE_SCALE is defined in terms of "S-CPU cycles" (as used by `step()`).
+        // Convert master cycles -> S-CPU cycles using our fixed divider (master/6).
+        let scale_cpu: f64 = std::env::var("APU_CYCLE_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.572);
+        let scale_master = scale_cpu / 6.0;
+
+        self.cycle_accum += (master_cycles as f64) * scale_master;
+        let run = self.cycle_accum.floor() as i32;
+        self.cycle_accum -= run as f64;
+
+        if run > 0 {
+            if let Some(smp) = self.inner.smp.as_mut() {
+                smp.run(run);
+            }
+            if let Some(dsp) = self.inner.dsp.as_mut() {
+                dsp.flush();
+            }
+        }
+
+        if self.boot_state == BootState::Running {
+            for p in 0..4 {
+                self.apu_to_cpu_ports[p] = self.inner.cpu_read_port(p as u8);
+            }
+        }
+    }
+
     /// CPU側ポート読み出し ($2140-$2143)
     pub fn read_port(&mut self, port: u8) -> u8 {
         let p = (port & 0x03) as usize;
