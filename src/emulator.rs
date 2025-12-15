@@ -2301,6 +2301,30 @@ impl Emulator {
                 }
             }
 
+            // burn-in-test.sfc: annotate the ROM-side OBJ overflow checks with current PPU timing.
+            // (This helps distinguish "PPU flag wrong" vs "check happens before scanline".)
+            if crate::debug_flags::trace_burnin_obj_checks()
+                && pc >> 16 == 0x00
+                && matches!(pc & 0xFFFF, 0x9AC4 | 0x9AEC | 0x9B61 | 0x9B8E | 0x9BD0 | 0x9BD8)
+            {
+                let ppu_frame = self.bus.get_ppu().get_frame();
+                let ppu_sl = self.bus.get_ppu().scanline;
+                let ppu_cyc = self.bus.get_ppu().get_cycle();
+                let ppu_vblank = self.bus.get_ppu().is_vblank() as u8;
+                let hvbjoy = self.bus.read_u8(0x4212);
+                let stat77 = self.bus.read_u8(0x213E);
+                println!(
+                    "[BURNIN-OBJ-CHECK-CTX] PC=00:{:04X} frame={} sl={} cyc={} vblank={} hvbjoy={:02X} stat77={:02X}",
+                    pc & 0xFFFF,
+                    ppu_frame,
+                    ppu_sl,
+                    ppu_cyc,
+                    ppu_vblank,
+                    hvbjoy,
+                    stat77
+                );
+            }
+
             // Watch a specific address read/write (S-CPU side) if requested
             if let Some(watch) = crate::debug_flags::watch_addr() {
                 let wbank = (watch >> 16) as u8;

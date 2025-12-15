@@ -13,6 +13,13 @@ fn env_u16(key: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
 pub fn dma() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("DEBUG_DMA", false))
@@ -426,6 +433,12 @@ pub fn apu_handshake_plus() -> bool {
 pub fn trace_apu_handshake() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("TRACE_APU_HANDSHAKE", false))
+}
+
+// Trace APU handshake log limit (applies to TRACE_APU_HANDSHAKE).
+pub fn trace_apu_handshake_limit() -> u32 {
+    static VAL: OnceLock<u32> = OnceLock::new();
+    *VAL.get_or_init(|| env_u32("TRACE_APU_HANDSHAKE_LIMIT", 256))
 }
 
 // burn-in-test.sfc debug: trace STAT77 ($213E) reads for OBJ L OVER

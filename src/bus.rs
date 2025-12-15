@@ -2013,7 +2013,8 @@ impl Bus {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static CNT: AtomicU32 = AtomicU32::new(0);
                             let n = CNT.fetch_add(1, Ordering::Relaxed);
-                            if n < 256 {
+                            let limit = crate::debug_flags::trace_apu_handshake_limit();
+                            if n < limit {
                                 println!(
                                     "[APU-HS][R] ${:04X} -> {:02X} state={} pc={:06X} sl={} cyc={}",
                                     offset,
@@ -2627,7 +2628,8 @@ impl Bus {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static CNT: AtomicU32 = AtomicU32::new(0);
                             let n = CNT.fetch_add(1, Ordering::Relaxed);
-                            if n < 256 {
+                            let limit = crate::debug_flags::trace_apu_handshake_limit();
+                            if n < limit {
                                 if self.fake_apu {
                                     println!(
                                         "[APU-HS][W] ${:04X} <- {:02X} state=fake-{:?} pc={:06X} sl={} cyc={}",
@@ -3638,8 +3640,15 @@ impl Bus {
                 self.irq_v_enabled = (value & 0x20) != 0;
                 // Reset HV shadow when enables change
                 self.irq_v_matched_line = None;
-                // If NMI is enabled mid-VBlank, hardware latches an NMI immediately.
-                if nmi_en && !prev_nmi_en && self.ppu.is_vblank() && !self.ppu.is_nmi_latched() {
+                // If NMI is enabled mid-VBlank, hardware may latch an NMI immediately *only if*
+                // the NMI flag ($4210 bit7) is still set (i.e., the VBlank-edge has occurred and
+                // has not yet been acknowledged via $4210 read).
+                if nmi_en
+                    && !prev_nmi_en
+                    && self.ppu.is_vblank()
+                    && self.ppu.nmi_flag
+                    && !self.ppu.is_nmi_latched()
+                {
                     self.ppu.latch_nmi_now();
                 }
                 // bit0: auto-joypad enable (ignored here)
