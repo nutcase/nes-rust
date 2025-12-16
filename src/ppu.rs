@@ -19,6 +19,8 @@ pub struct Ppu {
     // Latched H/V counters (set by reading $2137 or by WRIO latch via $4201 bit7 transition).
     hv_latched_h: u16,
     hv_latched_v: u16,
+    // Pending external latch via WRIO ($4201 bit7 1->0). Fires after a 1-dot delay.
+    wio_latch_pending_dots: u8,
     ophct_second: bool,
     opvct_second: bool,
 
@@ -275,6 +277,10 @@ pub struct Ppu {
     // Distinguish CPU vs MDMA vs HDMA register writes (0=CPU,1=MDMA,2=HDMA)
     write_ctx: u8,
     debug_dma_channel: Option<u8>, // active MDMA/HDMA channel for debug logs
+    // burn-in-test.sfc: arm narrow VRAM clobber tracing after DMA MEMORY begins
+    burnin_vram_trace_armed: bool,
+    burnin_vram_trace_cnt_2118: u32,
+    burnin_vram_trace_cnt_2119: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -407,6 +413,7 @@ impl Ppu {
             frame: 0,
             hv_latched_h: 0,
             hv_latched_v: 0,
+            wio_latch_pending_dots: 0,
             ophct_second: false,
             opvct_second: false,
 
@@ -617,6 +624,9 @@ impl Ppu {
 
             write_ctx: 0,
             debug_dma_channel: None,
+            burnin_vram_trace_armed: false,
+            burnin_vram_trace_cnt_2118: 0,
+            burnin_vram_trace_cnt_2119: 0,
         }
     }
 
@@ -707,6 +717,15 @@ impl Ppu {
                     }
                 }
             }
+
+            // External HV latch via WRIO ($4201 bit7 1->0): latch occurs 1 dot later than $2137.
+            // (See Super Famicom Development Wiki "Timing".)
+            if self.wio_latch_pending_dots > 0 {
+                self.wio_latch_pending_dots = self.wio_latch_pending_dots.saturating_sub(1);
+                if self.wio_latch_pending_dots == 0 {
+                    self.latch_hv_counters();
+                }
+            }
         }
     }
 
@@ -718,6 +737,43 @@ impl Ppu {
         self.hv_latched_v = self.scanline & 0x01FF;
         // STAT78 latch flag: set when counters are latched.
         self.stat78_latch_flag = true;
+        // Reset OPHCT/OPVCT read selectors so the next read returns the low byte.
+        self.ophct_second = false;
+        self.opvct_second = false;
+
+        if crate::debug_flags::trace_burnin_ext_latch() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static CNT: AtomicU32 = AtomicU32::new(0);
+            let n = CNT.fetch_add(1, Ordering::Relaxed);
+            if n < 1024 && !crate::debug_flags::quiet() {
+                println!(
+                    "[BURNIN-EXT][LATCH] sl={} cyc={} -> OPHCT={:03} OPVCT={:03} flag={} wio_en={}",
+                    self.scanline,
+                    self.cycle,
+                    self.hv_latched_h,
+                    self.hv_latched_v,
+                    self.stat78_latch_flag as u8,
+                    self.wio_latch_enable as u8
+                );
+            }
+        }
+    }
+
+    pub fn request_wrio_hv_latch(&mut self) {
+        // WRIO ($4201) external latch is documented as latching 1 dot later than a $2137 read.
+        // We schedule the latch so it fires after the next dot advances.
+        self.wio_latch_pending_dots = 1;
+        if crate::debug_flags::trace_burnin_ext_latch() && !crate::debug_flags::quiet() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static CNT: AtomicU32 = AtomicU32::new(0);
+            let n = CNT.fetch_add(1, Ordering::Relaxed);
+            if n < 256 {
+                println!(
+                    "[BURNIN-EXT][WRIO-LATCH-REQ] sl={} cyc={} pending_dots={}",
+                    self.scanline, self.cycle, self.wio_latch_pending_dots
+                );
+            }
+        }
     }
 
     pub fn set_wio_latch_enable(&mut self, enabled: bool) {
@@ -858,20 +914,39 @@ impl Ppu {
 
     #[inline]
     fn is_vram_write_safe_dot(&self) -> bool {
+        // VRAM data port ($2118/$2119) writes are only effective during:
+        // - forced blank (INIDISP bit7), or
+        // - VBlank, or
+        // - a small HBlank window for DMA/HDMA (timing-sensitive titles rely on this)
+        //
+        // NOTE: Even when the write is ignored, VMADD still increments based on VMAIN. The
+        // caller must apply the increment regardless of the return value here.
         self.can_write_vram_now()
+    }
+
+    #[inline]
+    fn can_read_vram_now(&self) -> bool {
+        // SNESdev wiki: VRAM reads via $2139/$213A are only valid during VBlank or forced blank.
+        if (self.screen_display & 0x80) != 0 {
+            return true;
+        }
+        let vblank_start = self.get_visible_height().saturating_add(1);
+        self.v_blank || self.scanline >= vblank_start
     }
 
     // Centralized timing gates for graphics register writes.
     // These are coarse approximations meant to be refined over time.
     #[inline]
     fn can_write_vram_now(&self) -> bool {
-        if !crate::debug_flags::strict_ppu_timing() {
+        let strict = crate::debug_flags::strict_ppu_timing();
+        // During forced blank (INIDISP bit7), VRAM is accessible at any time.
+        if (self.screen_display & 0x80) != 0 {
             return true;
         }
         let vblank_start = self.get_visible_height().saturating_add(1);
         if self.v_blank || self.scanline >= vblank_start {
             // Optional VBlank head/tail sub-windows for MDMA/CPU
-            if self.write_ctx != 2 {
+            if strict && self.write_ctx != 2 {
                 let head = crate::debug_flags::vram_vblank_head();
                 let tail = crate::debug_flags::vram_vblank_tail();
                 let last = self.last_dot_index();
@@ -887,35 +962,22 @@ impl Ppu {
             }
             return true;
         }
-        if !self.h_blank {
-            return false;
-        }
-        let x = self.cycle as u16;
-        let hb = self.first_hblank_dot();
-        let last = self.last_dot_index();
-        // Block VRAM data writes immediately after VMAIN effect for MDMA/CPU
-        if self.vmain_data_gap_ticks > 0 && self.write_ctx != 2 {
-            return false;
-        }
-        match self.write_ctx {
-            2 => {
-                let head = hb.saturating_add(crate::debug_flags::vram_hdma_head());
-                let tail = crate::debug_flags::vram_hdma_tail();
-                x >= head && x <= (last.saturating_sub(tail))
-            }
-            1 => {
-                let head = hb.saturating_add(crate::debug_flags::vram_mdma_head());
-                let tail = crate::debug_flags::vram_mdma_tail();
-                let start = head.max(self.hdma_head_busy_until);
-                x >= start && x <= (last.saturating_sub(tail))
-            }
-            _ => false, // CPU direct: VBlank only
-        }
+        // Outside of VBlank/forced blank, VRAM data port writes are ignored on real hardware
+        // (even during HBlank). See: SNESdev wiki ($2118/$2119 timing notes).
+        //
+        // We keep the STRICT_PPU_TIMING flag for future refinements, but the fundamental rule
+        // is the same in both modes.
+        let _ = strict;
+        false
     }
 
     #[inline]
     fn can_write_cgram_now(&self) -> bool {
         if !crate::debug_flags::strict_ppu_timing() {
+            return true;
+        }
+        // During forced blank (INIDISP bit7), CGRAM is accessible at any time.
+        if (self.screen_display & 0x80) != 0 {
             return true;
         }
         let vblank_start = self.get_visible_height().saturating_add(1);
@@ -959,6 +1021,10 @@ impl Ppu {
     #[inline]
     fn can_write_oam_now(&self) -> bool {
         if !crate::debug_flags::strict_ppu_timing() {
+            return true;
+        }
+        // During forced blank (INIDISP bit7), OAM is accessible at any time.
+        if (self.screen_display & 0x80) != 0 {
             return true;
         }
         let vblank_start = self.get_visible_height().saturating_add(1);
@@ -1084,6 +1150,10 @@ impl Ppu {
         if !crate::debug_flags::strict_ppu_timing() {
             return true;
         }
+        // During forced blank (INIDISP bit7), VRAM control regs are writable at any time.
+        if (self.screen_display & 0x80) != 0 {
+            return true;
+        }
         let vblank_start = self.get_visible_height().saturating_add(1);
         if self.v_blank || self.scanline >= vblank_start {
             return true;
@@ -1104,6 +1174,10 @@ impl Ppu {
     // Determine if it is safe to commit CGADD (CGRAM address) now
     fn can_commit_cgadd_now(&self) -> bool {
         if !crate::debug_flags::strict_ppu_timing() {
+            return true;
+        }
+        // During forced blank (INIDISP bit7), CGRAM control regs are writable at any time.
+        if (self.screen_display & 0x80) != 0 {
             return true;
         }
         let vblank_start = self.get_visible_height().saturating_add(1);
@@ -1144,7 +1218,9 @@ impl Ppu {
                     changed = true;
                 }
                 if changed {
-                    self.reload_vram_read_latch();
+                    if self.can_read_vram_now() {
+                        self.reload_vram_read_latch();
+                    }
                 }
             }
         }
@@ -4056,8 +4132,7 @@ impl Ppu {
                 // $2137 (SLHV) - latch H/V counters on read.
                 // On read: counter_latch = 1 (always).
                 // The returned value is open bus on real hardware.
-                // Super Famicom Dev Wiki reports this latch as being gated by $4201 bit7.
-                // Gate behind the WRIO latch-enable to satisfy official burn-in behavior.
+                // Super Famicom Dev Wiki: latching is gated by $4201 bit7.
                 if self.wio_latch_enable {
                     self.latch_hv_counters();
                 }
@@ -4081,7 +4156,6 @@ impl Ppu {
             }
             0x39 | 0x3A => {
                 // VRAM data read ($2139/$213A): one-word latch behavior.
-                // - VMADD writes preload the latch from the current address.
                 // - Reading returns the current latch byte.
                 // - On the incrementing access (VMAIN bit7 selects low/high), the latch is reloaded
                 //   from the current VMADD *before* VMADD is incremented.
@@ -4182,7 +4256,7 @@ impl Ppu {
                 self.opvct_second = false;
 
                 // Side effect: counter_latch = 0.
-                // Super Famicom Dev Wiki reports the latch flag clears only when $4201 bit7 is set.
+                // Super Famicom Dev Wiki: latch flag clears on read only when $4201 bit7 is set.
                 if self.wio_latch_enable {
                     self.stat78_latch_flag = false;
                 }
@@ -4783,7 +4857,9 @@ impl Ppu {
             0x16 => {
                 if self.can_commit_vmadd_now() {
                     self.vram_addr = (self.vram_addr & 0xFF00) | (value as u16);
-                    self.reload_vram_read_latch();
+                    if self.can_read_vram_now() {
+                        self.reload_vram_read_latch();
+                    }
                 } else {
                     self.latched_vmadd_lo = Some(value);
                 }
@@ -4804,7 +4880,9 @@ impl Ppu {
             0x17 => {
                 if self.can_commit_vmadd_now() {
                     self.vram_addr = (self.vram_addr & 0x00FF) | ((value as u16) << 8);
-                    self.reload_vram_read_latch();
+                    if self.can_read_vram_now() {
+                        self.reload_vram_read_latch();
+                    }
                 } else {
                     self.latched_vmadd_hi = Some(value);
                 }
@@ -4852,6 +4930,11 @@ impl Ppu {
                         );
                         self.last_reject_frame_vram = self.frame;
                     }
+                    // Even if the VRAM write is ignored, VMADD still increments depending on VMAIN.
+                    // (SNESdev wiki: "VMADD will always increment ... even if the VRAM write is ignored.")
+                    if (self.vram_mapping & 0x80) == 0 {
+                        self.vram_addr = self.vram_addr.wrapping_add(self.vram_increment);
+                    }
                     return;
                 }
                 if crate::debug_flags::boot_verbose() {
@@ -4869,6 +4952,31 @@ impl Ppu {
                 let masked_addr = self.vram_remap_word_addr(self.vram_addr); // apply FG mapping
                                                                              // VRAM is word-addressed (0x0000-0x7FFF), but stored as bytes (0x0000-0xFFFF)
                 let vram_index = ((masked_addr & 0x7FFF) as usize * 2) & 0xFFFF; // Low byte at even address
+
+                // burn-in-test.sfc DMA MEMORY: detect unexpected writes into the test region.
+                if self.burnin_vram_trace_armed
+                    && std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some()
+                    && (0x5000..0x5800).contains(&masked_addr)
+                {
+                    let dma_ch = self.debug_dma_channel.unwrap_or(0xFF);
+                    let is_known = self.write_ctx == 1 && dma_ch == 6;
+                    if !is_known {
+                        let n = self.burnin_vram_trace_cnt_2118;
+                        self.burnin_vram_trace_cnt_2118 =
+                            self.burnin_vram_trace_cnt_2118.saturating_add(1);
+                        if n < 64 {
+                            let who = match self.write_ctx {
+                                2 => "HDMA",
+                                1 => "MDMA",
+                                _ => "CPU",
+                            };
+                            println!(
+                                "[BURNIN-VRAM-WRITE] {} ch={} frame={} sl={} cyc={} VMADD={:04X} $2118={:02X}",
+                                who, dma_ch, self.frame, self.scanline, self.cycle, masked_addr, value
+                            );
+                        }
+                    }
+                }
 
                 // Summary counters (bucketed by masked word address high bits)
                 let bucket = ((masked_addr >> 12) & 0x7) as usize; // 0..7
@@ -4926,6 +5034,10 @@ impl Ppu {
                         );
                         self.last_reject_frame_vram = self.frame;
                     }
+                    // Even if the VRAM write is ignored, VMADD still increments depending on VMAIN.
+                    if (self.vram_mapping & 0x80) != 0 {
+                        self.vram_addr = self.vram_addr.wrapping_add(self.vram_increment);
+                    }
                     return;
                 }
                 if crate::debug_flags::boot_verbose() {
@@ -4942,6 +5054,30 @@ impl Ppu {
                 }
                 let masked_addr = self.vram_remap_word_addr(self.vram_addr);
                 let vram_index = (((masked_addr & 0x7FFF) as usize) * 2 + 1) & 0xFFFF; // High byte at odd address
+
+                if self.burnin_vram_trace_armed
+                    && std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some()
+                    && (0x5000..0x5800).contains(&masked_addr)
+                {
+                    let dma_ch = self.debug_dma_channel.unwrap_or(0xFF);
+                    let is_known = self.write_ctx == 1 && dma_ch == 6;
+                    if !is_known {
+                        let n = self.burnin_vram_trace_cnt_2119;
+                        self.burnin_vram_trace_cnt_2119 =
+                            self.burnin_vram_trace_cnt_2119.saturating_add(1);
+                        if n < 64 {
+                            let who = match self.write_ctx {
+                                2 => "HDMA",
+                                1 => "MDMA",
+                                _ => "CPU",
+                            };
+                            println!(
+                                "[BURNIN-VRAM-WRITE] {} ch={} frame={} sl={} cyc={} VMADD={:04X} $2119={:02X}",
+                                who, dma_ch, self.frame, self.scanline, self.cycle, masked_addr, value
+                            );
+                        }
+                    }
+                }
 
                 // Summary counters
                 let bucket = ((masked_addr >> 12) & 0x7) as usize; // 0..7
@@ -5352,6 +5488,11 @@ impl Ppu {
     /// デバッグ用: BG1 のタイルマップ／タイルベースアドレスを取得
     pub fn dbg_bg1_bases(&self) -> (u16, u16) {
         (self.bg1_tilemap_base, self.bg1_tile_base)
+    }
+
+    /// デバッグ用: VRAM 関連レジスタを取得
+    pub fn dbg_vram_regs(&self) -> (u16, u16, u8) {
+        (self.vram_addr, self.vram_increment, self.vram_mapping)
     }
 
     // Raw memory accessors (headless debug dump)
@@ -6511,6 +6652,13 @@ impl Ppu {
     #[inline]
     pub fn set_debug_dma_channel(&mut self, ch: Option<u8>) {
         self.debug_dma_channel = ch;
+    }
+
+    #[inline]
+    pub fn arm_burnin_vram_trace(&mut self) {
+        self.burnin_vram_trace_armed = true;
+        self.burnin_vram_trace_cnt_2118 = 0;
+        self.burnin_vram_trace_cnt_2119 = 0;
     }
 
     // Mark HBlank head guard window for HDMA operations

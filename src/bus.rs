@@ -1904,6 +1904,28 @@ impl Bus {
                                 }
                             }
                         }
+                        if crate::debug_flags::trace_burnin_ext_latch() {
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static CNT: AtomicU32 = AtomicU32::new(0);
+                            let n = CNT.fetch_add(1, Ordering::Relaxed);
+                            if n < 2048 {
+                                match offset {
+                                    0x2137 | 0x213C | 0x213D | 0x213F => {
+                                        println!(
+                                            "[BURNIN-EXT][PPU-R] PC={:06X} ${:04X} -> {:02X} sl={} cyc={} vblank={} wio=0x{:02X}",
+                                            self.last_cpu_pc,
+                                            offset,
+                                            v,
+                                            self.ppu.scanline,
+                                            self.ppu.get_cycle(),
+                                            self.ppu.is_vblank() as u8,
+                                            self.wio
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         if crate::debug_flags::trace_burnin_obj() && offset == 0x213E {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static CNT: AtomicU32 = AtomicU32::new(0);
@@ -3670,15 +3692,31 @@ impl Bus {
             }
             // WRIO - Joypad Programmable I/O Port; read back via $4213
             0x4201 => {
-                // Bit7 ("a") is connected to the PPU latch line (active-low).
-                // Latch occurs on transition 1->0, similar to reading $2137.
+                // Bit7 ("a") is connected to the PPU latch line.
+                // Official burn-in expects the HV counters to be latched when the line is released
+                // (0->1), matching common WRIO pulse usage (drive low, then high).
                 let prev = self.wio;
                 self.wio = value;
                 let prev_a = (prev & 0x80) != 0;
                 let new_a = (value & 0x80) != 0;
                 self.ppu.set_wio_latch_enable(new_a);
-                if prev_a && !new_a {
-                    self.ppu.latch_hv_counters();
+                if crate::debug_flags::trace_burnin_ext_latch() {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static CNT: AtomicU32 = AtomicU32::new(0);
+                    let n = CNT.fetch_add(1, Ordering::Relaxed);
+                    if n < 1024 {
+                        println!(
+                            "[BURNIN-EXT][WRIO] PC={:06X} $4201 <- {:02X} (prev={:02X}) sl={} cyc={}",
+                            self.last_cpu_pc,
+                            value,
+                            prev,
+                            self.ppu.scanline,
+                            self.ppu.get_cycle()
+                        );
+                    }
+                }
+                if !prev_a && new_a {
+                    self.ppu.request_wrio_hv_latch();
                 }
             }
             0x4202 => {
@@ -3774,6 +3812,12 @@ impl Bus {
             }
             0x420B => {
                 // MDMAEN - General DMA Enable
+                if std::env::var_os("TRACE_DMA_REG_PC").is_some() {
+                    println!(
+                        "[DMA-EN-PC] PC={:06X} W $420B val={:02X}",
+                        self.last_cpu_pc, value
+                    );
+                }
                 self.dma_controller.write(addr, value);
                 if value != 0 {
                     self.mdmaen_nonzero_count = self.mdmaen_nonzero_count.saturating_add(1);
@@ -4629,11 +4673,136 @@ impl Bus {
         }
         let src_addr = ch.src_address;
 
+        // --- burn-in-test.sfc DMA MEMORY diagnostics (opt-in) ---
+        //
+        // The official burn-in ROM uses DMA ch6/ch7 to roundtrip 0x1000 bytes between
+        // WRAM $7E:4000 and VRAM (write via $2118/$2119, read via $2139/$213A).
+        // If the DMA MEMORY test FAILs, enable TRACE_BURNIN_DMA_MEMORY=1 to print
+        // a small fingerprint and detect common off-by-one/latch issues.
+        let trace_burnin_dma_mem = std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some();
+        #[derive(Clone, Copy)]
+        struct BurninDmaSnap {
+            pc: u32,
+            frame: u64,
+            scanline: u16,
+            cycle: u16,
+            vblank: bool,
+            hblank: bool,
+            forced_blank: bool,
+            vram_addr: u16,
+            vram_inc: u16,
+            vmain: u8,
+            hash: u64,
+            sample: [u8; 32],
+        }
+        static BURNIN_DMA_SNAP: OnceLock<Mutex<Option<BurninDmaSnap>>> = OnceLock::new();
+        static BURNIN_DMA_DUMPED: OnceLock<AtomicU32> = OnceLock::new();
+        let fnv1a64 = |data: &[u8]| -> u64 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &b in data {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        };
+
         // 特定ROM用のアドレス補正ハックは廃止（正規マッピング/CPU実装で解決する）
 
         // B-bus destination uses low 7 bits (0x2100-0x217F)
         let transfer_unit = ch.get_transfer_unit();
         let dest_base_full = ch.dest_address;
+
+        // burn-in-test.sfc: track unexpected VRAM DMAs that might clobber the DMA MEMORY test region.
+        // (Covers both $2118/$2119 bases and all transfer modes; we only special-case the known
+        // DMA MEMORY write via ch6.)
+        if trace_burnin_dma_mem
+            && cpu_to_ppu
+            && (dest_base_full == 0x18 || dest_base_full == 0x19)
+        {
+            let (vmadd_start, vram_inc, vmain) = self.ppu.dbg_vram_regs();
+            if vram_inc == 1 {
+                let words = (transfer_size / 2) as u16;
+                let vmadd_end = vmadd_start.wrapping_add(words);
+                let overlaps = vmadd_start < 0x5800 && vmadd_end > 0x5000;
+                let is_known_dmamem_write =
+                    channel == 6 && src_addr == 0x7E4000 && transfer_size == 0x1000;
+                if overlaps && !is_known_dmamem_write {
+                    println!(
+                        "[BURNIN-DMAMEM] UNEXPECTED VRAM DMA: pc={:06X} ch{} src=0x{:06X} size=0x{:04X} base=$21{:02X} unit={} addr_mode={} VMADD={}..{} VMAIN={:02X}",
+                        self.last_cpu_pc,
+                        channel,
+                        src_addr,
+                        transfer_size,
+                        dest_base_full,
+                        transfer_unit,
+                        ch.get_address_mode(),
+                        vmadd_start,
+                        vmadd_end,
+                        vmain
+                    );
+                }
+            }
+        }
+
+        // Snapshot the source buffer before it gets overwritten by the VRAM->WRAM read-back DMA.
+        if trace_burnin_dma_mem
+            && cpu_to_ppu
+            && channel == 6
+            && transfer_unit == 1
+            && dest_base_full == 0x18
+            && src_addr == 0x7E4000
+            && transfer_size == 0x1000
+            && self.wram.len() >= 0x5000
+        {
+            let slice = &self.wram[0x4000..0x5000];
+            let mut sample = [0u8; 32];
+            for (seg, off) in [0x000usize, 0x100, 0x200, 0x300].into_iter().enumerate() {
+                let start = seg * 8;
+                sample[start..start + 8].copy_from_slice(&slice[off..off + 8]);
+            }
+            let hash = fnv1a64(slice);
+            let (vram_addr, vram_inc, vmain) = self.ppu.dbg_vram_regs();
+            let pc = self.last_cpu_pc;
+            // Arm fine-grained VRAM clobber tracing (PPU-side) after the DMA MEMORY routine starts.
+            self.ppu.arm_burnin_vram_trace();
+            let frame = self.ppu.get_frame();
+            let scanline = self.ppu.get_scanline();
+            let cycle = self.ppu.get_cycle();
+            let vblank = self.ppu.is_vblank();
+            let hblank = self.ppu.is_hblank();
+            let forced_blank = self.ppu.is_forced_blank();
+            *BURNIN_DMA_SNAP.get_or_init(|| Mutex::new(None)).lock().unwrap() =
+                Some(BurninDmaSnap {
+                    pc,
+                    frame,
+                    scanline,
+                    cycle,
+                    vblank,
+                    hblank,
+                    forced_blank,
+                    vram_addr,
+                    vram_inc,
+                    vmain,
+                    hash,
+                    sample,
+                });
+            println!(
+                "[BURNIN-DMAMEM] SNAP pc={:06X} frame={} sl={} cyc={} vblank={} hblank={} fblank={} VMADD={:04X} VMAIN={:02X} inc={} hash={:016X} sample@0/100/200/300={:02X?}",
+                pc,
+                frame,
+                scanline,
+                cycle,
+                vblank as u8,
+                hblank as u8,
+                forced_blank as u8,
+                vram_addr,
+                vmain,
+                vram_inc,
+                hash,
+                sample
+            );
+        }
+
         if dest_base_full == 0 {
             static INIDISP_DMA_ALERT: OnceLock<AtomicU32> = OnceLock::new();
             let n = INIDISP_DMA_ALERT
@@ -4768,6 +4937,26 @@ impl Bus {
             println!(
                 "[WRAM-DMA-START] ch{} start_wram_addr=0x{:05X} size=0x{:04X} src=0x{:06X}",
                 channel, self.wram_address, transfer_size, src_addr
+            );
+        }
+
+        // burn-in-test.sfc DMA MEMORY: capture the destination WRAM buffer before VRAM->WRAM DMA overwrites it.
+        let mut burnin_pre_wram_hash: Option<u64> = None;
+        if trace_burnin_dma_mem
+            && !cpu_to_ppu
+            && channel == 7
+            && transfer_unit == 1
+            && dest_base_full == 0x39
+            && src_addr == 0x7E4000
+            && transfer_size == 0x1000
+            && self.wram.len() >= 0x5000
+        {
+            let pre = &self.wram[0x4000..0x5000];
+            burnin_pre_wram_hash = Some(fnv1a64(pre));
+            println!(
+                "[BURNIN-DMAMEM] PREREAD-WRAM pc={:06X} hash={:016X}",
+                self.last_cpu_pc,
+                burnin_pre_wram_hash.unwrap()
             );
         }
 
@@ -4916,11 +5105,11 @@ impl Bus {
                         }
                         // advance addresses but skip write
                         i += 1;
+                        // DMAP bit3=1 => fixed; bit4 is ignored in that case.
                         cur_src = match addr_mode {
-                            2 => cur_src.wrapping_sub(1),
-                            1 => cur_src,
-                            3 => cur_src.wrapping_add(2),
-                            _ => cur_src.wrapping_add(1),
+                            0 => cur_src.wrapping_add(1), // inc
+                            2 => cur_src.wrapping_sub(1), // dec
+                            _ => cur_src,                 // fixed (1 or 3)
                         };
                         continue;
                     }
@@ -4961,7 +5150,8 @@ impl Bus {
                 }
             } else {
                 // PPU -> CPU転送（稀）
-                let dest_reg = 0x2100 + dest_base_full as u32; // simple read from base
+                let dest_offset = self.mdma_dest_offset(transfer_unit, dest_base_full, i as u8);
+                let dest_reg = 0x2100 + dest_offset as u32;
                 let data = self.read_u8(dest_reg);
                 self.write_u8(cur_src, data);
             }
@@ -4971,9 +5161,8 @@ impl Bus {
             let lo16 = (cur_src & 0x0000_FFFF) as u16;
             let next_lo16 = match addr_mode {
                 0 => lo16.wrapping_add(1), // inc
-                1 => lo16,                 // fixed
                 2 => lo16.wrapping_sub(1), // dec
-                _ => lo16.wrapping_add(1), // treat 3 as inc
+                _ => lo16,                 // fixed (1 or 3)
             } as u32;
             cur_src = bank | next_lo16;
             i += 1;
@@ -4990,6 +5179,147 @@ impl Bus {
         if bytes_transferred > 0 {
             let stall_master_cycles = 8u64.saturating_mul(bytes_transferred.saturating_add(1));
             self.add_pending_stall_master_cycles(stall_master_cycles);
+        }
+
+        // After WRAM->VRAM DMA completes, verify the target VRAM range matches the source buffer.
+        // This helps distinguish "VRAM write blocked/corrupted" vs "VRAM read-back wrong".
+        if trace_burnin_dma_mem
+            && cpu_to_ppu
+            && channel == 6
+            && transfer_unit == 1
+            && dest_base_full == 0x18
+            && src_addr == 0x7E4000
+            && transfer_size == 0x1000
+            && self.wram.len() >= 0x5000
+        {
+            let src = &self.wram[0x4000..0x5000];
+            let src_hash = fnv1a64(src);
+            let vram = self.ppu.get_vram();
+            let start = 0x5000usize.saturating_mul(2);
+            let end = start.saturating_add(0x1000).min(vram.len());
+            let vram_slice = &vram[start..end];
+            let vram_hash = fnv1a64(vram_slice);
+            println!(
+                "[BURNIN-DMAMEM] POSTWRITE pc={:06X} VMADD_end={:04X} src_hash={:016X} vram_hash={:016X} match={}",
+                self.last_cpu_pc,
+                self.ppu.dbg_vram_regs().0,
+                src_hash,
+                vram_hash,
+                (src_hash == vram_hash) as u8
+            );
+        }
+
+        // Before VRAM->WRAM DMA begins, fingerprint the VRAM range that should be read back.
+        if trace_burnin_dma_mem
+            && !cpu_to_ppu
+            && channel == 7
+            && transfer_unit == 1
+            && dest_base_full == 0x39
+            && src_addr == 0x7E4000
+            && transfer_size == 0x1000
+        {
+            let vram = self.ppu.get_vram();
+            let start = 0x5000usize.saturating_mul(2);
+            let end = start.saturating_add(0x1000).min(vram.len());
+            let vram_slice = &vram[start..end];
+            let vram_hash = fnv1a64(vram_slice);
+            println!(
+                "[BURNIN-DMAMEM] PREREAD pc={:06X} VMADD_start={:04X} vram_hash={:016X}",
+                self.last_cpu_pc,
+                self.ppu.dbg_vram_regs().0,
+                vram_hash
+            );
+        }
+
+        // Compare read-back buffer after VRAM->WRAM DMA completes.
+        if trace_burnin_dma_mem
+            && !cpu_to_ppu
+            && channel == 7
+            && transfer_unit == 1
+            && dest_base_full == 0x39
+            && src_addr == 0x7E4000
+            && transfer_size == 0x1000
+            && self.wram.len() >= 0x5000
+        {
+            let slice = &self.wram[0x4000..0x5000];
+            let mut sample = [0u8; 32];
+            for (seg, off) in [0x000usize, 0x100, 0x200, 0x300].into_iter().enumerate() {
+                let start = seg * 8;
+                sample[start..start + 8].copy_from_slice(&slice[off..off + 8]);
+            }
+            let hash = fnv1a64(slice);
+            let (vram_addr, vram_inc, vmain) = self.ppu.dbg_vram_regs();
+            let pc = self.last_cpu_pc;
+            let snap = *BURNIN_DMA_SNAP.get_or_init(|| Mutex::new(None)).lock().unwrap();
+            if let Some(s) = snap {
+                let ok = s.hash == hash;
+                println!(
+                    "[BURNIN-DMAMEM] READBACK pc={:06X} frame={} sl={} cyc={} vblank={} hblank={} fblank={} VMADD={:04X} VMAIN={:02X} inc={} hash={:016X} match={}",
+                    pc,
+                    self.ppu.get_frame(),
+                    self.ppu.get_scanline(),
+                    self.ppu.get_cycle(),
+                    self.ppu.is_vblank() as u8,
+                    self.ppu.is_hblank() as u8,
+                    self.ppu.is_forced_blank() as u8,
+                    vram_addr,
+                    vmain,
+                    vram_inc,
+                    hash,
+                    ok as u8
+                );
+                if !ok {
+                    // Count and summarize differences (byte-wise) to spot shifts vs corruption.
+                    let mut diff_count: u32 = 0;
+                    let mut first_diff: Option<usize> = None;
+                    for (i, (&a, &b)) in s.sample.iter().zip(sample.iter()).enumerate() {
+                        if a != b {
+                            diff_count = diff_count.saturating_add(1);
+                            if first_diff.is_none() {
+                                first_diff = Some(i);
+                            }
+                        }
+                    }
+                    println!(
+                        "[BURNIN-DMAMEM] mismatch: src(pc={:06X} VMADD={:04X} VMAIN={:02X} inc={} hash={:016X} sample={:02X?}) rb(sample={:02X?})",
+                        s.pc,
+                        s.vram_addr,
+                        s.vmain,
+                        s.vram_inc,
+                        s.hash,
+                        s.sample,
+                        sample
+                    );
+                    println!(
+                        "[BURNIN-DMAMEM] mismatch detail: sample_diff_bytes={} first_diff_idx={}",
+                        diff_count,
+                        first_diff.map(|v| v as i32).unwrap_or(-1)
+                    );
+                    // One-shot dump for offline diffing.
+                    let dumped = BURNIN_DMA_DUMPED
+                        .get_or_init(|| AtomicU32::new(0))
+                        .fetch_add(1, Ordering::Relaxed);
+                    if dumped == 0 {
+                        let src_wram = &self.wram[0x4000..0x5000];
+                        let vram = self.ppu.get_vram();
+                        let start = 0x5000usize.saturating_mul(2);
+                        let end = start.saturating_add(0x1000).min(vram.len());
+                        let vram_slice = &vram[start..end];
+                        let _ = std::fs::create_dir_all("logs");
+                        let _ = std::fs::write("logs/burnin_dmamem_src_wram.bin", src_wram);
+                        let _ = std::fs::write("logs/burnin_dmamem_rb_wram.bin", slice);
+                        let _ = std::fs::write("logs/burnin_dmamem_vram.bin", vram_slice);
+                        println!(
+                            "[BURNIN-DMAMEM] dumped logs/burnin_dmamem_src_wram.bin, logs/burnin_dmamem_rb_wram.bin, logs/burnin_dmamem_vram.bin"
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "[BURNIN-DMAMEM] READBACK pc={:06X} VMADD={:04X} VMAIN={:02X} inc={} hash={:016X} sample={:02X?} (no source snap)",
+                    pc, vram_addr, vmain, vram_inc, hash, sample
+                );
+            }
         }
 
         if capture_cgram && cgram_total > 0 {
@@ -5203,6 +5533,25 @@ impl CpuBus for Bus {
 
     fn set_last_cpu_pc(&mut self, pc24: u32) {
         self.last_cpu_pc = pc24;
+
+        // burn-in-test.sfc EXT LATCH: trace tight PC flow with PPU timing (opt-in).
+        // Useful to understand whether the latch pulse is occurring at the expected H/V position.
+        if std::env::var_os("TRACE_BURNIN_EXT_FLOW").is_some() {
+            let bank = (pc24 >> 16) as u8;
+            let pc = (pc24 & 0xFFFF) as u16;
+            if bank == 0x00 && (0x94C0..=0x9610).contains(&pc) {
+                println!(
+                    "[BURNIN-EXT][FLOW] PC={:06X} sl={} cyc={} frame={} vblank={} hblank={} wio=0x{:02X}",
+                    pc24,
+                    self.ppu.scanline,
+                    self.ppu.get_cycle(),
+                    self.ppu.get_frame(),
+                    self.ppu.is_vblank() as u8,
+                    self.ppu.is_hblank() as u8,
+                    self.wio
+                );
+            }
+        }
 
         // cputest-full.sfc: detect PASS/FAIL/Invalid by watching known PC points where it prints
         // the result string. This is used by headless runners to exit with an appropriate code.

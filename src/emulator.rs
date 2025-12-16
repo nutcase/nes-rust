@@ -2120,7 +2120,6 @@ impl Emulator {
         // Debug: Track loop iterations to detect infinite loops
         let mut loop_iterations = 0u64;
         // ループ検出の許容回数を環境変数で調整できるようにする。
-        // ・frame>=997: 10,000（従来）
         // ・初期フレーム(<=3): 5,000,000（VBlank待ちなどで多少重くても落とさない）
         // ・重いトレース有効時: 50,000,000 まで許容（WATCH_PC/TRACE_4210/TRACE_4218/TRACE_BRANCH など）
         // ・通常: 1,000,000
@@ -2130,9 +2129,7 @@ impl Emulator {
             || std::env::var_os("WATCH_PC").is_some()
             || std::env::var_os("WATCH_PC_FLOW").is_some()
             || std::env::var_os("TRACE_BRANCH").is_some();
-        let default_max = if frame_count >= 997 {
-            10_000
-        } else if tracing_heavy {
+        let default_max = if tracing_heavy {
             50_000_000
         } else if frame_count <= 3 {
             5_000_000
@@ -2429,14 +2426,21 @@ impl Emulator {
             // Measure CPU execution time
             let cpu_start = Instant::now();
             let before_pc = pc;
-            let cpu_cycles =
-                if batch_cycles > 8 && self.adaptive_timing && !self.debugger.is_paused() {
-                    // Use batch execution for performance
-                    self.cpu.step_multiple(&mut self.bus, batch_cycles)
-                } else {
-                    // Single step for accuracy or debugging
-                    self.cpu.step(&mut self.bus)
-                };
+            // Batch execution is a performance optimization but it breaks timing-sensitive
+            // software (e.g., official burn-in HV latch tests) because PPU/APU are stepped only
+            // once per batch. Keep it opt-in.
+            let batch_exec = std::env::var("CPU_BATCH")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false);
+            let cpu_cycles = if batch_exec
+                && batch_cycles > 8
+                && self.adaptive_timing
+                && !self.debugger.is_paused()
+            {
+                self.cpu.step_multiple(&mut self.bus, batch_cycles)
+            } else {
+                self.cpu.step(&mut self.bus)
+            };
             if std::env::var_os("TRACE_LOOP_CYCLES").is_some() && loop_iterations < 20 {
                 println!(
                     "[loop] iter={} cpu_cycles={} master_cycles={} pc={:02X}:{:04X}",
@@ -2797,36 +2801,72 @@ impl Emulator {
     }
 
     fn step_ppu(&mut self, cycles: u16) {
-        let old_scanline = self.bus.get_ppu().scanline;
-        let old_cycle = self.bus.get_ppu().get_cycle();
-        let was_hblank = self.bus.get_ppu().is_hblank();
-        self.bus.get_ppu_mut().step(cycles);
-        let new_scanline = self.bus.get_ppu().scanline;
-        let new_cycle = self.bus.get_ppu().get_cycle();
-        let is_hblank = self.bus.get_ppu().is_hblank();
-        let vis_last = self.bus.get_ppu().get_visible_height();
-        let vblank_start = vis_last.saturating_add(1);
-        let new_line_is_visible = new_scanline >= 1 && new_scanline <= vis_last;
+        // Step in bounded slices so we don't miss per-scanline events when a single call
+        // advances across HBlank and/or multiple scanlines (e.g., during MDMA stalls).
+        //
+        // In particular, the official burn-in tests rely on accurate HV-timer behavior.
+        // If we step across a scanline boundary in one lump, we must:
+        // - Run HDMA exactly at HBlank entry for that scanline (visible lines only)
+        // - Tick scanline-based timers on every scanline advance
+        // - Attribute HV-timer H-match to the correct scanline (before wrap)
+        let mut remaining = cycles;
+        const DOTS_PER_LINE: u16 = 341;
+        const FIRST_HBLANK_DOT: u16 = 22 + 256; // visible starts at 22, width=256
 
-        // H-Blank入りでHDMA実行（画面内ラインのみ）
-        if !was_hblank && is_hblank && new_line_is_visible {
-            // Guard a few dots at HBlank head for HDMA operations
-            self.bus.get_ppu_mut().on_hblank_start_guard();
-            self.bus.hdma_hblank();
-        }
-        // スキャンライン変更時はタイマを進める
-        if old_scanline != new_scanline {
-            self.bus.tick_timers();
-            // JOYBUSYの更新
-            self.bus.on_scanline_advance();
-            // VBlank突入検知
-            if old_scanline < vblank_start && new_scanline >= vblank_start {
-                self.bus.on_vblank_start();
+        while remaining > 0 {
+            let old_scanline = self.bus.get_ppu().scanline;
+            let old_cycle = self.bus.get_ppu().get_cycle();
+            let was_hblank = self.bus.get_ppu().is_hblank();
+
+            // Compute a slice that won't cross HBlank entry or scanline wrap.
+            let mut slice = remaining.min(DOTS_PER_LINE.saturating_sub(old_cycle).max(1));
+            if !was_hblank && old_cycle < FIRST_HBLANK_DOT {
+                slice = slice.min(FIRST_HBLANK_DOT - old_cycle);
+            }
+
+            self.bus.get_ppu_mut().step(slice);
+            remaining -= slice;
+
+            let new_scanline = self.bus.get_ppu().scanline;
+            let new_cycle = self.bus.get_ppu().get_cycle();
+            let is_hblank = self.bus.get_ppu().is_hblank();
+
+            // Update H/V timer progress for the segment we just stepped.
+            // If we wrapped to the next scanline, attribute the segment to the old scanline.
+            if old_scanline == new_scanline {
+                self.bus.tick_timers_hv(old_cycle, new_cycle, old_scanline);
+            } else {
+                self.bus
+                    .tick_timers_hv(old_cycle, DOTS_PER_LINE, old_scanline);
+            }
+
+            // H-Blank入りでHDMA実行（画面内ラインのみ）
+            if !was_hblank && is_hblank {
+                let vis_last = self.bus.get_ppu().get_visible_height();
+                let line_is_visible = old_scanline >= 1 && old_scanline <= vis_last;
+                if line_is_visible {
+                    // Guard a few dots at HBlank head for HDMA operations
+                    self.bus.get_ppu_mut().on_hblank_start_guard();
+                    self.bus.hdma_hblank();
+                }
+            }
+
+            // スキャンライン変更時はタイマを進める
+            if old_scanline != new_scanline {
+                self.bus.tick_timers();
+                // JOYBUSYの更新
+                self.bus.on_scanline_advance();
+                // VBlank突入検知
+                let vblank_start = self
+                    .bus
+                    .get_ppu()
+                    .get_visible_height()
+                    .saturating_add(1);
+                if old_scanline < vblank_start && new_scanline >= vblank_start {
+                    self.bus.on_vblank_start();
+                }
             }
         }
-
-        // H/V タイマーの進捗を更新
-        self.bus.tick_timers_hv(old_cycle, new_cycle, new_scanline);
     }
 
     fn handle_nmi(&mut self) {

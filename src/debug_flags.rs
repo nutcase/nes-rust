@@ -507,6 +507,12 @@ pub fn trace_burnin_v224() -> bool {
     *ON.get_or_init(|| env_flag("TRACE_BURNIN_V224", false))
 }
 
+// Burn-in test EXT LATCH / DMA MEMORY focused trace. Very verbose; enable only when needed.
+pub fn trace_burnin_ext_latch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_BURNIN_EXT_LATCH", false))
+}
+
 // CPU trace / verbose instruction logs (very noisy)
 pub fn trace() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
