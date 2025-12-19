@@ -847,7 +847,8 @@ impl Ppu {
             main_layer_id = 5; // Backdrop layer id
         }
         let (sub_color, sub_layer_id) = self.render_sub_screen_pixel_with_layer(x as u16, y as u16);
-        let final_color = if self.pseudo_hires {
+        let hires_out = self.pseudo_hires || matches!(self.bg_mode, 5 | 6);
+        let final_color = if hires_out {
             let even_mix =
                 self.apply_color_math_screens(main_color, sub_color, main_layer_id, x as u16);
             let odd_mix =
@@ -1781,11 +1782,14 @@ impl Ppu {
                 }
             }
             5 | 6 => {
-                // Only BG1 relevant in practice
-                if pr >= 1 {
-                    80
-                } else {
-                    60
+                // Mode 5/6: BG1 and BG2 have distinct priority slots.
+                // Order (front->back) from SNESdev: OBJ3, BG1H, OBJ2, BG2H, OBJ1, BG1L, OBJ0, BG2L.
+                // We map into the generic OBJ z-ranks (90/70/50/40) by placing BG ranks between them.
+                match (layer, pr) {
+                    (0, 1) => 80, // BG1 high
+                    (1, 1) => 60, // BG2 high
+                    (0, _) => 45, // BG1 low
+                    _ => 35,      // BG2 low (and any other BG)
                 }
             }
             7 => {
@@ -2359,11 +2363,51 @@ impl Ppu {
     }
 
     fn render_bg_mode5_with_priority(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
-        self.render_bg_mode5(x, y, bg_num)
+        self.render_bg_mode5(x, y, bg_num, true)
     }
 
     fn render_bg_mode6_with_priority(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
-        self.render_bg_mode6(x, y, bg_num)
+        self.render_bg_mode6(x, y, bg_num, true)
+    }
+
+    #[inline]
+    fn sample_tile_2bpp(&self, tile_base: u16, tile_id: u16, px: u8, py: u8) -> u8 {
+        // 2bpp tile = 8 words (16 bytes)
+        let tile_addr = tile_base.wrapping_add(tile_id.wrapping_mul(8)) & 0x7FFF;
+        let row_word = tile_addr.wrapping_add(py as u16) & 0x7FFF;
+        let plane0_addr = (row_word as usize) * 2;
+        let plane1_addr = plane0_addr + 1;
+        if plane1_addr >= self.vram.len() {
+            return 0;
+        }
+        let plane0 = self.vram[plane0_addr];
+        let plane1 = self.vram[plane1_addr];
+        let bit = 7 - px;
+        (((plane1 >> bit) & 1) << 1) | ((plane0 >> bit) & 1)
+    }
+
+    #[inline]
+    fn sample_tile_4bpp(&self, tile_base: u16, tile_id: u16, px: u8, py: u8) -> u8 {
+        // 4bpp tile = 16 words (32 bytes)
+        let tile_addr = (tile_base.wrapping_add(tile_id.wrapping_mul(16))) & 0x7FFF;
+        let row01_word = (tile_addr.wrapping_add(py as u16)) & 0x7FFF;
+        let row23_word = (tile_addr.wrapping_add(8).wrapping_add(py as u16)) & 0x7FFF;
+        let plane0_addr = (row01_word as usize) * 2;
+        let plane1_addr = plane0_addr + 1;
+        let plane2_addr = (row23_word as usize) * 2;
+        let plane3_addr = plane2_addr + 1;
+        if plane3_addr >= self.vram.len() {
+            return 0;
+        }
+        let plane0 = self.vram[plane0_addr];
+        let plane1 = self.vram[plane1_addr];
+        let plane2 = self.vram[plane2_addr];
+        let plane3 = self.vram[plane3_addr];
+        let bit = 7 - px;
+        (((plane3 >> bit) & 1) << 3)
+            | (((plane2 >> bit) & 1) << 2)
+            | (((plane1 >> bit) & 1) << 1)
+            | ((plane0 >> bit) & 1)
     }
 
     fn render_bg_mode0(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
@@ -3261,60 +3305,123 @@ impl Ppu {
         self.render_bg_4bpp(sx, sy, bg_num)
     }
 
-    fn render_bg_mode5(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
-        // Mode 5: BG1は4bpp、BG2は2bpp（高解像度512x448）
-        // 簡素化実装：通常解像度でサンプリング
-        // Note: Some games (e.g., DQ3) use BG3 as an additional 4bpp layer
-        match bg_num {
-            0 => {
-                // BG1: 4bpp with enhanced sampling
-                let (color, priority) = self.render_bg_4bpp(x, y, 0);
-                // Mode 5では倍率スケーリングを適用
-                if color != 0 {
-                    let enhanced_color = self.apply_hires_enhancement(color);
-                    (enhanced_color, priority)
-                } else {
-                    (color, priority)
-                }
-            }
-            1 => {
-                // BG2: 2bpp with enhanced sampling
-                let (color, priority) = self.render_bg_mode0(x, y, 1);
-                if color != 0 {
-                    let enhanced_color = self.apply_hires_enhancement(color);
-                    (enhanced_color, priority)
-                } else {
-                    (color, priority)
-                }
-            }
-            2 => {
-                // BG3: 4bpp (non-standard, but used by some games)
-                let (color, priority) = self.render_bg_4bpp(x, y, 2);
-                if color != 0 {
-                    let enhanced_color = self.apply_hires_enhancement(color);
-                    (enhanced_color, priority)
-                } else {
-                    (color, priority)
-                }
-            }
-            _ => (0, 0),
+    fn render_bg_mode5(&self, x: u16, y: u16, bg_num: u8, is_main: bool) -> (u32, u8) {
+        // Mode 5 (hi-res): BG tiles are effectively 16px wide by pairing tiles horizontally.
+        // Background layers are de-interleaved between main/sub screens (even/odd columns).
+        //
+        // We keep a 256-wide framebuffer and treat the main screen as the even columns and
+        // the sub screen as the odd columns. So BG sampling uses a doubled X coordinate with
+        // a phase offset based on which screen we are rendering.
+        if bg_num > 2 {
+            return (0, 0);
         }
+
+        let tile_base = match bg_num {
+            0 => self.bg1_tile_base,
+            1 => self.bg2_tile_base,
+            2 => self.bg3_tile_base,
+            _ => 0,
+        };
+        let tilemap_base = match bg_num {
+            0 => self.bg1_tilemap_base,
+            1 => self.bg2_tilemap_base,
+            2 => self.bg3_tilemap_base,
+            _ => 0,
+        } as u32;
+        let ss = self.bg_screen_size[bg_num as usize];
+        let width_tiles = if ss == 1 || ss == 3 { 64 } else { 32 } as u16;
+        let height_tiles = if ss == 2 || ss == 3 { 64 } else { 32 } as u16;
+
+        let tile_w: u16 = 16;
+        let tile_h: u16 = if self.bg_tile_16[bg_num as usize] {
+            16
+        } else {
+            8
+        };
+        let wrap_x = width_tiles * tile_w;
+        let wrap_y = height_tiles * tile_h;
+
+        let phase: u16 = if is_main { 0 } else { 1 };
+        let x_hires = x.wrapping_mul(2).wrapping_add(phase);
+
+        let (scroll_x, scroll_y) = match bg_num {
+            0 => (self.bg1_hscroll, self.bg1_vscroll),
+            1 => (self.bg2_hscroll, self.bg2_vscroll),
+            2 => (self.bg3_hscroll, self.bg3_vscroll),
+            _ => (0, 0),
+        };
+        let bg_x = (x_hires.wrapping_add(scroll_x)) % wrap_x;
+        let bg_y = (y.wrapping_add(scroll_y)) % wrap_y;
+
+        let tile_x = bg_x / tile_w;
+        let tile_y = bg_y / tile_h;
+
+        let (map_tx, map_ty) = (tile_x % 32, tile_y % 32);
+        let scx = (tile_x / 32) as u32;
+        let scy = (tile_y / 32) as u32;
+        let width_screens = if ss == 1 || ss == 3 { 2 } else { 1 } as u32;
+        let quadrant = scx + scy * width_screens;
+        let map_entry_word_addr = tilemap_base
+            .saturating_add(quadrant * 0x400)
+            .saturating_add((map_ty as u32) * 32 + map_tx as u32)
+            & 0x7FFF;
+        let map_entry_addr = (map_entry_word_addr * 2) as usize;
+        if map_entry_addr + 1 >= self.vram.len() {
+            return (0, 0);
+        }
+        let lo = self.vram[map_entry_addr];
+        let hi = self.vram[map_entry_addr + 1];
+        let entry = ((hi as u16) << 8) | (lo as u16);
+
+        let mut tile_id = entry & 0x03FF;
+        let palette = ((entry >> 10) & 0x07) as u8;
+        let flip_x = (entry & 0x4000) != 0;
+        let flip_y = (entry & 0x8000) != 0;
+        let priority = (entry & 0x2000) != 0;
+
+        let mut rel_x = (bg_x % tile_w) as u8; // 0..15 (even/odd depends on screen phase)
+        let mut rel_y = (bg_y % tile_h) as u8; // 0..7 or 0..15
+        if flip_x {
+            rel_x = (tile_w as u8 - 1) - rel_x;
+        }
+        if flip_y {
+            rel_y = (tile_h as u8 - 1) - rel_y;
+        }
+
+        // Select the paired tile horizontally, and optionally vertically (when tile_h=16).
+        let sub_x = (rel_x / 8) as u16; // 0 or 1
+        let sub_y = if tile_h == 16 { (rel_y / 8) as u16 } else { 0 };
+        tile_id = tile_id
+            .wrapping_add(sub_x)
+            .wrapping_add(sub_y.wrapping_mul(16));
+        rel_x %= 8;
+        rel_y %= 8;
+
+        let color_index = match bg_num {
+            0 | 2 => self.sample_tile_4bpp(tile_base, tile_id, rel_x, rel_y),
+            1 => self.sample_tile_2bpp(tile_base, tile_id, rel_x, rel_y),
+            _ => 0,
+        };
+        if color_index == 0 {
+            return (0, 0);
+        }
+
+        let bpp = if bg_num == 1 { 2 } else { 4 };
+        let palette_index = self.get_bg_palette_index(palette, color_index, bpp);
+        let color = self.cgram_to_rgb(palette_index);
+        let priority_value = if priority { 1 } else { 0 };
+        (color, priority_value)
     }
 
-    fn render_bg_mode6(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_mode6(&self, x: u16, y: u16, bg_num: u8, is_main: bool) -> (u32, u8) {
         // Mode 6: BG1は4bpp（高解像度512x448）
-        if bg_num == 0 {
-            let (color, priority) = self.render_bg_4bpp(x, y, 0);
-            // Mode 6では高解像度エンハンスメントを適用
-            if color != 0 {
-                let enhanced_color = self.apply_hires_enhancement(color);
-                (enhanced_color, priority)
-            } else {
-                (color, priority)
-            }
-        } else {
-            (0, 0) // Mode 6 only uses BG1
+        if bg_num != 0 {
+            return (0, 0);
         }
+
+        // Use the Mode 5 sampling rules for BG1 (16px wide tiles + main/sub phase),
+        // but only BG1 is displayed in Mode 6.
+        self.render_bg_mode5(x, y, 0, is_main)
     }
 
     fn apply_hires_enhancement(&self, color: u32) -> u32 {
@@ -6263,7 +6370,7 @@ impl Ppu {
         bg_layers
             .into_iter()
             .filter(|(c, _, _)| *c != 0)
-            .max_by_key(|(_, p, n)| (*p, *n))
+            .max_by_key(|(_, p, n)| (self.z_rank_for_bg(*n, *p), *n))
             .unwrap_or((0, 0, 0))
     }
 
@@ -6401,13 +6508,13 @@ impl Ppu {
             }
             5 => {
                 if self.sub_screen_designation & 0x01 != 0 && !self.should_mask_bg(x, 0, false) {
-                    let (color, priority) = self.render_bg_mode5(x, y, 0);
+                    let (color, priority) = self.render_bg_mode5(x, y, 0, false);
                     if color != 0 {
                         bg_results.push((color, priority, 0));
                     }
                 }
                 if self.sub_screen_designation & 0x02 != 0 && !self.should_mask_bg(x, 1, false) {
-                    let (color, priority) = self.render_bg_mode5(x, y, 1);
+                    let (color, priority) = self.render_bg_mode5(x, y, 1, false);
                     if color != 0 {
                         bg_results.push((color, priority, 1));
                     }
@@ -6415,7 +6522,7 @@ impl Ppu {
             }
             6 => {
                 if self.sub_screen_designation & 0x01 != 0 && !self.should_mask_bg(x, 0, false) {
-                    let (color, priority) = self.render_bg_mode6(x, y, 0);
+                    let (color, priority) = self.render_bg_mode6(x, y, 0, false);
                     if color != 0 {
                         bg_results.push((color, priority, 0));
                     }
@@ -6439,7 +6546,7 @@ impl Ppu {
         // 最も高いプライオリティのBGを返す
         bg_results
             .into_iter()
-            .max_by_key(|(_, p, n)| (*p, *n))
+            .max_by_key(|(_, p, n)| (self.z_rank_for_bg(*n, *p), *n))
             .unwrap_or((0, 0, 0))
     }
 
@@ -6796,8 +6903,23 @@ impl Ppu {
             self.scanline, self.cycle, self.frame
         );
         println!(
+            "Mode: {} (BG3prio={}), SETINI=0x{:02X} (pseudo_hires={}, interlace={}, obj_interlace={}, overscan={}, extbg={})",
+            self.bg_mode,
+            self.mode1_bg3_priority,
+            self.setini,
+            self.pseudo_hires,
+            self.interlace,
+            self.obj_interlace,
+            self.overscan,
+            self.extbg
+        );
+        println!(
             "Main Screen: 0x{:02X}, Sub Screen: 0x{:02X}",
             self.main_screen_designation, self.sub_screen_designation
+        );
+        println!(
+            "Color Math: CGWSEL=0x{:02X} CGADSUB=0x{:02X} fixed=0x{:04X}",
+            self.cgwsel, self.cgadsub, self.fixed_color
         );
         println!("Screen Display: 0x{:02X}", self.screen_display);
         println!("NMI: enabled={}, flag={}", self.nmi_enabled, self.nmi_flag);
@@ -6818,6 +6940,17 @@ impl Ppu {
         println!(
             "BG4: tilemap=0x{:04X}, tile=0x{:04X}, scroll=({},{})",
             self.bg4_tilemap_base, self.bg4_tile_base, self.bg4_hscroll, self.bg4_vscroll
+        );
+        println!(
+            "BG tile16: [{},{},{},{}] screen_size: [{},{},{},{}]",
+            self.bg_tile_16[0],
+            self.bg_tile_16[1],
+            self.bg_tile_16[2],
+            self.bg_tile_16[3],
+            self.bg_screen_size[0],
+            self.bg_screen_size[1],
+            self.bg_screen_size[2],
+            self.bg_screen_size[3]
         );
 
         // スプライト設定
