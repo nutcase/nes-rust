@@ -4673,10 +4673,8 @@ impl Ppu {
                 // BG1SC ($2107):
                 // - bits 0-1: screen size
                 // - bits 2-7: tilemap base in units of 0x400 bytes (1KB)
-                // Tilemap VRAM address is a *word* address: AAAAAA << 10 (1 KiW = 2 KiB pages).
-                // We store word addresses to match the renderer.
-                // Store base as VRAM *word* address.
-                // Fullsnes/SNESdev: base word address = (value & 0xFC) << 8
+                // Tilemap base is stored as VRAM *word* address.
+                // Common reference formula (SNESdev): base word address = (value & 0xFC) << 8.
                 self.bg1_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[0] = value & 0x03;
                 if !crate::debug_flags::quiet() {
