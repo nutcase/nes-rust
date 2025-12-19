@@ -1218,9 +1218,8 @@ impl Ppu {
                     changed = true;
                 }
                 if changed {
-                    if self.can_read_vram_now() {
-                        self.reload_vram_read_latch();
-                    }
+                    // SNESdev wiki: On VMADD write, vram_latch = [VMADD]
+                    self.reload_vram_read_latch();
                 }
             }
         }
@@ -4103,13 +4102,10 @@ impl Ppu {
 
     #[inline]
     fn reload_vram_read_latch(&mut self) {
-        // In strict timing mode, only allow VRAM latch reads during VBlank or forced blank.
-        if crate::debug_flags::strict_ppu_timing() {
-            let vblank_start = self.get_visible_height().saturating_add(1);
-            let forced_blank = (self.screen_display & 0x80) != 0;
-            if !(self.v_blank || self.scanline >= vblank_start || forced_blank) {
-                return;
-            }
+        // SNESdev wiki: VRAM reads via $2139/$213A are only valid during VBlank or forced blank.
+        // Outside those periods, the latch is not updated (returns invalid/old data).
+        if !self.can_read_vram_now() {
+            return;
         }
 
         let masked = self.vram_remap_word_addr(self.vram_addr) as usize;
@@ -4437,62 +4433,31 @@ impl Ppu {
                     }
                 }
 
-                // Detect and log DMA/HDMA writes to INIDISP
+                // DMA/HDMA writes to INIDISP ($2100) are valid on real hardware.
+                // We only block them when explicitly requested for debugging.
                 if self.write_ctx != 0 {
-                    // Mario 起動安定化: HDMA/MDMA からの INIDISP 書き込みは無効化
-                    let allow_dma_write = std::env::var("ALLOW_INIDISP_DMA")
-                        .map(|v| v == "1" || v.to_lowercase() == "true")
-                        .unwrap_or(false);
-                    if !allow_dma_write {
+                    if crate::debug_flags::block_inidisp_dma() {
                         return;
                     }
-                    let source = match self.write_ctx {
-                        1 => "MDMA",
-                        2 => "HDMA",
-                        _ => "unknown",
-                    };
-                    let ch = self.debug_dma_channel.unwrap_or(0xFF);
-
-                    static mut INIDISP_DMA_WRITE_COUNT: u32 = 0;
-                    static mut INIDISP_DMA_BLANK_ON: u32 = 0;
-                    static mut INIDISP_DMA_BLANK_OFF: u32 = 0;
-
-                    unsafe {
-                        INIDISP_DMA_WRITE_COUNT += 1;
-                        let is_blank_on = (value & 0x80) != 0;
-                        if is_blank_on {
-                            INIDISP_DMA_BLANK_ON += 1;
-                        } else {
-                            INIDISP_DMA_BLANK_OFF += 1;
-                        }
-
-                        // Log first 20 occurrences or when environment variable is set
-                        if std::env::var_os("DEBUG_INIDISP_DMA").is_some()
-                            || INIDISP_DMA_WRITE_COUNT <= 20
-                        {
-                            println!(
-                                "⚠️  {} write to INIDISP #{} (ch={}): value=0x{:02X} (blank={} brightness={}) [total: {} on={} off={}]",
-                                source,
-                                INIDISP_DMA_WRITE_COUNT,
-                                if ch == 0xFF { -1 } else { ch as i32 },
-                                value,
-                                if is_blank_on { "ON" } else { "OFF" },
-                                value & 0x0F,
-                                INIDISP_DMA_WRITE_COUNT,
-                                INIDISP_DMA_BLANK_ON,
-                                INIDISP_DMA_BLANK_OFF
-                            );
-                        }
-                    }
-
-                    // Allow DMA/HDMA writes to INIDISP?
-                    // Mario 黒画面対策: デフォルトを「許可しない」に変更。必要なら env で明示的に許可。
-                    let allow_dma_write = std::env::var("ALLOW_INIDISP_DMA")
-                        .map(|v| v == "1" || v.to_lowercase() == "true")
-                        .unwrap_or(false);
-
-                    if !allow_dma_write {
-                        return;
+                    if std::env::var_os("DEBUG_INIDISP_DMA").is_some()
+                        && !crate::debug_flags::quiet()
+                    {
+                        let source = match self.write_ctx {
+                            1 => "MDMA",
+                            2 => "HDMA",
+                            _ => "unknown",
+                        };
+                        let ch = self.debug_dma_channel.unwrap_or(0xFF);
+                        println!(
+                            "[INIDISP-DMA] {} ch={} scanline={} cyc={} value=0x{:02X} blank={} brightness={}",
+                            source,
+                            if ch == 0xFF { -1 } else { ch as i32 },
+                            self.scanline,
+                            self.cycle,
+                            value,
+                            ((value & 0x80) != 0) as u8,
+                            value & 0x0F,
+                        );
                     }
                 }
 
@@ -4857,9 +4822,8 @@ impl Ppu {
             0x16 => {
                 if self.can_commit_vmadd_now() {
                     self.vram_addr = (self.vram_addr & 0xFF00) | (value as u16);
-                    if self.can_read_vram_now() {
-                        self.reload_vram_read_latch();
-                    }
+                    // SNESdev wiki: On VMADD write, vram_latch = [VMADD]
+                    self.reload_vram_read_latch();
                 } else {
                     self.latched_vmadd_lo = Some(value);
                 }
@@ -4880,9 +4844,8 @@ impl Ppu {
             0x17 => {
                 if self.can_commit_vmadd_now() {
                     self.vram_addr = (self.vram_addr & 0x00FF) | ((value as u16) << 8);
-                    if self.can_read_vram_now() {
-                        self.reload_vram_read_latch();
-                    }
+                    // SNESdev wiki: On VMADD write, vram_latch = [VMADD]
+                    self.reload_vram_read_latch();
                 } else {
                     self.latched_vmadd_hi = Some(value);
                 }
@@ -4971,8 +4934,21 @@ impl Ppu {
                                 _ => "CPU",
                             };
                             println!(
-                                "[BURNIN-VRAM-WRITE] {} ch={} frame={} sl={} cyc={} VMADD={:04X} $2118={:02X}",
-                                who, dma_ch, self.frame, self.scanline, self.cycle, masked_addr, value
+                                "[BURNIN-VRAM-WRITE] {} ch={} frame={} sl={} cyc={} vblank={} hblank={} fblank={} vis_h={} VMAIN={:02X} inc={} raw={:04X} masked={:04X} $2118={:02X}",
+                                who,
+                                dma_ch,
+                                self.frame,
+                                self.scanline,
+                                self.cycle,
+                                self.v_blank as u8,
+                                self.h_blank as u8,
+                                ((self.screen_display & 0x80) != 0) as u8,
+                                self.get_visible_height(),
+                                self.vram_mapping,
+                                self.vram_increment,
+                                self.vram_addr,
+                                masked_addr,
+                                value
                             );
                         }
                     }
@@ -5072,8 +5048,21 @@ impl Ppu {
                                 _ => "CPU",
                             };
                             println!(
-                                "[BURNIN-VRAM-WRITE] {} ch={} frame={} sl={} cyc={} VMADD={:04X} $2119={:02X}",
-                                who, dma_ch, self.frame, self.scanline, self.cycle, masked_addr, value
+                                "[BURNIN-VRAM-WRITE] {} ch={} frame={} sl={} cyc={} vblank={} hblank={} fblank={} vis_h={} VMAIN={:02X} inc={} raw={:04X} masked={:04X} $2119={:02X}",
+                                who,
+                                dma_ch,
+                                self.frame,
+                                self.scanline,
+                                self.cycle,
+                                self.v_blank as u8,
+                                self.h_blank as u8,
+                                ((self.screen_display & 0x80) != 0) as u8,
+                                self.get_visible_height(),
+                                self.vram_mapping,
+                                self.vram_increment,
+                                self.vram_addr,
+                                masked_addr,
+                                value
                             );
                         }
                     }

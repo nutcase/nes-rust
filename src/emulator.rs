@@ -2318,7 +2318,10 @@ impl Emulator {
             // (This helps distinguish "PPU flag wrong" vs "check happens before scanline".)
             if crate::debug_flags::trace_burnin_obj_checks()
                 && pc >> 16 == 0x00
-                && matches!(pc & 0xFFFF, 0x9AC4 | 0x9AEC | 0x9B61 | 0x9B8E | 0x9BD0 | 0x9BD8)
+                && matches!(
+                    pc & 0xFFFF,
+                    0x9AC4 | 0x9AEC | 0x9B61 | 0x9B8E | 0x9BD0 | 0x9BD8
+                )
             {
                 let ppu_frame = self.bus.get_ppu().get_frame();
                 let ppu_sl = self.bus.get_ppu().scanline;
@@ -2857,11 +2860,7 @@ impl Emulator {
                 // JOYBUSYの更新
                 self.bus.on_scanline_advance();
                 // VBlank突入検知
-                let vblank_start = self
-                    .bus
-                    .get_ppu()
-                    .get_visible_height()
-                    .saturating_add(1);
+                let vblank_start = self.bus.get_ppu().get_visible_height().saturating_add(1);
                 if old_scanline < vblank_start && new_scanline >= vblank_start {
                     self.bus.on_vblank_start();
                 }

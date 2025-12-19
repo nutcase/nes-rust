@@ -22,6 +22,7 @@ impl Timer {
 
     pub fn reset(&mut self) {
         self.is_running = false;
+        self.ticks = 0;
         self.target = 0;
         self.counter_low = 0;
         self.counter_high = 0;
@@ -48,8 +49,8 @@ impl Timer {
     }
 
     pub fn set_start_stop_bit(&mut self, value: bool) {
-        // Writing 1 restarts the timer even if already running.
-        if value {
+        // A transition from clear to set (0 -> 1) resets the timer.
+        if value && !self.is_running {
             self.ticks = 0;
             self.counter_low = 0;
             self.counter_high = 0;
@@ -59,6 +60,17 @@ impl Timer {
 
     pub fn set_target(&mut self, value: u8) {
         self.target = value;
+    }
+
+    pub fn debug_state(&self) -> (i32, bool, u8, u8, u8, i32) {
+        (
+            self.ticks,
+            self.is_running,
+            self.target,
+            self.counter_low,
+            self.counter_high,
+            self.resolution,
+        )
     }
 
     pub fn read_counter(&mut self) -> u8 {

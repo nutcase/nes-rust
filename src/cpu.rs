@@ -246,7 +246,11 @@ impl Cpu {
             }
         }
 
-        if bus.poll_nmi() {
+        let has_deferred = self.core.has_deferred_instruction();
+
+        // If an instruction was prefetched and then delayed by MDMA, do not service
+        // interrupts until after that instruction has executed (matches hardware behavior).
+        if !has_deferred && bus.poll_nmi() {
             bus.begin_cpu_instruction();
             let cycles = crate::cpu_core::service_nmi(self.core.state_mut(), bus);
             self.sync_cpu_from_core();
@@ -254,7 +258,9 @@ impl Cpu {
             return cycles;
         }
 
-        let irq_pending = {
+        let irq_pending = if has_deferred {
+            false
+        } else {
             let state = self.core.state();
             !state.p.contains(StatusFlags::IRQ_DISABLE) && bus.poll_irq()
         };
@@ -294,8 +300,34 @@ impl Cpu {
         self.debug_instruction_count = self.debug_instruction_count.wrapping_add(1);
 
         // デバッグ用に現在のPCをバスへ通知（DMAレジスタ書き込みの追跡に使用）
-        let pc24 = ((state_before.pb as u32) << 16) | state_before.pc as u32;
+        let pc24 = self
+            .core
+            .deferred_full_addr()
+            .unwrap_or(((state_before.pb as u32) << 16) | state_before.pc as u32);
         bus.set_last_cpu_pc(pc24);
+
+        // burn-in-test.sfc: CPU-side APU check disassembly aid (opt-in).
+        if std::env::var_os("TRACE_BURNIN_APU_CHECK").is_some()
+            && state_before.pb == 0x00
+            && state_before.pc == 0x863F
+        {
+            let mut bytes = [0u8; 8];
+            for i in 0..bytes.len() as u32 {
+                bytes[i as usize] = bus.read_u8(pc24.wrapping_add(i));
+            }
+            println!(
+                "[BURNIN-CPU-APU] PC=00:{:04X} bytes={:02X?} A={:04X} X={:04X} Y={:04X} DP={:04X} DB={:02X} P={:02X} emu={}",
+                state_before.pc,
+                bytes,
+                state_before.a,
+                state_before.x,
+                state_before.y,
+                state_before.dp,
+                state_before.db,
+                state_before.p.bits(),
+                state_before.emulation_mode as u8
+            );
+        }
 
         // burn-in-test.sfc: trace ROM-side OBJ overflow checks (quiet, few lines).
         if crate::debug_flags::trace_burnin_obj_checks()
@@ -678,6 +710,44 @@ impl Cpu {
                         print!("{:02X} ", b);
                     }
                     println!();
+                    // burn-in-test など: DP上の簡易パラメータ/文字列ポインタを覗けるようにする
+                    // 0x20..0x2F は多くの小型ルーチンで引数領域として使われることがある
+                    print!("  DP20..2F: ");
+                    for i in 0..16u32 {
+                        let addr = dbase + 0x20 + i;
+                        let b = bus.read_u8(addr);
+                        print!("{:02X} ", b);
+                    }
+                    println!();
+                    // DP+22/23 を 16bit ポインタとして解釈し、DBR バンクで短いASCIIを表示
+                    let p22 = bus.read_u8(dbase + 0x22) as u16;
+                    let p23 = bus.read_u8(dbase + 0x23) as u16;
+                    let ptr16 = (p23 << 8) | p22;
+                    let ptr24 = ((state_before.db as u32) << 16) | (ptr16 as u32);
+                    let mut s = String::new();
+                    for i in 0..8u32 {
+                        let b = bus.read_u8(ptr24 + i);
+                        if b == 0 {
+                            break;
+                        }
+                        let c = b as char;
+                        if c.is_ascii_graphic() || c == ' ' {
+                            s.push(c);
+                        } else {
+                            break;
+                        }
+                    }
+                    if !s.is_empty() {
+                        println!(
+                            "  DP22/23 ptr={:02X}:{:04X} \"{}\" (DBR={:02X})",
+                            state_before.db, ptr16, s, state_before.db
+                        );
+                    } else {
+                        println!(
+                            "  DP22/23 ptr={:02X}:{:04X} (DBR={:02X})",
+                            state_before.db, ptr16, state_before.db
+                        );
+                    }
                     // Dump stack top 8 bytes (after current SP)
                     let mut sbytes = [0u8; 8];
                     for i in 0..8u16 {

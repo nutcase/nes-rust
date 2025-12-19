@@ -23,6 +23,7 @@ pub struct StepResult {
 #[derive(Debug, Clone)]
 pub struct Core {
     pub state: CoreState,
+    deferred_fetch: Option<FetchResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,16 +69,55 @@ impl Core {
     pub fn new(default_flags: StatusFlags, emulation_mode: bool) -> Self {
         Self {
             state: CoreState::new(default_flags, emulation_mode),
+            deferred_fetch: None,
         }
     }
 
     pub fn reset(&mut self, default_flags: StatusFlags, emulation_mode: bool) {
         self.state = CoreState::new(default_flags, emulation_mode);
+        self.deferred_fetch = None;
+    }
+
+    #[inline]
+    pub fn has_deferred_instruction(&self) -> bool {
+        self.deferred_fetch.is_some()
+    }
+
+    #[inline]
+    pub fn deferred_full_addr(&self) -> Option<u32> {
+        self.deferred_fetch.as_ref().map(|f| f.full_addr)
     }
 
     pub fn step<B: CpuBus>(&mut self, bus: &mut B) -> StepResult {
+        // If an MDMA started after the previous opcode fetch, we deferred executing that
+        // instruction until after the DMA stall time elapsed (hardware behavior).
+        if let Some(fetch) = self.deferred_fetch.take() {
+            let opcode = fetch.opcode;
+            let mut cycles = execute_instruction_generic(&mut self.state, opcode, bus);
+            // The opcode fetch cycle (and any memspeed penalty) was already accounted for in
+            // the previous step, so subtract the opcode fetch here.
+            cycles = cycles.saturating_sub(1);
+            return StepResult { cycles, fetch };
+        }
+
         let fetch = fetch_opcode_generic(&mut self.state, bus);
         let opcode = fetch.opcode;
+
+        // If the bus started MDMA after this opcode fetch, return early with only the opcode
+        // fetch time (1 cycle + optional wait state). The instruction will be executed on the
+        // next CPU step after the DMA stall has been consumed by the main loop.
+        if bus.take_dma_start_event() {
+            self.deferred_fetch = Some(fetch.clone());
+            if fetch.memspeed_penalty != 0 {
+                self.state.cycles = self
+                    .state
+                    .cycles
+                    .wrapping_add(fetch.memspeed_penalty as u64);
+            }
+            let cycles = 1u8.saturating_add(fetch.memspeed_penalty);
+            return StepResult { cycles, fetch };
+        }
+
         let mut cycles = execute_instruction_generic(&mut self.state, opcode, bus);
         if fetch.memspeed_penalty != 0 {
             self.state.cycles = self

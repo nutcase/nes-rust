@@ -34,7 +34,10 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-FRAMES=${HEADLESS_FRAMES:-2500}
+# Note: With more accurate HV latch/APU timing, the full burn-in suite can take
+# several thousand frames to finish. Default to a higher value so the final
+# framebuffer is likely to be the results screen.
+FRAMES=${HEADLESS_FRAMES:-8000}
 TAIL_LINES=${BURNIN_TAIL_LINES:-60}
 TMP_LOG="$(mktemp -t snes-burnin.XXXXXX.log)"
 trap '[[ -n "$TMP_LOG" && -f "$TMP_LOG" && -z "${BURNIN_KEEP_LOG:-}" ]] && rm -f "$TMP_LOG"' EXIT
@@ -102,10 +105,11 @@ def get(x: int, y: int):
     idx = (y * w + x) * 3
     return pix[idx], pix[idx + 1], pix[idx + 2]
 
-# The PASS/FAIL status column is on the right side; sample a fixed region
-# that excludes the bottom sprite strip.
+# The PASS/FAIL status column is on the right side. Sample a fixed region that:
+# - covers all rows (including the early "DMA MEMORY" row), and
+# - excludes the bottom sprite strip (Mario row).
 x0, x1 = 200, 255
-y0, y1 = 120, 200
+y0, y1 = 40, 200
 red = green = other = 0
 for y in range(y0, y1):
     for x in range(x0, x1):

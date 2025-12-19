@@ -14,6 +14,15 @@ pub trait CpuBus {
     fn opcode_memory_penalty(&mut self, _addr: u32) -> u8 {
         0
     }
+
+    /// Returns true once if a general DMA (MDMAEN) started immediately after the last opcode fetch.
+    ///
+    /// This is used to model the SNES timing note that MDMA begins after the *next opcode fetch*.
+    /// When true, the CPU core can defer executing the fetched instruction until after the DMA
+    /// stall time has elapsed (matching real hardware behavior more closely).
+    fn take_dma_start_event(&mut self) -> bool {
+        false
+    }
     fn poll_nmi(&mut self) -> bool {
         false
     }

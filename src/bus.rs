@@ -64,6 +64,9 @@ pub struct Bus {
     //   $4202-$4206 等の時間依存I/Oをより正確に進める。
     cpu_instr_active: bool,
     cpu_instr_bus_cycles: u8,
+    // CPUアクセスのウェイト状態（Fast/Slow/JOYSER）を master cycles で積む。
+    // ベースは 6 master cycles/CPU cycle としているため、差分（+2/+6）だけをここに蓄積する。
+    cpu_instr_extra_master_cycles: u64,
 
     // IRQ/Timer
     irq_h_enabled: bool,             // $4200 bit4
@@ -96,7 +99,13 @@ pub struct Bus {
     dma_dest_hist: [u32; 256],
     // Pending graphics DMA mask (strict timing: defer VRAM/CGRAM/OAM MDMA to VBlank)
     pending_gdma_mask: u8,
-    last_cpu_pc: u32, // debug: last S-CPU PC that touched the bus
+    // Pending general DMA mask (MDMAEN): starts after the *next opcode fetch*.
+    pending_mdma_mask: u8,
+    // One-shot: set when an opcode fetch triggered MDMA start.
+    // Used by the CPU core to defer executing that instruction until after the DMA stall.
+    mdma_started_after_opcode_fetch: bool,
+    last_cpu_pc: u32,       // debug: last S-CPU PC that touched the bus
+    last_cpu_bus_addr: u32, // debug: last S-CPU bus address (for timing heuristics)
     // HDMA aggregate stats (visible for headless summaries)
     hdma_lines_executed: u32,
     hdma_bytes_vram: u32,
@@ -151,12 +160,108 @@ pub struct Bus {
 
 impl Bus {
     #[inline]
+    fn dma_a_bus_is_mmio_blocked(addr: u32) -> bool {
+        let bank = ((addr >> 16) & 0xFF) as u8;
+        let off = (addr & 0xFFFF) as u16;
+        // SNESdev wiki: DMA cannot access A-bus addresses that overlap MMIO registers:
+        // $2100-$21FF, $4000-$41FF, $4200-$421F, $4300-$437F (in system banks).
+        //
+        // These MMIO ranges are only mapped in banks $00-$3F and $80-$BF; in other banks
+        // the same low addresses typically map to ROM/RAM and are accessible.
+        if !((0x00..=0x3F).contains(&bank) || (0x80..=0xBF).contains(&bank)) {
+            return false;
+        }
+        matches!(
+            off,
+            0x2100..=0x21FF | 0x4000..=0x41FF | 0x4200..=0x421F | 0x4300..=0x437F
+        )
+    }
+
+    #[inline]
+    fn dma_read_a_bus(&mut self, addr: u32) -> u8 {
+        if Self::dma_a_bus_is_mmio_blocked(addr) {
+            // Open bus (MDR) – do not trigger side-effects.
+            self.mdr
+        } else {
+            self.read_u8(addr)
+        }
+    }
+
+    #[inline]
+    fn dma_write_a_bus(&mut self, addr: u32, value: u8) {
+        if Self::dma_a_bus_is_mmio_blocked(addr) {
+            // Ignore writes to MMIO addresses on the A-bus (hardware blocks DMA access).
+            return;
+        }
+        self.write_u8(addr, value);
+    }
+
+    #[inline]
     fn on_cpu_bus_cycle(&mut self) {
         if !self.cpu_instr_active {
             return;
         }
         self.cpu_instr_bus_cycles = self.cpu_instr_bus_cycles.saturating_add(1);
+        self.cpu_instr_extra_master_cycles = self
+            .cpu_instr_extra_master_cycles
+            .saturating_add(self.cpu_access_extra_master_cycles(self.last_cpu_bus_addr));
         self.tick_cpu_cycles(1);
+    }
+
+    #[inline]
+    fn is_wram_address(&self, addr: u32) -> bool {
+        let bank = ((addr >> 16) & 0xFF) as u8;
+        let off = (addr & 0xFFFF) as u16;
+        // WRAM direct: $7E:0000-$7F:FFFF
+        if (0x7E..=0x7F).contains(&bank) {
+            return true;
+        }
+        // WRAM mirror: $00-$3F/$80-$BF:0000-1FFF
+        ((0x00..=0x3F).contains(&bank) || (0x80..=0xBF).contains(&bank)) && off < 0x2000
+    }
+
+    #[inline]
+    fn cpu_access_master_cycles(&self, addr: u32) -> u8 {
+        // Reference: https://snes.nesdev.org/wiki/Timing
+        let bank = ((addr >> 16) & 0xFF) as u8;
+        let off = (addr & 0xFFFF) as u16;
+
+        // JOYSER0/1: always 12 master clocks
+        if ((0x00..=0x3F).contains(&bank) || (0x80..=0xBF).contains(&bank))
+            && matches!(off, 0x4016 | 0x4017)
+        {
+            return 12;
+        }
+
+        // Most MMIO: 6 master clocks
+        if ((0x00..=0x3F).contains(&bank) || (0x80..=0xBF).contains(&bank))
+            && matches!(
+                off,
+                0x2100..=0x21FF | 0x4000..=0x41FF | 0x4200..=0x421F | 0x4300..=0x437F
+            )
+        {
+            return 6;
+        }
+
+        // Internal WRAM: 8 master clocks
+        if self.is_wram_address(addr) {
+            return 8;
+        }
+
+        // ROM: 6 master clocks for FastROM ($80:0000+ with MEMSEL=1), otherwise 8.
+        if self.is_rom_address(addr) {
+            let fast = self.fastrom && (addr & 0x80_0000) != 0;
+            return if fast { 6 } else { 8 };
+        }
+
+        // Default to 8 (safe/slow) for SRAM/unknown regions.
+        8
+    }
+
+    #[inline]
+    fn cpu_access_extra_master_cycles(&self, addr: u32) -> u64 {
+        let mc = self.cpu_access_master_cycles(addr);
+        mc.saturating_sub(6) as u64
     }
 
     #[inline]
@@ -226,6 +331,7 @@ impl Bus {
             div_work_bit: 0,
             cpu_instr_active: false,
             cpu_instr_bus_cycles: 0,
+            cpu_instr_extra_master_cycles: 0,
 
             irq_h_enabled: false,
             irq_v_enabled: false,
@@ -263,7 +369,10 @@ impl Bus {
             dma_reg_writes: 0,
             dma_dest_hist: [0; 256],
             pending_gdma_mask: 0,
+            pending_mdma_mask: 0,
+            mdma_started_after_opcode_fetch: false,
             last_cpu_pc: 0,
+            last_cpu_bus_addr: 0,
             hdma_lines_executed: 0,
             hdma_bytes_vram: 0,
             hdma_bytes_cgram: 0,
@@ -425,6 +534,7 @@ impl Bus {
             div_work_bit: 0,
             cpu_instr_active: false,
             cpu_instr_bus_cycles: 0,
+            cpu_instr_extra_master_cycles: 0,
 
             irq_h_enabled: false,
             irq_v_enabled: false,
@@ -458,7 +568,10 @@ impl Bus {
             dma_reg_writes: 0,
             dma_dest_hist: [0; 256],
             pending_gdma_mask: 0,
+            pending_mdma_mask: 0,
+            mdma_started_after_opcode_fetch: false,
             last_cpu_pc: 0,
+            last_cpu_bus_addr: 0,
             hdma_lines_executed: 0,
             hdma_bytes_vram: 0,
             hdma_bytes_cgram: 0,
@@ -1883,7 +1996,42 @@ impl Bus {
                     }
                     // PPU registers
                     0x2100..=0x213F => {
-                        let v = self.ppu.read(offset & 0xFF);
+                        let ppu_reg = offset & 0xFF;
+                        if std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some()
+                            && matches!(ppu_reg, 0x39 | 0x3A)
+                        {
+                            let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
+                            if (0xAE80..=0xAEEF).contains(&pc16) {
+                                use std::sync::atomic::{AtomicU32, Ordering};
+                                static CNT: AtomicU32 = AtomicU32::new(0);
+                                let n = CNT.fetch_add(1, Ordering::Relaxed);
+                                if n < 64 {
+                                    let (vmadd, inc, vmain) = self.ppu.dbg_vram_regs();
+                                    println!(
+                                        "[BURNIN-DMAMEM][PPU-R] PC={:06X} ${:04X} VMADD={:04X} VMAIN={:02X} inc={} (pre)",
+                                        self.last_cpu_pc, offset, vmadd, vmain, inc
+                                    );
+                                }
+                            }
+                        }
+                        let v = self.ppu.read(ppu_reg);
+                        if std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some()
+                            && matches!(ppu_reg, 0x39 | 0x3A)
+                        {
+                            let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
+                            if (0xAE80..=0xAEEF).contains(&pc16) {
+                                use std::sync::atomic::{AtomicU32, Ordering};
+                                static CNT: AtomicU32 = AtomicU32::new(0);
+                                let n = CNT.fetch_add(1, Ordering::Relaxed);
+                                if n < 64 {
+                                    let (vmadd, inc, vmain) = self.ppu.dbg_vram_regs();
+                                    println!(
+                                        "[BURNIN-DMAMEM][PPU-R] PC={:06X} ${:04X} -> {:02X} VMADD={:04X} VMAIN={:02X} inc={} (post)",
+                                        self.last_cpu_pc, offset, v, vmadd, vmain, inc
+                                    );
+                                }
+                            }
+                        }
                         if crate::debug_flags::trace_burnin_v224() {
                             let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
                             if (0x97D0..=0x98FF).contains(&pc16) {
@@ -1990,6 +2138,60 @@ impl Bus {
                                 .map(|mut apu| {
                                     let p = (offset & 0x03) as u8;
                                     let v = apu.read_port(p);
+                                    // burn-in-test.sfc APU FAIL調査: CPU側が最終判定で $2141 を読む瞬間に
+                                    // APU(S-SMP) の実行位置をログに出す（opt-in, 少量）。
+                                    if std::env::var_os("TRACE_BURNIN_APU_PROG").is_some()
+                                        && offset == 0x2141
+                                        && self.last_cpu_pc == 0x00863F
+                                    {
+                                        use std::sync::atomic::{AtomicU32, Ordering};
+                                        static CNT: AtomicU32 = AtomicU32::new(0);
+                                        let n = CNT.fetch_add(1, Ordering::Relaxed);
+                                        if n < 4 {
+                                            if let Some(smp) = apu.inner.smp.as_ref() {
+                                                let smp_pc = smp.reg_pc;
+                                                let smp_a = smp.reg_a;
+                                                let smp_x = smp.reg_x;
+                                                let smp_y = smp.reg_y;
+                                                let smp_sp = smp.reg_sp;
+                                                let smp_psw = smp.get_psw();
+                                                let ctx_start = smp_pc.wrapping_sub(0x10);
+                                                let mut code = [0u8; 32];
+                                                for (i, b) in code.iter_mut().enumerate() {
+                                                    *b = apu
+                                                        .inner
+                                                        .read_u8(ctx_start.wrapping_add(i as u16) as u32);
+                                                }
+                                                let t0 = apu.inner.debug_timer_state(0);
+                                                println!(
+                                                    "[BURNIN-APU-PROG] cpu_pc=00:{:04X} apui1={:02X} sl={} cyc={} frame={} vblank={} vis_h={} apu_cycles={} smp_pc={:04X} A={:02X} X={:02X} Y={:02X} SP={:02X} PSW={:02X} t0={:?} code@{:04X}={:02X?}",
+                                                    (self.last_cpu_pc & 0xFFFF) as u16,
+                                                    v,
+                                                    self.ppu.scanline,
+                                                    self.ppu.get_cycle(),
+                                                    self.ppu.get_frame(),
+                                                    self.ppu.is_vblank() as u8,
+                                                    self.ppu.get_visible_height(),
+                                                    apu.total_smp_cycles,
+                                                    smp_pc,
+                                                    smp_a,
+                                                    smp_x,
+                                                    smp_y,
+                                                    smp_sp,
+                                                    smp_psw,
+                                                    t0,
+                                                    ctx_start,
+                                                    code
+                                                );
+                                            } else {
+                                                println!(
+                                                    "[BURNIN-APU-PROG] cpu_pc=00:{:04X} apui1={:02X} smp=<none>",
+                                                    (self.last_cpu_pc & 0xFFFF) as u16,
+                                                    v
+                                                );
+                                            }
+                                        }
+                                    }
                                     if std::env::var_os("TRACE_APU_PORT").is_some() {
                                         use std::sync::atomic::{AtomicU32, Ordering};
                                         static COUNT: AtomicU32 = AtomicU32::new(0);
@@ -2043,11 +2245,12 @@ impl Bus {
                             let limit = crate::debug_flags::trace_apu_handshake_limit();
                             if n < limit {
                                 println!(
-                                    "[APU-HS][R] ${:04X} -> {:02X} state={} pc={:06X} sl={} cyc={}",
+                                    "[APU-HS][R] ${:04X} -> {:02X} state={} pc={:06X} frame={} sl={} cyc={}",
                                     offset,
                                     val,
                                     state,
                                     self.last_cpu_pc,
+                                    self.ppu.get_frame(),
                                     self.ppu.scanline,
                                     self.ppu.get_cycle()
                                 );
@@ -2571,6 +2774,19 @@ impl Bus {
                                 );
                             }
                         }
+                        if std::env::var_os("TRACE_BURNIN_ZP16").is_some()
+                            && matches!(offset, 0x0016 | 0x0017 | 0x001F)
+                        {
+                            println!(
+                                "[BURNIN-ZP] PC={:06X} ${:04X} <- {:02X} frame={} sl={} cyc={}",
+                                self.last_cpu_pc,
+                                offset,
+                                value,
+                                self.ppu.get_frame(),
+                                self.ppu.scanline,
+                                self.ppu.get_cycle()
+                            );
+                        }
                         if std::env::var_os("TRACE_ZP").is_some() && offset < 0x0010 {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static COUNT: AtomicU32 = AtomicU32::new(0);
@@ -2620,7 +2836,85 @@ impl Bus {
                                 );
                             }
                         }
-                        self.ppu.write(offset & 0xFF, value);
+                        let ppu_reg = offset & 0xFF;
+                        // burn-in-test.sfc diagnostics: include S-CPU PC for VRAM data port writes
+                        // that touch the DMA MEMORY test region (VMADD 0x5000..0x57FF).
+                        if matches!(ppu_reg, 0x18 | 0x19) {
+                            let trace_dmamem =
+                                std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some();
+                            let trace_status = std::env::var_os("TRACE_BURNIN_STATUS").is_some();
+                            let trace_apu_status =
+                                std::env::var_os("TRACE_BURNIN_APU_STATUS").is_some();
+                            if trace_dmamem || trace_status || trace_apu_status {
+                                use std::sync::atomic::{AtomicU32, Ordering};
+                                let (vmadd, _inc, vmain) = self.ppu.dbg_vram_regs();
+
+                                // burn-in-test.sfc diagnostics: include S-CPU PC for VRAM data port writes
+                                // that touch the DMA MEMORY test region (VMADD 0x5000..0x57FF).
+                                // Only count/log writes that actually land in the interesting range;
+                                // otherwise early VRAM traffic (font/tiles) exhausts the counter.
+                                if trace_dmamem && (0x5000..0x5800).contains(&vmadd) {
+                                    static CNT: AtomicU32 = AtomicU32::new(0);
+                                    let n = CNT.fetch_add(1, Ordering::Relaxed);
+                                    if n < 256 {
+                                        println!(
+	                                            "[BURNIN-VRAM-PC] PC={:06X} ${:04X} <- {:02X} VMADD={:04X} VMAIN={:02X}",
+	                                            self.last_cpu_pc,
+	                                            offset,
+	                                            value,
+	                                            vmadd,
+	                                            vmain
+	                                        );
+                                    }
+                                }
+
+                                // Focused logging for PASS/FAIL column updates (opt-in).
+                                if trace_status && (0x50F0..0x5200).contains(&vmadd) {
+                                    let ch = value as char;
+                                    let printable = ch.is_ascii_graphic() || ch == ' ';
+                                    println!(
+	                                        "[BURNIN-STATUS] PC={:06X} ${:04X} <- {:02X}{} VMADD={:04X} VMAIN={:02X}",
+	                                        self.last_cpu_pc,
+	                                        offset,
+	                                        value,
+	                                        if printable {
+	                                            format!(" ('{}')", ch)
+	                                        } else {
+	                                            String::new()
+	                                        },
+	                                        vmadd,
+	                                        vmain
+	                                    );
+                                }
+
+                                // Focused logging for the APU status row (menu 5 results).
+                                // The PASS/FAIL column for the bottom rows lives around VMADD ~= $52D0.
+                                if trace_apu_status && (0x52C0..=0x52FF).contains(&vmadd) {
+                                    println!(
+	                                        "[BURNIN-APU-STATUS] PC={:06X} ${:04X} <- {:02X} VMADD={:04X} VMAIN={:02X}",
+	                                        self.last_cpu_pc, offset, value, vmadd, vmain
+	                                    );
+                                }
+                            }
+                        }
+                        self.ppu.write(ppu_reg, value);
+                        if std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some()
+                            && matches!(ppu_reg, 0x00 | 0x15 | 0x16 | 0x17)
+                        {
+                            let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
+                            if (0xAE80..=0xAEEF).contains(&pc16) {
+                                use std::sync::atomic::{AtomicU32, Ordering};
+                                static CNT: AtomicU32 = AtomicU32::new(0);
+                                let n = CNT.fetch_add(1, Ordering::Relaxed);
+                                if n < 128 {
+                                    let (vmadd, inc, vmain) = self.ppu.dbg_vram_regs();
+                                    println!(
+                                        "[BURNIN-DMAMEM][PPU-W] PC={:06X} ${:04X} <- {:02X} VMADD={:04X} VMAIN={:02X} inc={}",
+                                        self.last_cpu_pc, offset, value, vmadd, vmain, inc
+                                    );
+                                }
+                            }
+                        }
                     }
                     0x2200..=0x23FF if self.is_sa1_active() => {
                         if std::env::var_os("TRACE_SA1_REG").is_some() {
@@ -2633,6 +2927,44 @@ impl Bus {
                     }
                     // APU registers
                     0x2140..=0x217F => {
+                        // burn-in-test.sfc APU test: trace the CPU command sequence (opt-in, low volume).
+                        if std::env::var_os("TRACE_BURNIN_APU_CPU").is_some()
+                            && offset <= 0x2143
+                            && (0x008600..=0x008700).contains(&self.last_cpu_pc)
+                        {
+                            let apu_cycles =
+                                self.apu.lock().map(|apu| apu.total_smp_cycles).unwrap_or(0);
+                            println!(
+                                "[BURNIN-APU-CPU] PC={:06X} ${:04X} <- {:02X} frame={} sl={} cyc={} apu_cycles={}",
+                                self.last_cpu_pc,
+                                offset,
+                                value,
+                                self.ppu.get_frame(),
+                                self.ppu.scanline,
+                                self.ppu.get_cycle(),
+                                apu_cycles
+                            );
+                        }
+                        // burn-in-test.sfc: broader APU port write trace with frame correlation (opt-in).
+                        if std::env::var_os("TRACE_BURNIN_APU_WRITES").is_some()
+                            && offset <= 0x2143
+                            && (150..=420).contains(&self.ppu.get_frame())
+                        {
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static CNT: AtomicU32 = AtomicU32::new(0);
+                            let n = CNT.fetch_add(1, Ordering::Relaxed);
+                            if n < 2048 {
+                                println!(
+                                    "[BURNIN-APU-W] PC={:06X} ${:04X} <- {:02X} frame={} sl={} cyc={}",
+                                    self.last_cpu_pc,
+                                    offset,
+                                    value,
+                                    self.ppu.get_frame(),
+                                    self.ppu.scanline,
+                                    self.ppu.get_cycle()
+                                );
+                            }
+                        }
                         if crate::debug_flags::trace_apu_port_all()
                             || (offset == 0x2140 && crate::debug_flags::trace_apu_port0())
                         {
@@ -2659,21 +2991,23 @@ impl Bus {
                             if n < limit {
                                 if self.fake_apu {
                                     println!(
-                                        "[APU-HS][W] ${:04X} <- {:02X} state=fake-{:?} pc={:06X} sl={} cyc={}",
+                                        "[APU-HS][W] ${:04X} <- {:02X} state=fake-{:?} pc={:06X} frame={} sl={} cyc={}",
                                         offset,
                                         value,
                                         self.fake_apu_upload_state,
                                         self.last_cpu_pc,
+                                        self.ppu.get_frame(),
                                         self.ppu.scanline,
                                         self.ppu.get_cycle()
                                     );
                                 } else if let Ok(mut apu) = self.apu.lock() {
                                     println!(
-                                        "[APU-HS][W] ${:04X} <- {:02X} state={} pc={:06X} sl={} cyc={}",
+                                        "[APU-HS][W] ${:04X} <- {:02X} state={} pc={:06X} frame={} sl={} cyc={}",
                                         offset,
                                         value,
                                         apu.handshake_state_str(),
                                         self.last_cpu_pc,
+                                        self.ppu.get_frame(),
                                         self.ppu.scanline,
                                         self.ppu.get_cycle()
                                     );
@@ -3576,8 +3910,9 @@ impl Bus {
             // 0x4216/0x4217: Multiplication result (if last op was MUL) or Division remainder
             0x4216 => (self.mul_result & 0xFF) as u8, // or div_rem low after DIV
             0x4217 => (self.mul_result >> 8) as u8,   // or div_rem high after DIV
-            0x420B => self.dma_controller.read(addr),
-            0x420C => self.dma_controller.read(addr),
+            // $420B/$420C are write-only (W8). Reads return open bus.
+            0x420B => self.mdr,
+            0x420C => self.mdr,
             // APU registers readback
             0x2140..=0x217F => {
                 let port = (addr & 0x3F) as u8;
@@ -3693,8 +4028,8 @@ impl Bus {
             // WRIO - Joypad Programmable I/O Port; read back via $4213
             0x4201 => {
                 // Bit7 ("a") is connected to the PPU latch line.
-                // Official burn-in expects the HV counters to be latched when the line is released
-                // (0->1), matching common WRIO pulse usage (drive low, then high).
+                // HV counter latch via WRIO: latching occurs on the 1->0 transition (writing 0),
+                // and it latches 1 dot later than a $2137 read (see Super Famicom Dev Wiki "Timing").
                 let prev = self.wio;
                 self.wio = value;
                 let prev_a = (prev & 0x80) != 0;
@@ -3715,7 +4050,7 @@ impl Bus {
                         );
                     }
                 }
-                if !prev_a && new_a {
+                if prev_a && !new_a {
                     self.ppu.request_wrio_hv_latch();
                 }
             }
@@ -3951,16 +4286,15 @@ impl Bus {
                         }
                     }
                 }
-                // DMA転送を実行（非遅延分）
+                // MDMAEN starts after the *next opcode fetch* (SNESdev timing note).
+                // So here we only queue the channels; the actual transfer happens in
+                // `CpuBus::opcode_memory_penalty()` for the S-CPU bus.
                 for i in 0..8 {
-                    if now_mask & (1 << i) != 0 {
-                        // Skip unconfigured channels to avoid bogus huge transfers
-                        if !self.dma_controller.channels[i].configured {
-                            continue;
-                        }
-                        self.perform_dma_transfer(i);
+                    if (now_mask & (1 << i)) != 0 && !self.dma_controller.channels[i].configured {
+                        now_mask &= !(1 << i);
                     }
                 }
+                self.pending_mdma_mask |= now_mask;
             }
             0x420C => {
                 // HDMAEN - H-blank DMA Enable
@@ -4511,7 +4845,7 @@ impl Bus {
         // Mark write context so PPU can allow HDMA during HBlank appropriately
         self.ppu.begin_hdma_context();
         // 必要な情報を事前に取得して、借用を短く保つ
-        let dest_base = { self.dma_controller.channels[channel].dest_address & 0x3F };
+        let dest_base = { self.dma_controller.channels[channel].dest_address };
         let control = { self.dma_controller.channels[channel].control };
         let repeat_flag = { self.dma_controller.channels[channel].hdma_repeat_flag };
         let latched_len = { self.dma_controller.channels[channel].hdma_latched_len } as usize;
@@ -4549,13 +4883,7 @@ impl Bus {
 
         // 書き込み（PPU writable or APU I/O）
         for (i, data) in bytes.iter().enumerate().take(len) {
-            let dest_off = if dest_base == 0x22 {
-                0x22
-            } else if dest_base == 0x04 {
-                0x04
-            } else {
-                Self::hdma_dest_offset(unit, dest_base, i as u8)
-            };
+            let dest_off = Self::hdma_dest_offset(unit, dest_base, i as u8);
             let dest_addr = 0x2100u32 + dest_off as u32;
             if dest_off <= 0x33 || (0x40..=0x43).contains(&dest_off) {
                 self.write_u8(dest_addr, *data);
@@ -4590,7 +4918,7 @@ impl Bus {
             4 => 4,
             5 => 4,
             6 => 2,
-            7 => 1,
+            7 => 4,
             _ => 1,
         }
     }
@@ -4604,9 +4932,9 @@ impl Bus {
             2 => base,                            // A, A
             3 => base.wrapping_add((i >> 1) & 1), // A, A, B, B
             4 => base.wrapping_add(i & 3),        // A, B, C, D
-            5 => base.wrapping_add((i >> 1) & 3), // A,A,B,B,C,C,D,D
-            6 => base.wrapping_add((i >> 1) & 1), // A,A,B,B
-            7 => base,                            // A,A
+            5 => base.wrapping_add(i & 1),        // A,B,A,B (undocumented)
+            6 => base,                            // A,A (undocumented)
+            7 => base.wrapping_add((i >> 1) & 1), // A,A,B,B (undocumented)
             _ => base,
         }
     }
@@ -4715,9 +5043,7 @@ impl Bus {
         // burn-in-test.sfc: track unexpected VRAM DMAs that might clobber the DMA MEMORY test region.
         // (Covers both $2118/$2119 bases and all transfer modes; we only special-case the known
         // DMA MEMORY write via ch6.)
-        if trace_burnin_dma_mem
-            && cpu_to_ppu
-            && (dest_base_full == 0x18 || dest_base_full == 0x19)
+        if trace_burnin_dma_mem && cpu_to_ppu && (dest_base_full == 0x18 || dest_base_full == 0x19)
         {
             let (vmadd_start, vram_inc, vmain) = self.ppu.dbg_vram_regs();
             if vram_inc == 1 {
@@ -4771,21 +5097,23 @@ impl Bus {
             let vblank = self.ppu.is_vblank();
             let hblank = self.ppu.is_hblank();
             let forced_blank = self.ppu.is_forced_blank();
-            *BURNIN_DMA_SNAP.get_or_init(|| Mutex::new(None)).lock().unwrap() =
-                Some(BurninDmaSnap {
-                    pc,
-                    frame,
-                    scanline,
-                    cycle,
-                    vblank,
-                    hblank,
-                    forced_blank,
-                    vram_addr,
-                    vram_inc,
-                    vmain,
-                    hash,
-                    sample,
-                });
+            *BURNIN_DMA_SNAP
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap() = Some(BurninDmaSnap {
+                pc,
+                frame,
+                scanline,
+                cycle,
+                vblank,
+                hblank,
+                forced_blank,
+                vram_addr,
+                vram_inc,
+                vmain,
+                hash,
+                sample,
+            });
             println!(
                 "[BURNIN-DMAMEM] SNAP pc={:06X} frame={} sl={} cyc={} vblank={} hblank={} fblank={} VMADD={:04X} VMAIN={:02X} inc={} hash={:016X} sample@0/100/200/300={:02X?}",
                 pc,
@@ -4997,16 +5325,7 @@ impl Bus {
             if cpu_to_ppu {
                 // CPU -> PPU転送（最も一般的）
                 // Bバス宛先アドレスを転送モードに応じて決定
-                // Special-cases for B-bus ports
                 let dest_offset = self.mdma_dest_offset(transfer_unit, dest_base_full, i as u8);
-
-                // Safety guard: if offset unexpectedly collapses to $2100 while base is nonzero,
-                // clamp back to the configured base to avoid clobbering INIDISP.
-                let dest_offset = if cpu_to_ppu && dest_base_full != 0 && dest_offset == 0 {
-                    dest_base_full
-                } else {
-                    dest_offset
-                };
 
                 if std::env::var_os("TRACE_DMA_DEST").is_some() && channel == 0 && i < 32 {
                     println!(
@@ -5018,7 +5337,7 @@ impl Bus {
                 let dest_full = 0x2100 + dest_offset as u32;
                 self.dma_hist_note(dest_offset);
 
-                let data = self.read_u8(cur_src);
+                let data = self.dma_read_a_bus(cur_src);
 
                 // One-shot trace of early DMA bytes to understand real dests (opt-in)
                 if crate::debug_flags::dma() && !crate::debug_flags::quiet() {
@@ -5153,7 +5472,7 @@ impl Bus {
                 let dest_offset = self.mdma_dest_offset(transfer_unit, dest_base_full, i as u8);
                 let dest_reg = 0x2100 + dest_offset as u32;
                 let data = self.read_u8(dest_reg);
-                self.write_u8(cur_src, data);
+                self.dma_write_a_bus(cur_src, data);
             }
 
             // A-busアドレスの更新（バンク固定、16bitアドレスのみ増減）
@@ -5166,6 +5485,21 @@ impl Bus {
             } as u32;
             cur_src = bank | next_lo16;
             i += 1;
+        }
+
+        // --- DMA register side effects (hardware behavior) ---
+        //
+        // SNESdev wiki:
+        // - After DMA completes, DASn becomes 0.
+        // - A1Tn (low 16 bits) advances by the number of bytes transferred for increment/decrement
+        //   modes; the bank (A1Bn) is fixed and wraps at the bank boundary.
+        //
+        // We model this by updating the channel's A-bus address (src_address) to the final cur_src
+        // and clearing the transfer size register.
+        {
+            let ch = &mut self.dma_controller.channels[channel];
+            ch.src_address = cur_src;
+            ch.size = 0;
         }
 
         // --- Timing: S-CPU stalls during MDMA ---
@@ -5250,7 +5584,10 @@ impl Bus {
             let hash = fnv1a64(slice);
             let (vram_addr, vram_inc, vmain) = self.ppu.dbg_vram_regs();
             let pc = self.last_cpu_pc;
-            let snap = *BURNIN_DMA_SNAP.get_or_init(|| Mutex::new(None)).lock().unwrap();
+            let snap = *BURNIN_DMA_SNAP
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap();
             if let Some(s) = snap {
                 let ok = s.hash == hash;
                 println!(
@@ -5357,40 +5694,17 @@ impl Bus {
 
     #[inline]
     fn mdma_dest_offset(&self, unit: u8, base: u8, index: u8) -> u8 {
-        // Fixed ports
-        if base == 0x22 {
-            return 0x22;
-        } // CGDATA
-        if base == 0x04 {
-            return 0x04;
-        } // OAMDATA
-          // WRAM port ($2180-$2183) — keep upper bit; pattern still applies for 0x80-0x83
-        if base >= 0x80 {
-            let i = index as usize;
-            let rel = match unit & 0x07 {
-                0 => 0,
-                1 => (i & 1) as u8,
-                2 => 0,
-                3 => ((i >> 1) & 1) as u8,
-                4 => (i & 3) as u8,
-                5 => ((i >> 1) & 3) as u8,
-                6 => ((i >> 1) & 1) as u8,
-                _ => 0,
-            };
-            return base.wrapping_add(rel);
-        }
-
+        // SNESdev wiki: B-bus address is an 8-bit selector in $2100-$21FF; additions wrap at 0xFF.
+        // Transfer pattern (DMAPn bits 0-2) selects the B-bus address sequence.
         let i = index as usize;
-        let b = base as usize;
-        // Table-driven patterns for modes 0..7
         const P0: &[u8] = &[0];
         const P1: &[u8] = &[0, 1];
         const P2: &[u8] = &[0, 0];
         const P3: &[u8] = &[0, 0, 1, 1];
         const P4: &[u8] = &[0, 1, 2, 3];
-        const P5: &[u8] = &[0, 0, 1, 1, 2, 2, 3, 3];
-        const P6: &[u8] = &[0, 0, 1, 1];
-        const P7: &[u8] = &[0, 0];
+        const P5: &[u8] = &[0, 1, 0, 1]; // undocumented
+        const P6: &[u8] = &[0, 0]; // undocumented (same as 2)
+        const P7: &[u8] = &[0, 0, 1, 1]; // undocumented (same as 3)
         let pat = match unit & 0x07 {
             0 => P0,
             1 => P1,
@@ -5401,8 +5715,7 @@ impl Bus {
             6 => P6,
             _ => P7,
         };
-        let rel = pat[i % pat.len()] as usize;
-        ((b + rel) & 0x7F) as u8
+        base.wrapping_add(pat[i % pat.len()])
     }
 
     fn dma_hist_note(&mut self, dest_off: u8) {
@@ -5492,30 +5805,76 @@ impl Bus {
 impl CpuBus for Bus {
     fn read_u8(&mut self, addr: u32) -> u8 {
         let v = Bus::read_u8(self, addr);
+        self.last_cpu_bus_addr = addr;
         self.on_cpu_bus_cycle();
         v
     }
 
     fn write_u8(&mut self, addr: u32, value: u8) {
         Bus::write_u8(self, addr, value);
+        self.last_cpu_bus_addr = addr;
         self.on_cpu_bus_cycle();
     }
 
     fn begin_cpu_instruction(&mut self) {
         self.cpu_instr_active = true;
         self.cpu_instr_bus_cycles = 0;
+        self.cpu_instr_extra_master_cycles = 0;
     }
 
     fn end_cpu_instruction(&mut self, cycles: u8) {
         // 命令内で発生したバスアクセス分は read_u8/write_u8 側で tick 済み。
         // 残り（内部サイクル/ウェイト相当）だけ進める。
         let bus_cycles = self.cpu_instr_bus_cycles;
+        let extra_master = self.cpu_instr_extra_master_cycles;
         self.cpu_instr_active = false;
         self.cpu_instr_bus_cycles = 0;
+        self.cpu_instr_extra_master_cycles = 0;
         let remaining = cycles.saturating_sub(bus_cycles);
         if remaining != 0 {
             self.tick_cpu_cycles(remaining);
         }
+        if extra_master != 0 {
+            // Slow/joypad access stretches CPU cycles in master clocks; model as time that
+            // elapses with no further S-CPU execution.
+            self.add_pending_stall_master_cycles(extra_master);
+        }
+    }
+
+    fn opcode_memory_penalty(&mut self, addr: u32) -> u8 {
+        // General DMA (MDMAEN) begins after the *next opcode fetch* following the write to $420B.
+        // We model that by consuming the queued mask here, right after the opcode byte has been
+        // read by the core (see cpu_core::fetch_opcode_generic).
+        if self.pending_mdma_mask != 0 {
+            let mask = self.pending_mdma_mask;
+            self.pending_mdma_mask = 0;
+            let mut any = false;
+            for i in 0..8 {
+                if (mask & (1 << i)) == 0 {
+                    continue;
+                }
+                if !self.dma_controller.channels[i].configured {
+                    continue;
+                }
+                any = true;
+                self.perform_dma_transfer(i);
+            }
+            if any {
+                self.mdma_started_after_opcode_fetch = true;
+            }
+        }
+
+        if debug_flags::mem_timing() && self.is_rom_address(addr) && !self.is_fastrom() {
+            2
+        } else {
+            0
+        }
+    }
+
+    fn take_dma_start_event(&mut self) -> bool {
+        let v = self.mdma_started_after_opcode_fetch;
+        self.mdma_started_after_opcode_fetch = false;
+        v
     }
 
     fn poll_nmi(&mut self) -> bool {

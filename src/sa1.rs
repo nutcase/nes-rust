@@ -178,7 +178,11 @@ impl<'a> CpuBus for Sa1BusAdapter<'a> {
     }
 
     fn opcode_memory_penalty(&mut self, addr: u32) -> u8 {
-        unsafe { self.bus().opcode_memory_penalty(addr) }
+        // Important: do not forward to the main Bus::opcode_memory_penalty().
+        // That hook is used to trigger S-CPU MDMAEN timing (after opcode fetch),
+        // and must not be consumed by SA-1 opcode fetches during scheduling.
+        let _ = addr;
+        0
     }
 }
 

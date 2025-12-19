@@ -35,10 +35,17 @@ pub struct Dsp {
     echo_vol_right: u8,
     noise_clock: u8,
     echo_write_enabled: bool,
+    flg: u8,
     echo_feedback: u8,
     source_dir: u8,
     echo_start_address: u16,
     echo_delay: u8,
+    kon: u8,
+    kof: u8,
+    pmon: u8,
+    non: u8,
+    eon: u8,
+    endx: u8,
 
     counter: i32,
 
@@ -69,10 +76,17 @@ impl Dsp {
             echo_vol_right: 0,
             noise_clock: 0,
             echo_write_enabled: false,
+            flg: 0,
             echo_feedback: 0,
             source_dir: 0,
             echo_start_address: 0,
             echo_delay: 0,
+            kon: 0,
+            kof: 0,
+            pmon: 0,
+            non: 0,
+            eon: 0,
+            endx: 0,
 
             counter: 0,
 
@@ -85,8 +99,9 @@ impl Dsp {
             resampling_mode: resampling_mode,
         });
         let ret_ptr = &mut *ret as *mut _;
-        for _ in 0..NUM_VOICES {
-            ret.voices.push(Box::new(Voice::new(ret_ptr, emulator, resampling_mode)));
+        for i in 0..NUM_VOICES {
+            ret.voices
+                .push(Box::new(Voice::new(ret_ptr, emulator, resampling_mode, i as u8)));
         }
         ret.reset();
         ret
@@ -119,10 +134,17 @@ impl Dsp {
         self.echo_vol_right = 0x9c;
         self.noise_clock = 0;
         self.echo_write_enabled = false;
+        self.flg = 0x20;
         self.echo_feedback = 0;
         self.source_dir = 0;
         self.echo_start_address = Dsp::calculate_echo_start_address(0x60);
         self.echo_delay = 0x0e;
+        self.kon = 0;
+        self.kof = 0;
+        self.pmon = 0;
+        self.non = 0;
+        self.eon = 0;
+        self.endx = 0;
 
         self.set_filter_coefficient(0x00, 0x80);
         self.set_filter_coefficient(0x01, 0xff);
@@ -142,6 +164,10 @@ impl Dsp {
         self.echo_length = 0;
 
         self.set_resampling_mode(ResamplingMode::Gaussian);
+    }
+
+    pub(crate) fn set_endx_bit(&mut self, voice_index: u8) {
+        self.endx |= 1u8 << (voice_index & 7);
     }
 
     pub fn resampling_mode(&self) -> ResamplingMode {
@@ -290,18 +316,19 @@ impl Dsp {
                 0x1c => { self.vol_right = value; },
                 0x2c => { self.echo_vol_left = value; },
                 0x3c => { self.echo_vol_right = value; },
-                0x4c => { self.set_kon(value); },
-                0x5c => { self.set_kof(value); },
-                0x6c => { self.set_flg(value); },
+                0x4c => { self.kon = value; self.set_kon(value); },
+                0x5c => { self.kof = value; self.set_kof(value); },
+                0x6c => { self.flg = value; self.set_flg(value); },
 
                 0x0d => { self.echo_feedback = value; },
 
-                0x2d => { self.set_pmon(value); },
-                0x3d => { self.set_nov(value); },
-                0x4d => { self.set_eon(value); },
+                0x2d => { self.pmon = value; self.set_pmon(value); },
+                0x3d => { self.non = value; self.set_nov(value); },
+                0x4d => { self.eon = value; self.set_eon(value); },
                 0x5d => { self.source_dir = value; },
                 0x6d => { self.echo_start_address = (value as u16) << 8; },
                 0x7d => { self.echo_delay = value & 0x0f; },
+                0x7c => { self.endx = 0; },
 
                 _ => () // Do nothing
             }
@@ -313,8 +340,50 @@ impl Dsp {
             self.flush();
         }
 
-        let _ = address;
-        0
+        if (address & 0x80) != 0 {
+            return 0;
+        }
+
+        let voice_index = (address >> 4) as usize;
+        let voice_address = address & 0x0f;
+        if voice_address < 0x0a && voice_index < self.voices.len() {
+            let voice = &self.voices[voice_index];
+            return match voice_address {
+                0x00 => voice.vol_left,
+                0x01 => voice.vol_right,
+                0x02 => voice.pitch_low,
+                0x03 => voice.pitch_high(),
+                0x04 => voice.source,
+                0x05 => voice.envelope.adsr0,
+                0x06 => voice.envelope.adsr1,
+                0x07 => voice.envelope.gain,
+                0x08 => ((voice.envelope.level >> 4) & 0xFF) as u8,
+                0x09 => voice.outx(),
+                _ => 0,
+            };
+        }
+        if voice_address == 0x0f && voice_index < self.left_filter.coefficients.len() {
+            return self.left_filter.coefficients[voice_index];
+        }
+
+        match address {
+            0x0c => self.vol_left,
+            0x1c => self.vol_right,
+            0x2c => self.echo_vol_left,
+            0x3c => self.echo_vol_right,
+            0x0d => self.echo_feedback,
+            0x2d => self.pmon,
+            0x3d => self.non,
+            0x4d => self.eon,
+            0x5d => self.source_dir,
+            0x6c => self.flg,
+            0x6d => (self.echo_start_address >> 8) as u8,
+            0x7c => self.endx,
+            0x7d => self.echo_delay & 0x0f,
+            0x4c => self.kon,
+            0x5c => self.kof,
+            _ => 0,
+        }
     }
 
     pub fn read_counter(&self, rate: i32) -> bool {

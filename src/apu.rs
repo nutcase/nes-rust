@@ -2,6 +2,14 @@
 //! 現状: 精度よりも動作優先の簡易統合。セーブステートはダミー。
 use snes_apu::apu::Apu as SpcApu;
 
+// Clock ratio used to convert S-CPU cycles (3.579545MHz NTSC) to `snes-apu` internal cycles.
+//
+// `snes-apu` uses a 2.048MHz internal tick rate (32kHz * 64 cycles/sample), which corresponds to
+// the SNES APU oscillator (24.576MHz / 12).
+//
+// ratio = 2_048_000 / 3_579_545.333... ≈ 0.5721397019
+const DEFAULT_APU_CYCLE_SCALE: f64 = 0.572_139_701_913_725_3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootState {
     /// 初期シグネチャ (AA/BB) をCPUに見せる段階
@@ -17,6 +25,13 @@ pub struct Apu {
     sample_rate: u32,
     // Fractional SPC700 cycles accumulator (scaled from S-CPU cycles).
     cycle_accum: f64,
+    // Total SPC700 cycles executed (debug/diagnostics).
+    pub(crate) total_smp_cycles: u64,
+    // Debug: last observed values for $F1/$FA change tracing.
+    trace_last_f1: u8,
+    trace_last_fa: u8,
+    // Debug: last observed APU->CPU port values (for change tracing).
+    trace_last_out_ports: [u8; 4],
     // CPU<-APU方向のホストポート（CPUが読み取る値）
     apu_to_cpu_ports: [u8; 4],
     // CPU->APU方向の直近値（SMP側が$F4-$F7で読む値）
@@ -99,6 +114,10 @@ impl Apu {
             inner,
             sample_rate: 32000,
             cycle_accum: 0.0,
+            total_smp_cycles: 0,
+            trace_last_f1: 0,
+            trace_last_fa: 0,
+            trace_last_out_ports: [0; 4],
             apu_to_cpu_ports: [0; 4],
             port_latch: [0; 4],
             boot_state: if skip_boot || !boot_hle_enabled {
@@ -130,6 +149,11 @@ impl Apu {
             fake_upload,
         };
         apu.init_boot_ports();
+        apu.trace_last_f1 = apu.inner.read_u8(0x00F1);
+        apu.trace_last_fa = apu.inner.read_u8(0x00FA);
+        for p in 0..4 {
+            apu.trace_last_out_ports[p] = apu.inner.cpu_read_port(p as u8);
+        }
         if std::env::var_os("TRACE_APU_BOOTSTATE").is_some() {
             println!(
                 "[APU-BOOTSTATE] init: boot_hle_enabled={} skip_boot={} fast_upload={} boot_state={:?}",
@@ -182,6 +206,12 @@ impl Apu {
         self.zero_write_seen = false;
         self.last_port1 = 0;
         self.cycle_accum = 0.0;
+        self.total_smp_cycles = 0;
+        self.trace_last_f1 = self.inner.read_u8(0x00F1);
+        self.trace_last_fa = self.inner.read_u8(0x00FA);
+        for p in 0..4 {
+            self.trace_last_out_ports[p] = self.inner.cpu_read_port(p as u8);
+        }
         self.port_latch = [0; 4];
         self.upload_addr = 0x0200;
         self.expected_index = 0;
@@ -226,17 +256,18 @@ impl Apu {
     pub fn step(&mut self, cpu_cycles: u8) {
         // 比率調整。必要に応じて環境変数 APU_CYCLE_SCALE で上書き可。
         // `snes-apu` crate の内部サイクルは 2.048MHz 基準で、DSPサンプル(32kHz)は 64cycle ごとに生成される。
-        // したがって S-CPU(3.579545MHz) からの比率は 2.048MHz / 3.579545MHz ≈ 0.572。
+        // したがって S-CPU(3.579545MHz NTSC) からの比率は 2.048MHz / 3.579545MHz ≈ 0.57214。
         let scale: f64 = std::env::var("APU_CYCLE_SCALE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0.572);
+            .unwrap_or(DEFAULT_APU_CYCLE_SCALE);
 
         self.cycle_accum += (cpu_cycles as f64) * scale;
         let run = self.cycle_accum.floor() as i32;
         self.cycle_accum -= run as f64;
 
         if run > 0 {
+            self.total_smp_cycles = self.total_smp_cycles.saturating_add(run as u64);
             if let Some(smp) = self.inner.smp.as_mut() {
                 smp.run(run);
             }
@@ -251,6 +282,9 @@ impl Apu {
                 self.apu_to_cpu_ports[p] = self.inner.cpu_read_port(p as u8);
             }
         }
+
+        self.maybe_trace_apu_control();
+        self.maybe_trace_out_ports();
     }
 
     /// Master clock に合わせてSPC700を回す（S-CPU が停止している期間の進行用）。
@@ -267,7 +301,7 @@ impl Apu {
         let scale_cpu: f64 = std::env::var("APU_CYCLE_SCALE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0.572);
+            .unwrap_or(DEFAULT_APU_CYCLE_SCALE);
         let scale_master = scale_cpu / 6.0;
 
         self.cycle_accum += (master_cycles as f64) * scale_master;
@@ -275,6 +309,7 @@ impl Apu {
         self.cycle_accum -= run as f64;
 
         if run > 0 {
+            self.total_smp_cycles = self.total_smp_cycles.saturating_add(run as u64);
             if let Some(smp) = self.inner.smp.as_mut() {
                 smp.run(run);
             }
@@ -288,6 +323,52 @@ impl Apu {
                 self.apu_to_cpu_ports[p] = self.inner.cpu_read_port(p as u8);
             }
         }
+
+        self.maybe_trace_apu_control();
+        self.maybe_trace_out_ports();
+    }
+
+    fn maybe_trace_apu_control(&mut self) {
+        if std::env::var_os("TRACE_BURNIN_APU_F1").is_none() {
+            return;
+        }
+        let f1 = self.inner.read_u8(0x00F1);
+        let fa = self.inner.read_u8(0x00FA);
+        if f1 == self.trace_last_f1 && fa == self.trace_last_fa {
+            return;
+        }
+        let smp_pc = self.inner.smp.as_ref().map(|s| s.reg_pc).unwrap_or(0);
+        println!(
+            "[APU-F1] apu_cycles={} smp_pc={:04X} $F1 {:02X}->{:02X} $FA {:02X}->{:02X}",
+            self.total_smp_cycles, smp_pc, self.trace_last_f1, f1, self.trace_last_fa, fa
+        );
+        self.trace_last_f1 = f1;
+        self.trace_last_fa = fa;
+    }
+
+    fn maybe_trace_out_ports(&mut self) {
+        if std::env::var_os("TRACE_BURNIN_APU_PORT1").is_none() {
+            return;
+        }
+        let cur = self.inner.cpu_read_port(1);
+        if cur == self.trace_last_out_ports[1] {
+            return;
+        }
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CNT: AtomicU32 = AtomicU32::new(0);
+        let n = CNT.fetch_add(1, Ordering::Relaxed);
+        if n < 256 {
+            let smp_pc = self.inner.smp.as_ref().map(|s| s.reg_pc).unwrap_or(0);
+            let mut code = [0u8; 8];
+            for (i, b) in code.iter_mut().enumerate() {
+                *b = self.inner.read_u8(smp_pc.wrapping_add(i as u16) as u32);
+            }
+            println!(
+                "[APU-PORT1] apu_cycles={} smp_pc={:04X} {:02X}->{:02X} code={:02X?}",
+                self.total_smp_cycles, smp_pc, self.trace_last_out_ports[1], cur, code
+            );
+        }
+        self.trace_last_out_ports[1] = cur;
     }
 
     /// CPU側ポート読み出し ($2140-$2143)

@@ -61,6 +61,7 @@ impl VoiceBuffer {
 pub struct Voice {
     dsp: *mut Dsp,
     emulator: *mut Apu,
+    index: u8,
 
     pub envelope: Box<Envelope>,
 
@@ -84,15 +85,22 @@ pub struct Voice {
     resample_buffer_pos: usize,
 
     pub output_buffer: Box<VoiceBuffer>,
+    outx: u8,
     pub is_muted: bool,
     pub is_solod: bool
 }
 
 impl Voice {
-    pub fn new(dsp: *mut Dsp, emulator: *mut Apu, resampling_mode: ResamplingMode) -> Voice {
+    pub fn new(
+        dsp: *mut Dsp,
+        emulator: *mut Apu,
+        resampling_mode: ResamplingMode,
+        index: u8,
+    ) -> Voice {
         let mut ret = Voice {
             dsp: dsp,
             emulator: emulator,
+            index,
 
             envelope: Box::new(Envelope::new(dsp)),
 
@@ -116,6 +124,7 @@ impl Voice {
             resample_buffer_pos: 0,
 
             output_buffer: Box::new(VoiceBuffer::new()),
+            outx: 0,
             is_muted: false,
             is_solod: false
         };
@@ -147,6 +156,7 @@ impl Voice {
         self.source = 0;
         self.pitch_mod = false;
         self.noise_on = false;
+        self.outx = 0;
 
         self.sample_start_address = 0;
         self.loop_start_address = 0;
@@ -205,10 +215,12 @@ impl Voice {
         let env_level = self.envelope.level;
 
         sample = ((sample * env_level) >> 11) & !1;
+        self.outx = ((sample as i16) >> 8) as u8;
 
         if self.brr_block_decoder.is_end && !self.brr_block_decoder.is_looping {
             self.envelope.key_off();
             self.envelope.level = 0;
+            self.dsp().set_endx_bit(self.index);
         }
 
         self.sample_pos += pitch;
@@ -245,6 +257,14 @@ impl Voice {
 
     pub fn set_pitch_high(&mut self, value: u8) {
         self.pitch_high = value & 0x3f;
+    }
+
+    pub fn pitch_high(&self) -> u8 {
+        self.pitch_high
+    }
+
+    pub fn outx(&self) -> u8 {
+        self.outx
     }
 
     pub fn key_on(&mut self) {

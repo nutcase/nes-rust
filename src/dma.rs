@@ -1,12 +1,16 @@
 // SNES DMA and HDMA implementation
 use crate::debug_flags;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DmaChannel {
     pub control: u8,      // DMA制御レジスタ ($43X0)
     pub dest_address: u8, // 転送先アドレス ($43X1) - PPUレジスタ
     pub src_address: u32, // 転送元アドレス ($43X2-$43X4)
     pub size: u16,        // 転送サイズ ($43X5-$43X6)
+    pub dasb: u8,         // Indirect HDMA bank / DMA reg ($43X7)
+    pub a2a: u16,         // HDMA table current address ($43X8-$43X9)
+    pub nltr: u8,         // HDMA line counter/reload ($43XA)
+    pub unused: u8,       // Unused shared byte ($43XB and $43XF)
 
     // HDMA関連
     pub hdma_table_addr: u32,   // HDMAテーブルアドレス ($43X2-$43X4)
@@ -29,14 +33,29 @@ pub struct DmaChannel {
     pub cfg_size: bool,
 }
 
+impl Default for DmaChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DmaChannel {
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
-            control: 0,
-            dest_address: 0,
-            src_address: 0,
-            size: 0,
+            // Power-on defaults per SNESdev wiki:
+            // - DMAPn  = $FF
+            // - BBADn  = $FF
+            // - A1Tn   = $FFFFFF
+            // - DASn   = $FFFF
+            control: 0xFF,
+            dest_address: 0xFF,
+            src_address: 0x00FF_FFFF,
+            size: 0xFFFF,
+            dasb: 0xFF,
+            a2a: 0xFFFF,
+            nltr: 0xFF,
+            unused: 0xFF,
             hdma_table_addr: 0,
             hdma_line_counter: 0,
             hdma_repeat_flag: false,
@@ -103,7 +122,7 @@ impl DmaController {
             4 => 4,
             5 => 4,
             6 => 2,
-            7 => 1,
+            7 => 4,
             _ => 1,
         }
     }
@@ -118,9 +137,9 @@ impl DmaController {
             2 => base,                            // A, A
             3 => base.wrapping_add((i >> 1) & 1), // A, A, B, B
             4 => base.wrapping_add(i & 3),        // A, B, C, D
-            5 => base.wrapping_add((i >> 1) & 3), // A,A,B,B,C,C,D,D
-            6 => base.wrapping_add((i >> 1) & 1), // A,A,B,B
-            7 => base,                            // A,A
+            5 => base.wrapping_add(i & 1),        // A,B,A,B (undocumented)
+            6 => base,                            // A,A (undocumented)
+            7 => base.wrapping_add((i >> 1) & 1), // A,A,B,B (undocumented)
             _ => base,
         }
     }
@@ -323,10 +342,29 @@ impl DmaController {
                             }
                         }
                         0x07 => {
-                            // Unused register, but might be mirrored
+                            // DASBn ($43x7): Indirect HDMA bank. RW8.
+                            self.channels[channel].dasb = value;
                         }
-                        0x08..=0x0F => {
-                            // Unused registers - ignore writes
+                        0x08 => {
+                            // A2AnL ($43x8): HDMA table current address low. RW8.
+                            self.channels[channel].a2a =
+                                (self.channels[channel].a2a & 0xFF00) | value as u16;
+                        }
+                        0x09 => {
+                            // A2AnH ($43x9): HDMA table current address high. RW8.
+                            self.channels[channel].a2a =
+                                (self.channels[channel].a2a & 0x00FF) | ((value as u16) << 8);
+                        }
+                        0x0A => {
+                            // NLTRn ($43xA): HDMA reload flag + line counter. RW8.
+                            self.channels[channel].nltr = value;
+                        }
+                        0x0B | 0x0F => {
+                            // UNUSEDn ($43xB/$43xF): shared RW8 byte with no effect on DMA/HDMA.
+                            self.channels[channel].unused = value;
+                        }
+                        0x0C..=0x0E => {
+                            // Unused holes: ignore writes (open bus on read).
                         }
                         _ => {}
                     }
@@ -361,6 +399,11 @@ impl DmaController {
                         0x04 => ((self.channels[channel].src_address >> 16) & 0xFF) as u8,
                         0x05 => (self.channels[channel].size & 0xFF) as u8,
                         0x06 => ((self.channels[channel].size >> 8) & 0xFF) as u8,
+                        0x07 => self.channels[channel].dasb,
+                        0x08 => (self.channels[channel].a2a & 0xFF) as u8,
+                        0x09 => ((self.channels[channel].a2a >> 8) & 0xFF) as u8,
+                        0x0A => self.channels[channel].nltr,
+                        0x0B | 0x0F => self.channels[channel].unused,
                         _ => 0xFF,
                     }
                 } else {

@@ -20,7 +20,12 @@ pub struct Smp {
 
     is_stopped: bool,
 
-    cycle_count: i32
+    // Remaining cycle budget for the current (and subsequent) `run()` calls.
+    // This persists across calls to keep accurate timing when `run()` is invoked
+    // with small targets (e.g. 1-2 cycles).
+    cycle_count: i32,
+    // Cycles executed during the most recent `run()` call (returned for optional callers).
+    executed_cycles: i32,
 }
 
 impl Smp {
@@ -45,7 +50,8 @@ impl Smp {
 
             is_stopped: false,
 
-            cycle_count: 0
+            cycle_count: 0,
+            executed_cycles: 0,
         };
         ret.reset();
         ret
@@ -68,6 +74,8 @@ impl Smp {
         self.set_psw(0x02);
 
         self.is_stopped = false;
+        self.cycle_count = 0;
+        self.executed_cycles = 0;
     }
 
     pub fn set_reg_ya(&mut self, value: u16) {
@@ -82,7 +90,9 @@ impl Smp {
     pub fn set_psw(&mut self, value: u8) {
         self.psw_c = (value & 0x01) != 0;
         self.psw_z = (value & 0x02) != 0;
+        self.psw_i = (value & 0x04) != 0;
         self.psw_h = (value & 0x08) != 0;
+        self.psw_b = (value & 0x10) != 0;
         self.psw_p = (value & 0x20) != 0;
         self.psw_v = (value & 0x40) != 0;
         self.psw_n = (value & 0x80) != 0;
@@ -92,7 +102,9 @@ impl Smp {
         ((if self.psw_n { 1 } else { 0 }) << 7) |
         ((if self.psw_v { 1 } else { 0 }) << 6) |
         ((if self.psw_p { 1 } else { 0 }) << 5) |
+        ((if self.psw_b { 1 } else { 0 }) << 4) |
         ((if self.psw_h { 1 } else { 0 }) << 3) |
+        ((if self.psw_i { 1 } else { 0 }) << 2) |
         ((if self.psw_z { 1 } else { 0 }) << 1) |
         (if self.psw_c { 1 } else { 0 })
     }
@@ -103,7 +115,8 @@ impl Smp {
 
     fn cycles(&mut self, num_cycles: i32) {
         self.emulator().cpu_cycles_callback(num_cycles);
-        self.cycle_count += num_cycles;
+        self.executed_cycles += num_cycles;
+        self.cycle_count -= num_cycles;
     }
 
     fn read(&mut self, addr: u16) -> u8 {
@@ -890,8 +903,13 @@ impl Smp {
             })
         }
 
-        self.cycle_count = 0;
-        while self.cycle_count < target_cycles {
+        if target_cycles <= 0 {
+            return 0;
+        }
+
+        self.executed_cycles = 0;
+        self.cycle_count += target_cycles;
+        while self.cycle_count > 0 {
             if !self.is_stopped {
                 let opcode = self.read_pc();
                 match opcode {
@@ -1174,6 +1192,6 @@ impl Smp {
             }
         }
 
-        self.cycle_count
+        self.executed_cycles
     }
 }
