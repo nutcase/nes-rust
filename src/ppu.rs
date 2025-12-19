@@ -2642,7 +2642,20 @@ impl Ppu {
         if color_index == 0 {
             return (0, 0);
         }
-        let palette_index = self.get_bg_palette_index(palette, color_index, 2);
+        // Mode 0 uses a dedicated CGRAM range per BG:
+        // - BG1: palettes 0..7   (CGRAM 0..31)
+        // - BG2: palettes 8..15  (CGRAM 32..63)
+        // - BG3: palettes 16..23 (CGRAM 64..95)
+        // - BG4: palettes 24..31 (CGRAM 96..127)
+        //
+        // For other modes, BG palettes share the lower CGRAM region (0..127).
+        let palette_index = if self.bg_mode == 0 {
+            let bg_off = (bg_num as u16).saturating_mul(32);
+            let idx = bg_off + (palette as u16) * 4 + (color_index as u16);
+            idx.min(127) as u8
+        } else {
+            self.get_bg_palette_index(palette, color_index, 2)
+        };
         let color = self.cgram_to_rgb(palette_index);
 
         // Use palette result strictly as-is (no heuristic overrides)
@@ -6391,7 +6404,11 @@ impl Ppu {
         if final_color != 0 {
             final_color
         } else {
-            self.cgram_to_rgb(0) // backdrop
+            // When the entire sub-screen is transparent, real hardware uses the fixed
+            // color ($2132) instead of CGRAM color 0. This matters for color math
+            // tricks used by the official burn-in test suite (OBJTEST expects a white
+            // background via fixed color).
+            self.fixed_color_to_rgb()
         }
     }
 
@@ -6409,7 +6426,8 @@ impl Ppu {
         if final_color != 0 {
             (final_color, layer_id)
         } else {
-            (self.cgram_to_rgb(0), 5)
+            // Sub-screen backdrop is the fixed color ($2132), not CGRAM[0].
+            (self.fixed_color_to_rgb(), 5)
         }
     }
 
