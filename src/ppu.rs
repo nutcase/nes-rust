@@ -841,21 +841,23 @@ impl Ppu {
         // Use existing per-pixel composition with color math and windows.
         let (mut main_color, mut main_layer_id) =
             self.render_main_screen_pixel_with_layer(x as u16, y as u16);
+        let main_transparent = main_color == 0;
         // If main pixel is transparent, treat as backdrop for color math decisions
         if main_color == 0 {
             main_color = self.cgram_to_rgb(0);
             main_layer_id = 5; // Backdrop layer id
         }
-        let (sub_color, sub_layer_id) = self.render_sub_screen_pixel_with_layer(x as u16, y as u16);
+        let (sub_color, sub_layer_id, sub_transparent) =
+            self.render_sub_screen_pixel_with_layer(x as u16, y as u16);
         let hires_out = self.pseudo_hires || matches!(self.bg_mode, 5 | 6);
         let final_color = if hires_out {
             let even_mix =
-                self.apply_color_math_screens(main_color, sub_color, main_layer_id, x as u16);
+                self.apply_color_math_screens(main_color, sub_color, main_layer_id, x as u16, sub_transparent);
             let odd_mix =
-                self.apply_color_math_screens(sub_color, main_color, sub_layer_id, x as u16);
+                self.apply_color_math_screens(sub_color, main_color, sub_layer_id, x as u16, main_transparent);
             Self::average_rgb(even_mix, odd_mix)
         } else {
-            self.apply_color_math_screens(main_color, sub_color, main_layer_id, x as u16)
+            self.apply_color_math_screens(main_color, sub_color, main_layer_id, x as u16, sub_transparent)
         };
 
         let pixel_offset = y * 256 + x;
@@ -1387,22 +1389,43 @@ impl Ppu {
         // Render all 256 pixels
         for x in 0..256 {
             // メインスクリーンとサブスクリーンを個別に描画（レイヤID付き）
-            let (main_color, main_layer_id) =
+            let (mut main_color, mut main_layer_id) =
                 self.render_main_screen_pixel_with_layer(x as u16, y as u16);
-            let (sub_color, sub_layer_id) =
+            let main_transparent = main_color == 0;
+            if main_color == 0 {
+                main_color = self.cgram_to_rgb(0);
+                main_layer_id = 5;
+            }
+            let (sub_color, sub_layer_id, sub_transparent) =
                 self.render_sub_screen_pixel_with_layer(x as u16, y as u16);
 
             let final_color = if self.pseudo_hires {
                 // 疑似ハイレゾ: 512pxを256pxに折りたたむ近似として、
                 // main→sub と sub→main の両方の合成結果を平均化。
-                let even_mix =
-                    self.apply_color_math_screens(main_color, sub_color, main_layer_id, x as u16);
-                let odd_mix =
-                    self.apply_color_math_screens(sub_color, main_color, sub_layer_id, x as u16);
+                let even_mix = self.apply_color_math_screens(
+                    main_color,
+                    sub_color,
+                    main_layer_id,
+                    x as u16,
+                    sub_transparent,
+                );
+                let odd_mix = self.apply_color_math_screens(
+                    sub_color,
+                    main_color,
+                    sub_layer_id,
+                    x as u16,
+                    main_transparent,
+                );
                 Self::average_rgb(even_mix, odd_mix)
             } else {
                 // カラー演算適用（対象レイヤに限定）
-                self.apply_color_math_screens(main_color, sub_color, main_layer_id, x as u16)
+                self.apply_color_math_screens(
+                    main_color,
+                    sub_color,
+                    main_layer_id,
+                    x as u16,
+                    sub_transparent,
+                )
             };
 
             let pixel_offset = y * 256 + x;
@@ -6196,34 +6219,39 @@ impl Ppu {
     }
 
     fn blend_colors(&self, color1: u32, color2: u32, is_addition: bool, halve: bool) -> u32 {
-        // Work in 5-bit space to better match SNES BGR555 math, then expand to 8-bit.
-        let r1 = ((color1 >> 16) & 0xFF) as u16 >> 3;
-        let g1 = ((color1 >> 8) & 0xFF) as u16 >> 3;
-        let b1 = (color1 & 0xFF) as u16 >> 3;
+        // Work in 5-bit space (SNES BGR555), then expand to 8-bit.
+        //
+        // SNES color math order (per docs):
+        //   1) main +/- sub/fixed
+        //   2) optional /2 (half color math)
+        //   3) clamp to 0..31
+        //
+        // Doing saturating add before halving breaks Add+Half (it would cap at 31, then /2,
+        // incorrectly darkening the result). Keep the full sum first, then halve, then clamp.
+        let r1 = (((color1 >> 16) & 0xFF) as i16) >> 3;
+        let g1 = (((color1 >> 8) & 0xFF) as i16) >> 3;
+        let b1 = ((color1 & 0xFF) as i16) >> 3;
 
-        let r2 = ((color2 >> 16) & 0xFF) as u16 >> 3;
-        let g2 = ((color2 >> 8) & 0xFF) as u16 >> 3;
-        let b2 = (color2 & 0xFF) as u16 >> 3;
+        let r2 = (((color2 >> 16) & 0xFF) as i16) >> 3;
+        let g2 = (((color2 >> 8) & 0xFF) as i16) >> 3;
+        let b2 = ((color2 & 0xFF) as i16) >> 3;
 
         let (mut r, mut g, mut b) = if is_addition {
-            // 5-bit saturating add
-            let r = (r1 + r2).min(31);
-            let g = (g1 + g2).min(31);
-            let b = (b1 + b2).min(31);
-            (r, g, b)
+            (r1 + r2, g1 + g2, b1 + b2)
         } else {
-            // 5-bit saturating sub
-            let r = r1.saturating_sub(r2);
-            let g = g1.saturating_sub(g2);
-            let b = b1.saturating_sub(b2);
-            (r, g, b)
+            (r1 - r2, g1 - g2, b1 - b2)
         };
 
         if halve {
+            // Arithmetic shift matches hardware's divide-by-2 behavior for signed intermediates.
             r >>= 1;
             g >>= 1;
             b >>= 1;
         }
+
+        r = r.clamp(0, 31);
+        g = g.clamp(0, 31);
+        b = b.clamp(0, 31);
 
         // Expand back to 8-bit (x<<3 | x>>2 format)
         let r8 = ((r as u32) << 3) | ((r as u32) >> 2);
@@ -6413,7 +6441,11 @@ impl Ppu {
     }
 
     // サブスクリーン描画（レイヤID付き）
-    fn render_sub_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8) {
+    // 戻り値:
+    // - color: 合成後のRGBA
+    // - layer_id: 最前面レイヤ（0..4、5=backdrop）
+    // - transparent: サブスクリーンが完全透明で、fixed color ($2132) をbackdropとして返した場合
+    fn render_sub_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8, bool) {
         let (bg_color, bg_priority, bg_id) = self.get_sub_bg_pixel(x, y);
         let (sprite_color, sprite_priority) = self.get_sub_sprite_pixel(x, y);
         let (final_color, layer_id) = self.composite_pixel_with_layer(
@@ -6424,10 +6456,10 @@ impl Ppu {
             sprite_priority,
         );
         if final_color != 0 {
-            (final_color, layer_id)
+            (final_color, layer_id, false)
         } else {
             // Sub-screen backdrop is the fixed color ($2132), not CGRAM[0].
-            (self.fixed_color_to_rgb(), 5)
+            (self.fixed_color_to_rgb(), 5, true)
         }
     }
 
@@ -6581,6 +6613,7 @@ impl Ppu {
         sub_color_in: u32,
         main_layer_id: u8,
         x: u16,
+        sub_transparent: bool,
     ) -> u32 {
         // Forced blank produces black regardless of color math (unless FORCE_DISPLAY)
         if (self.screen_display & 0x80) != 0 && !self.force_display_active() {
@@ -6640,8 +6673,15 @@ impl Ppu {
 
         // Subsource is only used for color math; transparent main becomes backdrop earlier
         let use_sub_src = (self.cgwsel & 0x02) != 0; // 1=subscreen, 0=fixed
+        // NOTE: If the subscreen pixel is transparent, real hardware uses fixed color ($2132)
+        // as the addend, *and* disables half color math for that pixel.
+        let sub_is_fixed_fallback = use_sub_src && sub_transparent;
         let sub_src = if use_sub_src {
-            sub_color_in
+            if sub_is_fixed_fallback {
+                self.fixed_color_to_rgb()
+            } else {
+                sub_color_in
+            }
         } else {
             self.fixed_color_to_rgb()
         };
@@ -6666,7 +6706,7 @@ impl Ppu {
         }
 
         let src = sub_src;
-        let src_is_fixed = !use_sub_src;
+        let src_is_fixed = !use_sub_src || sub_is_fixed_fallback;
         // Use CGADSUB for add/sub + halve
         let is_addition = (self.cgadsub & 0x80) == 0;
         let halve_flag = (self.cgadsub & 0x40) != 0;
@@ -6674,7 +6714,7 @@ impl Ppu {
         // halve the result to approximate 512px brightness. Skip when src is fixed color.
         let hires_halve =
             self.pseudo_hires && use_sub_src && !src_is_fixed && main_color != 0 && src != 0;
-        let effective_halve = halve_flag || hires_halve;
+        let effective_halve = (halve_flag || hires_halve) && !sub_is_fixed_fallback;
         let out = self.blend_colors(main_color, src, is_addition, effective_halve);
         if crate::debug_flags::render_metrics() {
             if is_addition {
