@@ -38,6 +38,7 @@ cargo build --release --bin snes_emulator 2>&1 | grep -v "^   Compiling" | grep 
 echo "[2/3] Running headless test..."
 env HEADLESS=1 \
     HEADLESS_FRAMES=$FRAMES \
+    HEADLESS_AUTO_INPUT=1 \
     QUIET=1 \
     DUMP_REGISTER_SUMMARY=1 \
     DUMP_REGISTER_FRAMES="100,200,300,$FRAMES" \

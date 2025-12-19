@@ -40,6 +40,7 @@ trap '[[ -n "$TMP_LOG" && -f "$TMP_LOG" && -z "${CPUTEST_KEEP_LOG:-}" ]] && rm -
 echo "[cputest] Running headless (${FRAMES} frames max): $ROM_ARG"
 set +e
 CPU_TEST_MODE=1 \
+HEADLESS_AUTO_INPUT=1 \
 HEADLESS=1 \
 HEADLESS_FRAMES="${FRAMES}" \
 HEADLESS_SUMMARY=0 \

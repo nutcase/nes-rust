@@ -3313,6 +3313,14 @@ impl Emulator {
         if !self.headless {
             return;
         }
+        // Headless の自動入力は便利だが、通常実行の観察を邪魔することがあるため既定では無効。
+        // 必要な場合は HEADLESS_AUTO_INPUT=1 を明示して有効化する。
+        let enabled = std::env::var("HEADLESS_AUTO_INPUT")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
 
         // cputest/snes-test 等のテストROMは「右ボタンの押下→リリース」でスタートを検出する。
         // ヘッドレスでは入力できないため、対象タイトルでは短時間だけ「右+A+START」を押し、
