@@ -3258,20 +3258,6 @@ impl Emulator {
         if self.headless {
             return;
         }
-        // 自動ボタン押下（複数のボタンを順次試行）
-        let auto_start = self.frame_count >= 180 && self.frame_count <= 240;
-        let auto_a = self.frame_count >= 300 && self.frame_count <= 360;
-        let auto_b = self.frame_count >= 420 && self.frame_count <= 480;
-
-        if !crate::debug_flags::quiet() {
-            if auto_start && self.frame_count == 180 {
-                println!("Auto-pressing START button at frame {}", self.frame_count);
-            } else if auto_a && self.frame_count == 300 {
-                println!("Auto-pressing A button at frame {}", self.frame_count);
-            } else if auto_b && self.frame_count == 420 {
-                println!("Auto-pressing B button at frame {}", self.frame_count);
-            }
-        }
 
         // キーボード入力を KeyStates に変換
         if let Some(w) = &self.window {
@@ -3279,13 +3265,13 @@ impl Emulator {
             key_states.down = w.is_key_down(Key::Down);
             key_states.left = w.is_key_down(Key::Left);
             key_states.right = w.is_key_down(Key::Right);
-            key_states.b = w.is_key_down(Key::Z) || auto_b;
-            key_states.a = w.is_key_down(Key::X) || auto_a;
+            key_states.b = w.is_key_down(Key::Z);
+            key_states.a = w.is_key_down(Key::X);
             key_states.y = w.is_key_down(Key::A);
             key_states.x = w.is_key_down(Key::S);
             key_states.l = w.is_key_down(Key::Q);
             key_states.r = w.is_key_down(Key::W);
-            key_states.start = w.is_key_down(Key::Enter) || auto_start;
+            key_states.start = w.is_key_down(Key::Enter);
             key_states.select = w.is_key_down(Key::RightShift);
         }
 
