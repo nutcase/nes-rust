@@ -789,7 +789,7 @@ impl Cpu {
             }
         }
 
-        let trace_p_change = std::env::var_os("TRACE_P_CHANGE").is_some();
+        let trace_p_change = crate::debug_flags::trace_p_change();
         let p_before = state_before.p;
 
         bus.begin_cpu_instruction();
@@ -798,7 +798,7 @@ impl Cpu {
 
         // 軽量PCウォッチ: 環境変数 WATCH_PC_FLOW がセットされていれば、
         // 00:8240-00:82A0 付近のPC遷移を先頭 64 件だけ表示する（初回フレーム向け）。
-        if std::env::var_os("WATCH_PC_FLOW").is_some() {
+        if crate::debug_flags::watch_pc_flow() {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static LOGGED: AtomicUsize = AtomicUsize::new(0);
             let count = LOGGED.load(Ordering::Relaxed);

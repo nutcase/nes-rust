@@ -6,6 +6,10 @@ fn env_flag(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_present(key: &str) -> bool {
+    std::env::var_os(key).is_some()
+}
+
 fn env_u16(key: &str, default: u16) -> u16 {
     std::env::var(key)
         .ok()
@@ -136,6 +140,142 @@ pub fn quiet() -> bool {
 pub fn headless() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("HEADLESS", false))
+}
+
+// Hot-path traces: use env presence semantics to avoid repeated env lookups.
+pub fn trace_vectors() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_VECTORS"))
+}
+
+pub fn trace_4212() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_4212"))
+}
+
+pub fn trace_sfr() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_SFR"))
+}
+
+pub fn trace_sfr_values() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_SFR_VALUES"))
+}
+
+pub fn trace_sfr_val() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_SFR_VAL"))
+}
+
+pub fn trace_bwram_sys() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BWRAM_SYS"))
+}
+
+pub fn trace_sa1_reg() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_SA1_REG"))
+}
+
+pub fn trace_burnin_dma_memory() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_DMA_MEMORY"))
+}
+
+pub fn trace_burnin_status() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_STATUS"))
+}
+
+pub fn trace_burnin_apu_status() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_APU_STATUS"))
+}
+
+pub fn trace_fake_apu() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_FAKE_APU"))
+}
+
+pub fn trace_burnin_apu_prog() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_APU_PROG"))
+}
+
+pub fn trace_apu_port() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_APU_PORT"))
+}
+
+pub fn trace_stack_write() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_STACK_WRITE"))
+}
+
+pub fn debug_stack_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("DEBUG_STACK_TRACE"))
+}
+
+pub fn trace_burnin_zp16() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_ZP16"))
+}
+
+pub fn trace_zp() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_ZP"))
+}
+
+pub fn trace_burnin_apu_cpu() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_APU_CPU"))
+}
+
+pub fn trace_burnin_apu_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_APU_WRITES"))
+}
+
+pub fn trace_wram_stack_dma() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_WRAM_STACK_DMA"))
+}
+
+pub fn trace_wram_addr() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_WRAM_ADDR"))
+}
+
+pub fn trace_dma_reg_pc() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_DMA_REG_PC"))
+}
+
+pub fn trace_dma_addr() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_DMA_ADDR"))
+}
+
+pub fn trace_dq3_sp_mem() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_DQ3_SP_MEM"))
+}
+
+pub fn trace_handshake() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_HANDSHAKE"))
+}
+
+pub fn trace_p_change() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_P_CHANGE"))
+}
+
+pub fn watch_pc_flow() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("WATCH_PC_FLOW"))
 }
 
 // Trace long jumps/returns (JSL/RTL) for DQ3 investigation

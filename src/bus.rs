@@ -21,6 +21,8 @@ pub enum CpuTestResult {
 
 pub struct Bus {
     wram: Vec<u8>,
+    wram_64k_mirror: bool,
+    trace_nmi_wram: bool,
     sram: Vec<u8>,
     rom: Vec<u8>,
     ppu: crate::ppu::Ppu,
@@ -295,6 +297,8 @@ impl Bus {
             .unwrap_or(true);
         let mut bus = Self {
             wram: vec![0; 0x20000],
+            wram_64k_mirror: std::env::var_os("WRAM_64K_MIRROR").is_some(),
+            trace_nmi_wram: std::env::var_os("TRACE_NMI_WRAM").is_some(),
             sram: vec![0; 0x8000],
             rom,
             ppu: crate::ppu::Ppu::new(),
@@ -498,6 +502,8 @@ impl Bus {
             .unwrap_or(true);
         let mut bus = Self {
             wram: vec![0; 0x20000],
+            wram_64k_mirror: std::env::var_os("WRAM_64K_MIRROR").is_some(),
+            trace_nmi_wram: std::env::var_os("TRACE_NMI_WRAM").is_some(),
             sram: vec![0; sram_size.max(0x2000)], // Minimum 8KB SRAM
             rom,
             ppu: crate::ppu::Ppu::new(),
@@ -1819,9 +1825,9 @@ impl Bus {
         }
 
         // Debug: trace BRK/IRQ/NMI vector reads to verify mapping (SMW freeze investigation)
-        if std::env::var_os("TRACE_VECTORS").is_some()
-            && bank == 0x00
+        if bank == 0x00
             && (0xFFE0..=0xFFFF).contains(&offset)
+            && crate::debug_flags::trace_vectors()
         {
             use std::sync::atomic::{AtomicU32, Ordering};
             static COUNT_VEC: AtomicU32 = AtomicU32::new(0);
@@ -1837,7 +1843,7 @@ impl Bus {
         }
 
         // Debug: trace HVBJOY reads to confirm address decoding (opt-in)
-        if std::env::var_os("TRACE_4212").is_some() && offset == 0x4212 {
+        if offset == 0x4212 && crate::debug_flags::trace_4212() {
             use std::sync::atomic::{AtomicU32, Ordering};
             static READ_COUNT_4212: AtomicU32 = AtomicU32::new(0);
             let idx = READ_COUNT_4212.fetch_add(1, Ordering::Relaxed);
@@ -1849,34 +1855,35 @@ impl Bus {
             }
         }
         // Debug: trace S-CPU reads of SA-1 status regs ($2300/$2301) (opt-in)
-        if (std::env::var_os("TRACE_SFR").is_some()
-            || std::env::var_os("TRACE_SFR_VALUES").is_some())
-            && (offset == 0x2300 || offset == 0x2301)
-        {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static READ_COUNT_SFR: AtomicU32 = AtomicU32::new(0);
-            let idx = READ_COUNT_SFR.fetch_add(1, Ordering::Relaxed);
-            if idx < 16 {
-                let val = if std::env::var_os("TRACE_SFR_VALUES").is_some() {
-                    // Safe to double-read; SA-1 register reads are side-effect free.
-                    if offset == 0x2300 {
-                        Some(self.sa1.read_register(0))
+        if offset == 0x2300 || offset == 0x2301 {
+            let trace_sfr = crate::debug_flags::trace_sfr();
+            let trace_sfr_values = crate::debug_flags::trace_sfr_values();
+            if trace_sfr || trace_sfr_values {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static READ_COUNT_SFR: AtomicU32 = AtomicU32::new(0);
+                let idx = READ_COUNT_SFR.fetch_add(1, Ordering::Relaxed);
+                if idx < 16 {
+                    let val = if trace_sfr_values {
+                        // Safe to double-read; SA-1 register reads are side-effect free.
+                        if offset == 0x2300 {
+                            Some(self.sa1.read_register(0))
+                        } else {
+                            Some(self.sa1.read_register(1))
+                        }
                     } else {
-                        Some(self.sa1.read_register(1))
+                        None
+                    };
+                    if let Some(v) = val {
+                        println!(
+                            "[TRACE_SFR] addr={:06X} bank={:02X} offset={:04X} val=0x{:02X}",
+                            addr, bank, offset, v
+                        );
+                    } else {
+                        println!(
+                            "[TRACE_SFR] addr={:06X} bank={:02X} offset={:04X}",
+                            addr, bank, offset
+                        );
                     }
-                } else {
-                    None
-                };
-                if let Some(v) = val {
-                    println!(
-                        "[TRACE_SFR] addr={:06X} bank={:02X} offset={:04X} val=0x{:02X}",
-                        addr, bank, offset, v
-                    );
-                } else {
-                    println!(
-                        "[TRACE_SFR] addr={:06X} bank={:02X} offset={:04X}",
-                        addr, bank, offset
-                    );
                 }
             }
         }
@@ -1943,7 +1950,7 @@ impl Bus {
                     0x6000..=0x7FFF if self.is_sa1_active() => {
                         if let Some(idx) = self.sa1_bwram_addr(offset) {
                             let v = self.sa1_bwram[idx];
-                            if std::env::var_os("TRACE_BWRAM_SYS").is_some() {
+                            if crate::debug_flags::trace_bwram_sys() {
                                 use std::sync::atomic::{AtomicU32, Ordering};
                                 static COUNT_R: AtomicU32 = AtomicU32::new(0);
                                 let n = COUNT_R.fetch_add(1, Ordering::Relaxed);
@@ -1956,7 +1963,7 @@ impl Bus {
                             }
                             return v;
                         }
-                        if std::env::var_os("TRACE_BWRAM_SYS").is_some() {
+                        if crate::debug_flags::trace_bwram_sys() {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static COUNT: AtomicU32 = AtomicU32::new(0);
                             let n = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1973,10 +1980,10 @@ impl Bus {
                     0x2200..=0x23FF if self.is_sa1_active() => {
                         let reg = offset - 0x2200;
                         let v = self.sa1.read_register(reg);
-                        if std::env::var_os("TRACE_SA1_REG").is_some() {
+                        if crate::debug_flags::trace_sa1_reg() {
                             println!("SA1 REG R {:02X}:{:04X} -> {:02X}", bank, offset, v);
                         }
-                        if std::env::var_os("TRACE_SFR_VAL").is_some() && reg <= 1 {
+                        if reg <= 1 && crate::debug_flags::trace_sfr_val() {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static COUNT_SFR: AtomicU32 = AtomicU32::new(0);
                             let idx = COUNT_SFR.fetch_add(1, Ordering::Relaxed);
@@ -1997,8 +2004,8 @@ impl Bus {
                     // PPU registers
                     0x2100..=0x213F => {
                         let ppu_reg = offset & 0xFF;
-                        if std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some()
-                            && matches!(ppu_reg, 0x39 | 0x3A)
+                        if matches!(ppu_reg, 0x39 | 0x3A)
+                            && crate::debug_flags::trace_burnin_dma_memory()
                         {
                             let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
                             if (0xAE80..=0xAEEF).contains(&pc16) {
@@ -2015,8 +2022,8 @@ impl Bus {
                             }
                         }
                         let v = self.ppu.read(ppu_reg);
-                        if std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some()
-                            && matches!(ppu_reg, 0x39 | 0x3A)
+                        if matches!(ppu_reg, 0x39 | 0x3A)
+                            && crate::debug_flags::trace_burnin_dma_memory()
                         {
                             let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
                             if (0xAE80..=0xAEEF).contains(&pc16) {
@@ -2103,7 +2110,7 @@ impl Bus {
                                 _ => 0x00,
                             };
                             if !self.fake_apu_booted {
-                                if std::env::var_os("TRACE_FAKE_APU").is_some() {
+                                if crate::debug_flags::trace_fake_apu() {
                                     use std::sync::atomic::{AtomicU32, Ordering};
                                     static COUNT: AtomicU32 = AtomicU32::new(0);
                                     let n = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -2119,7 +2126,7 @@ impl Bus {
                                 let port_idx = (offset & 0x03) as usize;
                                 // Echo last written value (simple HLE).
                                 let v = self.fake_apu_ports[port_idx];
-                                if std::env::var_os("TRACE_FAKE_APU").is_some() {
+                                if crate::debug_flags::trace_fake_apu() {
                                     use std::sync::atomic::{AtomicU32, Ordering};
                                     static COUNT: AtomicU32 = AtomicU32::new(0);
                                     let n = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -2140,7 +2147,7 @@ impl Bus {
                                     let v = apu.read_port(p);
                                     // burn-in-test.sfc APU FAIL調査: CPU側が最終判定で $2141 を読む瞬間に
                                     // APU(S-SMP) の実行位置をログに出す（opt-in, 少量）。
-                                    if std::env::var_os("TRACE_BURNIN_APU_PROG").is_some()
+                                    if crate::debug_flags::trace_burnin_apu_prog()
                                         && offset == 0x2141
                                         && self.last_cpu_pc == 0x00863F
                                     {
@@ -2192,7 +2199,7 @@ impl Bus {
                                             }
                                         }
                                     }
-                                    if std::env::var_os("TRACE_APU_PORT").is_some() {
+                                    if crate::debug_flags::trace_apu_port() {
                                         use std::sync::atomic::{AtomicU32, Ordering};
                                         static COUNT: AtomicU32 = AtomicU32::new(0);
                                         let n = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -2369,14 +2376,13 @@ impl Bus {
             // Extended WRAM banks
             0x7E..=0x7F => {
                 // Optionally mirror 7E/7F to the same 64KB (useful for some test ROMs)
-                let mirror64k = std::env::var_os("WRAM_64K_MIRROR").is_some();
-                let wram_addr = if mirror64k {
+                let wram_addr = if self.wram_64k_mirror {
                     (offset as usize) & 0xFFFF
                 } else {
                     ((bank - 0x7E) as usize) * 0x10000 + (offset as usize)
                 };
                 // Debug: trace key handshake variables in WRAM (DQ3 NMI paths)
-                if std::env::var_os("TRACE_NMI_WRAM").is_some() {
+                if self.trace_nmi_wram {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static READ_COUNT: AtomicU32 = AtomicU32::new(0);
                     if let Some(label) = match wram_addr {
@@ -2714,13 +2720,13 @@ impl Bus {
             }
         }
 
-        if std::env::var_os("TRACE_STACK_WRITE").is_some() {
-            if (offset >= 0x0100 && offset <= 0x01FF) || offset == 0xFFFF {
-                println!(
-                    "[STACK-WRITE] PC={:06X} wrote {:02X} to {:02X}:{:04X}",
-                    self.last_cpu_pc, value, bank, offset
-                );
-            }
+        if ((offset >= 0x0100 && offset <= 0x01FF) || offset == 0xFFFF)
+            && crate::debug_flags::trace_stack_write()
+        {
+            println!(
+                "[STACK-WRITE] PC={:06X} wrote {:02X} to {:02X}:{:04X}",
+                self.last_cpu_pc, value, bank, offset
+            );
         }
 
         // SA-1 BW-RAM mapping for S-CPU in banks $40-$4F and $60-$6F
@@ -2746,7 +2752,7 @@ impl Bus {
                     // Stack area (0x0100-0x01FF)
                     0x0100..=0x01FF => {
                         // Debug stack corruption - trace suspicious writes
-                        if std::env::var_os("DEBUG_STACK_TRACE").is_some() {
+                        if crate::debug_flags::debug_stack_trace() {
                             static mut STACK_TRACE_COUNT: u32 = 0;
                             unsafe {
                                 STACK_TRACE_COUNT += 1;
@@ -2774,7 +2780,7 @@ impl Bus {
                                 );
                             }
                         }
-                        if std::env::var_os("TRACE_BURNIN_ZP16").is_some()
+                        if crate::debug_flags::trace_burnin_zp16()
                             && matches!(offset, 0x0016 | 0x0017 | 0x001F)
                         {
                             println!(
@@ -2787,7 +2793,7 @@ impl Bus {
                                 self.ppu.get_cycle()
                             );
                         }
-                        if std::env::var_os("TRACE_ZP").is_some() && offset < 0x0010 {
+                        if offset < 0x0010 && crate::debug_flags::trace_zp() {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static COUNT: AtomicU32 = AtomicU32::new(0);
                             let n = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -2805,7 +2811,7 @@ impl Bus {
                     0x6000..=0x7FFF if self.is_sa1_active() => {
                         if let Some(idx) = self.sa1_bwram_addr(offset) {
                             self.sa1_bwram[idx] = value;
-                            if std::env::var_os("TRACE_BWRAM_SYS").is_some() {
+                            if crate::debug_flags::trace_bwram_sys() {
                                 use std::sync::atomic::{AtomicU32, Ordering};
                                 static COUNT: AtomicU32 = AtomicU32::new(0);
                                 let n = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -2840,11 +2846,9 @@ impl Bus {
                         // burn-in-test.sfc diagnostics: include S-CPU PC for VRAM data port writes
                         // that touch the DMA MEMORY test region (VMADD 0x5000..0x57FF).
                         if matches!(ppu_reg, 0x18 | 0x19) {
-                            let trace_dmamem =
-                                std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some();
-                            let trace_status = std::env::var_os("TRACE_BURNIN_STATUS").is_some();
-                            let trace_apu_status =
-                                std::env::var_os("TRACE_BURNIN_APU_STATUS").is_some();
+                            let trace_dmamem = crate::debug_flags::trace_burnin_dma_memory();
+                            let trace_status = crate::debug_flags::trace_burnin_status();
+                            let trace_apu_status = crate::debug_flags::trace_burnin_apu_status();
                             if trace_dmamem || trace_status || trace_apu_status {
                                 use std::sync::atomic::{AtomicU32, Ordering};
                                 let (vmadd, _inc, vmain) = self.ppu.dbg_vram_regs();
@@ -2898,8 +2902,8 @@ impl Bus {
                             }
                         }
                         self.ppu.write(ppu_reg, value);
-                        if std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some()
-                            && matches!(ppu_reg, 0x00 | 0x15 | 0x16 | 0x17)
+                        if matches!(ppu_reg, 0x00 | 0x15 | 0x16 | 0x17)
+                            && crate::debug_flags::trace_burnin_dma_memory()
                         {
                             let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
                             if (0xAE80..=0xAEEF).contains(&pc16) {
@@ -2917,7 +2921,7 @@ impl Bus {
                         }
                     }
                     0x2200..=0x23FF if self.is_sa1_active() => {
-                        if std::env::var_os("TRACE_SA1_REG").is_some() {
+                        if crate::debug_flags::trace_sa1_reg() {
                             println!(
                                 "SA1 REG W (S-CPU) {:02X}:{:04X} = {:02X}",
                                 bank, offset, value
@@ -2928,7 +2932,7 @@ impl Bus {
                     // APU registers
                     0x2140..=0x217F => {
                         // burn-in-test.sfc APU test: trace the CPU command sequence (opt-in, low volume).
-                        if std::env::var_os("TRACE_BURNIN_APU_CPU").is_some()
+                        if crate::debug_flags::trace_burnin_apu_cpu()
                             && offset <= 0x2143
                             && (0x008600..=0x008700).contains(&self.last_cpu_pc)
                         {
@@ -2946,7 +2950,7 @@ impl Bus {
                             );
                         }
                         // burn-in-test.sfc: broader APU port write trace with frame correlation (opt-in).
-                        if std::env::var_os("TRACE_BURNIN_APU_WRITES").is_some()
+                        if crate::debug_flags::trace_burnin_apu_writes()
                             && offset <= 0x2143
                             && (150..=420).contains(&self.ppu.get_frame())
                         {
@@ -3049,7 +3053,7 @@ impl Bus {
                                         };
                                         self.fake_apu_spc_addr = 0;
                                         self.fake_apu_spc_ram.fill(0);
-                                        if std::env::var_os("TRACE_FAKE_APU").is_some() {
+                                        if crate::debug_flags::trace_fake_apu() {
                                             println!(
                                                 "[FAKE-APU] STATE -> {:?} (on CC kick)",
                                                 self.fake_apu_upload_state
@@ -3076,7 +3080,7 @@ impl Bus {
                                         self.fake_apu_upload_echo[port] = value;
                                     }
                                 }
-                                if std::env::var_os("TRACE_FAKE_APU").is_some() {
+                                if crate::debug_flags::trace_fake_apu() {
                                     println!(
                                         "[FAKE-APU] W ${:04X} <- {:02X} (preboot state={:?})",
                                         offset, value, self.fake_apu_upload_state
@@ -3096,7 +3100,7 @@ impl Bus {
                                             crate::fake_apu::FakeApuUploadState::Done;
                                         self.fake_apu_ports[0] = 0;
                                         self.fake_apu_ports[1] = 0;
-                                        if std::env::var_os("TRACE_FAKE_APU").is_some() {
+                                        if crate::debug_flags::trace_fake_apu() {
                                             println!(
                                                 "[FAKE-APU] Timeout -> Done (idle_reads={})",
                                                 self.fake_apu_idle_reads
@@ -3154,7 +3158,7 @@ impl Bus {
                                             crate::fake_apu::FakeApuUploadState::Done;
                                         self.fake_apu_run_cooldown = 2;
                                         // 実機では完了後もエコー維持とされるためポートはクリアしない
-                                        if std::env::var_os("TRACE_FAKE_APU").is_some() {
+                                        if crate::debug_flags::trace_fake_apu() {
                                             println!(
                                                 "[FAKE-APU] Upload complete (bytes={})",
                                                 self.fake_apu_upload_data_bytes
@@ -3172,7 +3176,7 @@ impl Bus {
                                 }
                             }
 
-                            if std::env::var_os("TRACE_FAKE_APU").is_some() {
+                            if crate::debug_flags::trace_fake_apu() {
                                 use std::sync::atomic::{AtomicU32, Ordering};
                                 static COUNT_W: AtomicU32 = AtomicU32::new(0);
                                 let n = COUNT_W.fetch_add(1, Ordering::Relaxed);
@@ -3188,7 +3192,7 @@ impl Bus {
                             }
                         } else if let Ok(mut apu) = self.apu.lock() {
                             let p = (offset & 0x03) as u8;
-                            if std::env::var_os("TRACE_APU_PORT").is_some() {
+                            if crate::debug_flags::trace_apu_port() {
                                 use std::sync::atomic::{AtomicU32, Ordering};
                                 static COUNT_W: AtomicU32 = AtomicU32::new(0);
                                 let n = COUNT_W.fetch_add(1, Ordering::Relaxed);
@@ -3223,8 +3227,8 @@ impl Bus {
                     0x2180 => {
                         let addr = self.wram_address as usize;
                         if addr < self.wram.len() {
-                            if std::env::var_os("TRACE_WRAM_STACK_DMA").is_some()
-                                && (0x0100..=0x01FF).contains(&(addr as u32))
+                            if (0x0100..=0x01FF).contains(&(addr as u32))
+                                && crate::debug_flags::trace_wram_stack_dma()
                             {
                                 println!(
                                     "[WRAM-STACK] PC={:06X} addr=0x{:05X} val=0x{:02X}",
@@ -3234,7 +3238,7 @@ impl Bus {
                             self.wram[addr] = value;
                             // WMADD ($2181-2183) is a 17-bit address; auto-increment carries across bit16.
                             self.wram_address = (self.wram_address + 1) & 0x1FFFF;
-                            if std::env::var_os("TRACE_WRAM_ADDR").is_some() {
+                            if crate::debug_flags::trace_wram_addr() {
                                 static TRACE_WRAM_CNT: OnceLock<std::sync::atomic::AtomicU32> =
                                     OnceLock::new();
                                 let n = TRACE_WRAM_CNT
@@ -3252,7 +3256,7 @@ impl Bus {
                     // WRAM Address registers
                     0x2181 => {
                         self.wram_address = (self.wram_address & 0xFFFF00) | (value as u32);
-                        if std::env::var_os("TRACE_WRAM_ADDR").is_some() {
+                        if crate::debug_flags::trace_wram_addr() {
                             println!(
                                 "[WRAM ADR] write 2181 = {:02X} -> addr=0x{:05X}",
                                 value, self.wram_address
@@ -3261,7 +3265,7 @@ impl Bus {
                     }
                     0x2182 => {
                         self.wram_address = (self.wram_address & 0xFF00FF) | ((value as u32) << 8);
-                        if std::env::var_os("TRACE_WRAM_ADDR").is_some() {
+                        if crate::debug_flags::trace_wram_addr() {
                             println!(
                                 "[WRAM ADR] write 2182 = {:02X} -> addr=0x{:05X}",
                                 value, self.wram_address
@@ -3271,7 +3275,7 @@ impl Bus {
                     0x2183 => {
                         self.wram_address =
                             (self.wram_address & 0x00FFFF) | (((value & 0x01) as u32) << 16);
-                        if std::env::var_os("TRACE_WRAM_ADDR").is_some() {
+                        if crate::debug_flags::trace_wram_addr() {
                             println!(
                                 "[WRAM ADR] write 2183 = {:02X} -> addr=0x{:05X}",
                                 value, self.wram_address
@@ -3292,14 +3296,14 @@ impl Bus {
                     0x4000..=0x42FF => self.write_io_register(offset, value),
                     // DMA registers
                     0x4300..=0x43FF => {
-                        if std::env::var_os("TRACE_DMA_REG_PC").is_some() {
+                        if crate::debug_flags::trace_dma_reg_pc() {
                             let pc = self.last_cpu_pc;
                             println!(
                                 "[DMA-REG-PC] PC={:06X} W ${:04X} val={:02X}",
                                 pc, offset, value
                             );
                         }
-                        if std::env::var_os("TRACE_DMA_ADDR").is_some() {
+                        if crate::debug_flags::trace_dma_addr() {
                             println!(
                                 "[DMA-REG-W] bank={:02X} addr={:04X} value=0x{:02X}",
                                 bank, offset, value
@@ -3389,10 +3393,13 @@ impl Bus {
             }
             // Extended WRAM banks
             0x7E..=0x7F => {
-                let wram_addr = ((bank - 0x7E) as usize) * 0x10000 + (offset as usize);
-                if std::env::var_os("TRACE_DQ3_SP_MEM").is_some()
-                    && wram_addr >= 0x1002C
-                    && wram_addr <= 0x1002D
+                let wram_addr = if self.wram_64k_mirror {
+                    (offset as usize) & 0xFFFF
+                } else {
+                    ((bank - 0x7E) as usize) * 0x10000 + (offset as usize)
+                };
+                if (0x1002C..=0x1002D).contains(&wram_addr)
+                    && crate::debug_flags::trace_dq3_sp_mem()
                 {
                     println!(
                         "DQ3_SP_MEM write {:02X}:{:04X} -> WRAM[0x{:05X}] = {:02X}",
@@ -3401,7 +3408,7 @@ impl Bus {
                 }
                 // Watch suspected handshake flag 7F:7DC0 (opt-in)
                 if wram_addr == 0x1FDC0
-                    && std::env::var_os("TRACE_HANDSHAKE").is_some()
+                    && crate::debug_flags::trace_handshake()
                     && !crate::debug_flags::quiet()
                 {
                     println!(
@@ -3409,7 +3416,7 @@ impl Bus {
                         value, bank, offset
                     );
                 }
-                if std::env::var_os("TRACE_NMI_WRAM").is_some() {
+                if self.trace_nmi_wram {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static WRITE_COUNT: AtomicU32 = AtomicU32::new(0);
                     if let Some(label) = match wram_addr {
