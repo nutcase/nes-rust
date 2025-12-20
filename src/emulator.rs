@@ -635,8 +635,6 @@ impl Emulator {
                         .get_ppu_mut()
                         .set_framebuffer_rendering_enabled(enable);
                 }
-                // 先にヘッドレス自動入力を反映しておく（オートジョイパッドのラッチがVBlank頭で走るため）
-                self.inject_auto_input_headless();
                 if is_dq3 && self.frame_count == 0 {
                     self.fix_dragon_quest_initialization();
                 }
@@ -3362,126 +3360,6 @@ impl Emulator {
 
         // Handle audio controls
         self.handle_audio_controls();
-    }
-
-    // Inject minimal auto-input in headless mode to help games progress
-    fn inject_auto_input_headless(&mut self) {
-        if !self.headless {
-            return;
-        }
-        // Headless の自動入力は便利だが、通常実行の観察を邪魔することがあるため既定では無効。
-        // 必要な場合は HEADLESS_AUTO_INPUT=1 を明示して有効化する。
-        let enabled = std::env::var("HEADLESS_AUTO_INPUT")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-        if !enabled {
-            return;
-        }
-
-        // cputest/snes-test 等のテストROMは「右ボタンの押下→リリース」でスタートを検出する。
-        // ヘッドレスでは入力できないため、対象タイトルでは短時間だけ「右+A+START」を押し、
-        // それ以降は全ボタンを離す。押しっぱなしにすると 1st オートジョイパッド値の bit7 が
-        // 0 のままになり、BIT/BPL ループから抜けられなくなるため、パルス動作にする。
-        let title_up = self.rom_title.to_ascii_uppercase();
-        let is_cpu_test = title_up.starts_with("65C816 TEST")
-            || title_up.starts_with("SNES TEST")
-            || title_up.contains("CPU TEST")
-            || title_up.contains("CPUTEST");
-        if is_cpu_test {
-            // cputest は「右が押された状態でラッチされ、その後離される」ことに加え、
-            // START が押されていることを確認する。AUTOJOY ラッチを跨ぐまで START を長めに押す。
-            // RIGHT+A は初期の短い間だけ押し、以降は離す。
-            let hold_total: u64 = std::env::var("HEADLESS_TEST_INPUT_HOLD_TOTAL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1);
-            // デフォルトは 0（常時押下）にし、必要に応じて環境変数で短くできるようにする。
-            let hold_start: u64 = std::env::var("HEADLESS_TEST_INPUT_HOLD_TOTAL_START")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let buttons = if hold_total == 0 || self.frame_count <= hold_total {
-                crate::input::button::RIGHT | crate::input::button::A
-            } else {
-                0
-            };
-            let start_mask = if hold_start == 0 || self.frame_count <= hold_start {
-                crate::input::button::START
-            } else {
-                0
-            };
-            let final_buttons = buttons | start_mask;
-            self.bus
-                .get_input_system_mut()
-                .controller1
-                .set_buttons(final_buttons);
-            if !crate::debug_flags::quiet()
-                && (hold_total == 0
-                    || self.frame_count <= hold_total
-                    || self.frame_count <= hold_start)
-            {
-                println!(
-                "🎮 AUTO INPUT[test]: frame={} RIGHT={} A={} START={} (hold_total={} hold_start={})",
-                self.frame_count,
-                (final_buttons & crate::input::button::RIGHT) != 0,
-                (final_buttons & crate::input::button::A) != 0,
-                (final_buttons & crate::input::button::START) != 0,
-                hold_total,
-                hold_start
-            );
-            }
-            // テストROMでは他の自動入力は不要
-            return;
-        }
-
-        // More aggressive input pattern for Dragon Quest III
-        if !self.is_dq3_title() {
-            return;
-        }
-        let t = (self.frame_count % 60) as u64; // Faster cycle
-
-        // Try different input combinations every 60 frames
-        let cycle = (self.frame_count / 60) % 8;
-
-        let mut ks = crate::input::KeyStates::default();
-
-        match cycle {
-            0 => {
-                ks.start = t >= 10 && t <= 20;
-            } // START
-            1 => {
-                ks.a = t >= 10 && t <= 20;
-            } // A button
-            2 => {
-                ks.b = t >= 10 && t <= 20;
-            } // B button
-            3 => {
-                ks.x = t >= 10 && t <= 20;
-            } // X button
-            4 => {
-                ks.y = t >= 10 && t <= 20;
-            } // Y button
-            5 => {
-                ks.select = t >= 10 && t <= 20;
-            } // SELECT
-            6 => {
-                ks.up = t >= 10 && t <= 20;
-            } // UP
-            7 => {
-                ks.down = t >= 10 && t <= 20;
-            } // DOWN
-            _ => {}
-        }
-
-        if ks.start || ks.a || ks.b || ks.x || ks.y || ks.select || ks.up || ks.down {
-            self.bus.get_input_system_mut().handle_key_input(&ks);
-            if self.frame_count % 60 == 10 && !crate::debug_flags::quiet() {
-                println!(
-                    "🎮 AUTO INPUT[{}]: cycle={}, injecting input",
-                    self.frame_count, cycle
-                );
-            }
-        }
     }
 
     fn maybe_quit_on_cpu_test_result(&mut self) {

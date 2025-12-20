@@ -56,8 +56,7 @@ for rom in "${ROM_LIST[@]}"; do
   # - cputest-full.sfc halts at a known loop after printing "Success"/"Failed" -> CPU_TEST_MODE=1
   set +e
 if [[ $is_cputest -eq 1 ]]; then
-  OUT=$(CPU_TEST_MODE=1 CPU_TEST_AUTO_FRAMES=${CPU_TEST_AUTO_FRAMES:-2000} \
-          HEADLESS_AUTO_INPUT=1 \
+  OUT=$(CPU_TEST_MODE=1 \
           HEADLESS=1 HEADLESS_FRAMES=${HEADLESS_FRAMES:-2000} QUIET=1 \
           HEADLESS_VIS_CHECK=0 HEADLESS_SUMMARY=0 \
           ALLOW_BAD_CHECKSUM=1 \

@@ -84,10 +84,7 @@ pub struct Bus {
     joy_busy_counter: u8,   // >0 while auto-joy is in progress
     joy_data: [u8; 8],      // $4218..$421F (JOY1L,JOY1H,JOY2L,JOY2H,JOY3L,JOY3H,JOY4L,JOY4H)
     joy_busy_scanlines: u8, // configurable duration of JOYBUSY after VBlank start
-    // CPUテストROM用の自動入力（RIGHT を短時間だけ押下）
     cpu_test_mode: bool,
-    cpu_test_auto_frames: u32,
-    cpu_test_auto_joy_phase: u8,
     cpu_test_result: Option<CpuTestResult>,
 
     // Run-wide counters for headless init summary
@@ -359,8 +356,6 @@ impl Bus {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8),
             cpu_test_mode: false,
-            cpu_test_auto_frames: 120,
-            cpu_test_auto_joy_phase: 0,
             cpu_test_result: None,
 
             nmitimen_writes_count: 0,
@@ -560,8 +555,6 @@ impl Bus {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8),
             cpu_test_mode: false,
-            cpu_test_auto_frames: 120,
-            cpu_test_auto_joy_phase: 0,
             cpu_test_result: None,
 
             nmitimen_writes_count: 0,
@@ -3844,41 +3837,6 @@ impl Bus {
             }
             // JOY1/2/3/4 data
             0x4218 => {
-                // cputest-full 初期操作補助（ヘッドレス向け）:
-                // 最初の読みで未押下、次の読みでAボタン押下(bit7=1)を返し、
-                // BPL/BMI の二段階チェックを通過させる。
-                // - CPU_TEST_MODE により cpu_test_mode が有効になるが、ウィンドウ表示では入力を尊重するため無効
-                // - 明示的に有効化したい場合は CPUTEST_AUTORIGHT=1
-                if (self.cpu_test_mode && crate::debug_flags::headless())
-                    || std::env::var_os("CPUTEST_AUTORIGHT").is_some()
-                {
-                    let always = std::env::var_os("CPUTEST_AUTORIGHT").is_some();
-                    let auto_active = always
-                        || (self.cpu_test_mode
-                            && self.ppu.frame() < (self.cpu_test_auto_frames as u64));
-                    if auto_active {
-                        let mut val = self.joy_data[0];
-                        if self.cpu_test_auto_joy_phase == 0 {
-                            self.cpu_test_auto_joy_phase = 1;
-                            // まず未押下を返す（A=0, 1=Low=Pressed）
-                            val &= !0x80;
-                            if std::env::var_os("TRACE_CPU_TEST_AUTO").is_some() {
-                                println!(
-                                    "[CPU-TEST-AUTO] JOY1L read (unpressed) val=0x{:02X}",
-                                    val
-                                );
-                            }
-                            return val;
-                        }
-                        self.cpu_test_auto_joy_phase = 0;
-                        // 次はA押下を返す（bit7=1）
-                        val |= 0x80;
-                        if std::env::var_os("TRACE_CPU_TEST_AUTO").is_some() {
-                            println!("[CPU-TEST-AUTO] JOY1L read (A) val=0x{:02X}", val);
-                        }
-                        return val;
-                    }
-                }
                 let force = std::env::var("JOY1L_FORCE")
                     .ok()
                     .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok());
@@ -4384,14 +4342,9 @@ impl Bus {
         self.joy_busy_counter
     }
 
-    /// CPUテストROM用の自動入力を有効化する
+    /// CPUテストROM向けのPASS/FAIL検出を有効化する（入力は注入しない）
     pub fn enable_cpu_test_mode(&mut self) {
         self.cpu_test_mode = true;
-        self.cpu_test_auto_frames = std::env::var("CPU_TEST_AUTO_FRAMES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(120);
-        self.cpu_test_auto_joy_phase = 0;
         self.cpu_test_result = None;
     }
 
