@@ -184,9 +184,6 @@ impl Emulator {
     ) -> Result<Self, String> {
         let quiet = crate::debug_flags::quiet();
         let rom = cartridge.rom.clone();
-        let headless_env = std::env::var("HEADLESS")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(false);
         let mut bus = Bus::new_with_mapper(
             cartridge.rom,
             cartridge.header.mapper_type.clone(),
@@ -515,11 +512,11 @@ impl Emulator {
                 .unwrap_or(true);
             let forced = crate::debug_flags::apu_handshake_plus();
             if auto || forced {
-                if let Ok(mut apu) = bus.get_apu_shared().lock() {
+                bus.with_apu_mut(|apu| {
                     apu.set_handshake_enabled(true);
-                    if !quiet {
-                        println!("APU: enhanced handshake shim enabled (mapper=DragonQuest3)");
-                    }
+                });
+                if !quiet {
+                    println!("APU: enhanced handshake shim enabled (mapper=DragonQuest3)");
                 }
             }
         }
@@ -2193,8 +2190,35 @@ impl Emulator {
         let trace_exec = std::env::var("TRACE_EXEC")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
+        // These are checked in the inner loop; cache once per frame.
+        let trace_pc_ffff = std::env::var_os("TRACE_PC_FFFF").is_some();
+        let trace_pc_frame = std::env::var_os("TRACE_PC_FRAME").is_some();
         let trace_loop_cycles = std::env::var_os("TRACE_LOOP_CYCLES").is_some();
         let trace_pc_ffff_once = std::env::var_os("TRACE_PC_FFFF_ONCE").is_some();
+
+        // SMW compatibility hack (debug-only): cache env read to avoid per-instruction overhead.
+        let smw_force_bbaa = std::env::var("SMW_FORCE_BBAA")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        // DQ3 debug/hack toggles (cache env reads to avoid per-instruction overhead).
+        let dq3_force_vector = dq3_auto
+            && std::env::var("DQ3_FORCE_VECTOR")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false);
+        let dq3_force_vector_always = dq3_auto
+            && std::env::var("DQ3_FORCE_VECTOR_ALWAYS")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false);
+        let dq3_force_vector_use_nmi = (dq3_force_vector || dq3_force_vector_always)
+            && std::env::var("DQ3_FORCE_VECTOR_MODE")
+                .map(|v| v.to_lowercase() == "nmi")
+                .unwrap_or(false);
+
+        // Optional: dump SA-1/S-CPU state for early frames (DQ3調査用)
+        if dq3_auto {
+            self.maybe_trace_sa1_state(frame_count);
+        }
 
         while self.master_cycles - start_cycles < cycles_per_frame {
             loop_iterations += 1;
@@ -2259,7 +2283,7 @@ impl Emulator {
             let pc = self.cpu.get_pc();
 
             // Debug: when PC gets stuck at $FFFF (seen in SMW init), dump state a few times
-            if std::env::var_os("TRACE_PC_FFFF").is_some() && pc == 0x00FFFF {
+            if trace_pc_ffff && pc == 0x00FFFF {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static COUNT_FFFF: AtomicU32 = AtomicU32::new(0);
                 let n = COUNT_FFFF.fetch_add(1, Ordering::Relaxed);
@@ -2326,7 +2350,7 @@ impl Emulator {
             }
 
             // Optional: per-frame PC trace for coarse progress (DQ3 boot調査用)
-            if std::env::var_os("TRACE_PC_FRAME").is_some() {
+            if trace_pc_frame {
                 static mut LAST_LOGGED_FRAME: u32 = 0;
                 // Avoid spamming: log once per frame at loop top
                 unsafe {
@@ -2391,7 +2415,9 @@ impl Emulator {
             }
 
             // DQ3: IRQ/NMIベクタ強制ジャンプ（デバッグハック）
-            self.maybe_force_vector_dq3(frame_count);
+            if dq3_force_vector {
+                self.maybe_force_vector_dq3(frame_count);
+            }
 
             // DQ3: フレーム内でSEIが再設定されても常にIRQを許可し続ける
             if dq3_auto {
@@ -2402,10 +2428,7 @@ impl Emulator {
             }
 
             // SMW (LoROM) bootstrap guard: seed 7E:BBAA with 0xBBAA to escape the early self-check loop.
-            if std::env::var("SMW_FORCE_BBAA")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false)
-            {
+            if smw_force_bbaa {
                 let addr = 0x00BBAAusize;
                 // Cover both WRAM banks 7E/7F in case DB is set later.
                 for bank in &[0x7E0000u32, 0x7F0000u32] {
@@ -2414,15 +2437,8 @@ impl Emulator {
                 }
             }
             // DQ3: 常時IRQベクタへジャンプさせる強制モード（フレーム内毎回）
-            if self.is_dq3_title()
-                && std::env::var("DQ3_FORCE_VECTOR_ALWAYS")
-                    .map(|v| v == "1" || v.to_lowercase() == "true")
-                    .unwrap_or(false)
-            {
-                let use_nmi = std::env::var("DQ3_FORCE_VECTOR_MODE")
-                    .map(|v| v.to_lowercase() == "nmi")
-                    .unwrap_or(false);
-                let vec_addr = if use_nmi {
+            if dq3_force_vector_always {
+                let vec_addr = if dq3_force_vector_use_nmi {
                     self.bus.read_u16(0xFFEA)
                 } else {
                     self.bus.read_u16(0xFFEE)
@@ -2434,11 +2450,6 @@ impl Emulator {
                 p.remove(crate::cpu::StatusFlags::IRQ_DISABLE);
                 self.cpu.p = p;
                 self.cpu.core.state_mut().p = p;
-            }
-
-            // Optional: dump SA-1/S-CPU state for early frames (DQ3調査用)
-            if self.is_dq3_title() {
-                self.maybe_trace_sa1_state(frame_count);
             }
 
             // Use batch execution for better performance (デバッグモードでない場合)
@@ -2566,9 +2577,7 @@ impl Emulator {
             // APU も更新
             let apu_cycles = cpu_cycles; // APUはCPUと同じクロック
             if !self.bus.is_fake_apu() {
-                if let Ok(mut apu) = self.bus.get_apu_shared().lock() {
-                    apu.step(apu_cycles);
-                }
+                self.bus.with_apu_mut(|apu| apu.step(apu_cycles));
             }
 
             // NMIはCPU側の poll_nmi/service_nmi で処理する（重複トリガ防止）。
@@ -2620,9 +2629,8 @@ impl Emulator {
 
         // Step APU for the same elapsed master time.
         if !self.bus.is_fake_apu() {
-            if let Ok(mut apu) = self.bus.get_apu_shared().lock() {
-                apu.step_master_cycles(master_cycles);
-            }
+            self.bus
+                .with_apu_mut(|apu| apu.step_master_cycles(master_cycles));
         }
 
         self.master_cycles = self.master_cycles.saturating_add(master_cycles);

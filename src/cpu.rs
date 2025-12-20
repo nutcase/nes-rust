@@ -217,7 +217,7 @@ impl Cpu {
             }
 
             if state.waiting_for_irq {
-                if std::env::var_os("TRACE_WAI").is_some() {
+                if crate::debug_flags::trace_wai() {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static COUNT: AtomicU32 = AtomicU32::new(0);
                     let n = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -264,7 +264,7 @@ impl Cpu {
             let state = self.core.state();
             !state.p.contains(StatusFlags::IRQ_DISABLE) && bus.poll_irq()
         };
-        if std::env::var_os("TRACE_IRQ").is_some() {
+        if crate::debug_flags::trace_irq() {
             use std::sync::atomic::{AtomicU32, Ordering};
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) < 32 {
@@ -290,10 +290,7 @@ impl Cpu {
         let mut state_before = self.core.state().clone();
         // デバッグ: データバンクを強制上書き（FORCE_DB=0x7E など）。
         // 実際の実行状態にも反映させる。
-        if let Some(force_db) = std::env::var("FORCE_DB")
-            .ok()
-            .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-        {
+        if let Some(force_db) = crate::debug_flags::force_db() {
             self.core.state_mut().db = force_db;
             state_before.db = force_db;
         }
@@ -307,7 +304,7 @@ impl Cpu {
         bus.set_last_cpu_pc(pc24);
 
         // burn-in-test.sfc: CPU-side APU check disassembly aid (opt-in).
-        if std::env::var_os("TRACE_BURNIN_APU_CHECK").is_some()
+        if crate::debug_flags::trace_burnin_apu_check()
             && state_before.pb == 0x00
             && state_before.pc == 0x863F
         {
@@ -546,10 +543,7 @@ impl Cpu {
                     };
                 let op = bus.read_u8(((state_before.pb as u32) << 16) | state_before.pc as u32);
                 // デバッグ: FORCE_DB=0x7E などでデータバンクを強制
-                if let Some(force_db) = std::env::var("FORCE_DB")
-                    .ok()
-                    .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-                {
+                if let Some(force_db) = crate::debug_flags::force_db() {
                     state_before.db = force_db;
                 }
                 writeln!(
@@ -851,7 +845,7 @@ impl Cpu {
             }
         }
 
-        if std::env::var_os("DEBUG_DQ3_LOOP").is_some()
+        if crate::debug_flags::debug_dq3_loop()
             && state_before.pb == 0xC0
             && (0x04C5..=0x04D0).contains(&state_before.pc)
         {

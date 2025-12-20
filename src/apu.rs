@@ -25,6 +25,7 @@ pub struct Apu {
     sample_rate: u32,
     // Fractional SPC700 cycles accumulator (scaled from S-CPU cycles).
     cycle_accum: f64,
+    cycle_scale: f64,
     // Total SPC700 cycles executed (debug/diagnostics).
     pub(crate) total_smp_cycles: u64,
     // Debug: last observed values for $F1/$FA change tracing.
@@ -72,6 +73,13 @@ unsafe impl Send for Apu {}
 unsafe impl Sync for Apu {}
 
 impl Apu {
+    fn read_cycle_scale() -> f64 {
+        std::env::var("APU_CYCLE_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_APU_CYCLE_SCALE)
+    }
+
     pub fn new() -> Self {
         let inner = SpcApu::new(); // comes with default IPL
         let boot_hle_enabled = std::env::var("APU_BOOT_HLE")
@@ -110,10 +118,12 @@ impl Apu {
         let smw_apu_port_echo_strict = std::env::var("SMW_APU_PORT_ECHO_STRICT")
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(false);
+        let cycle_scale = Self::read_cycle_scale();
         let mut apu = Self {
             inner,
             sample_rate: 32000,
             cycle_accum: 0.0,
+            cycle_scale,
             total_smp_cycles: 0,
             trace_last_f1: 0,
             trace_last_fa: 0,
@@ -206,6 +216,7 @@ impl Apu {
         self.zero_write_seen = false;
         self.last_port1 = 0;
         self.cycle_accum = 0.0;
+        self.cycle_scale = Self::read_cycle_scale();
         self.total_smp_cycles = 0;
         self.trace_last_f1 = self.inner.read_u8(0x00F1);
         self.trace_last_fa = self.inner.read_u8(0x00FA);
@@ -254,15 +265,7 @@ impl Apu {
     /// CPUサイクルに合わせてSPC700を回す。
     /// 仮想周波数: S-CPU 3.58MHz / SPC700 1.024MHz ⇒ およそ 1 : 3.5 で遅らせる。
     pub fn step(&mut self, cpu_cycles: u8) {
-        // 比率調整。必要に応じて環境変数 APU_CYCLE_SCALE で上書き可。
-        // `snes-apu` crate の内部サイクルは 2.048MHz 基準で、DSPサンプル(32kHz)は 64cycle ごとに生成される。
-        // したがって S-CPU(3.579545MHz NTSC) からの比率は 2.048MHz / 3.579545MHz ≈ 0.57214。
-        let scale: f64 = std::env::var("APU_CYCLE_SCALE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_APU_CYCLE_SCALE);
-
-        self.cycle_accum += (cpu_cycles as f64) * scale;
+        self.cycle_accum += (cpu_cycles as f64) * self.cycle_scale;
         let run = self.cycle_accum.floor() as i32;
         self.cycle_accum -= run as f64;
 
@@ -298,11 +301,7 @@ impl Apu {
 
         // APU_CYCLE_SCALE is defined in terms of "S-CPU cycles" (as used by `step()`).
         // Convert master cycles -> S-CPU cycles using our fixed divider (master/6).
-        let scale_cpu: f64 = std::env::var("APU_CYCLE_SCALE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_APU_CYCLE_SCALE);
-        let scale_master = scale_cpu / 6.0;
+        let scale_master = self.cycle_scale / 6.0;
 
         self.cycle_accum += (master_cycles as f64) * scale_master;
         let run = self.cycle_accum.floor() as i32;
@@ -329,7 +328,7 @@ impl Apu {
     }
 
     fn maybe_trace_apu_control(&mut self) {
-        if std::env::var_os("TRACE_BURNIN_APU_F1").is_none() {
+        if !crate::debug_flags::trace_burnin_apu_f1() {
             return;
         }
         let f1 = self.inner.read_u8(0x00F1);
@@ -347,7 +346,7 @@ impl Apu {
     }
 
     fn maybe_trace_out_ports(&mut self) {
-        if std::env::var_os("TRACE_BURNIN_APU_PORT1").is_none() {
+        if !crate::debug_flags::trace_burnin_apu_port1() {
             return;
         }
         let cur = self.inner.cpu_read_port(1);

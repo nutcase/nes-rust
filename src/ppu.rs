@@ -647,13 +647,13 @@ impl Ppu {
         let first_hblank = self.first_hblank_dot();
         let first_visible = self.first_visible_dot();
         let render_enabled = self.framebuffer_rendering_enabled;
+        let mut vis_last = self.get_visible_height();
+        let mut vblank_start = vis_last.saturating_add(1);
         for _ in 0..cycles {
             // Advance any deferred control effects before processing this dot
             self.tick_deferred_ctrl_effects();
             let x = self.cycle;
             let y = self.scanline;
-            let vis_last = self.get_visible_height();
-            let vblank_start = vis_last.saturating_add(1);
 
             // Update HBlank state from dot counters.
             //
@@ -674,7 +674,10 @@ impl Ppu {
             if x == 0 {
                 // Commit latched regs at the beginning of each scanline
                 self.commit_latched_display_regs();
-                if y >= 1 && y <= vis_last {
+                // Visible height depends on display regs (e.g., overscan) latched at line start.
+                vis_last = self.get_visible_height();
+                vblank_start = vis_last.saturating_add(1);
+                if render_enabled && y >= 1 && y <= vis_last {
                     // Prepare window LUTs at line start (OBJ list is prepared during previous HBlank)
                     self.prepare_line_window_luts();
                     self.prepare_line_opt_luts();
@@ -690,11 +693,8 @@ impl Ppu {
             if !self.v_blank && y >= 1 && y <= vis_last && x >= first_visible && x < first_hblank {
                 let fb_x = (x - first_visible) as usize;
                 let fb_y = (y - 1) as usize;
-                if fb_y < 224 {
-                    self.update_obj_time_over_at_x(fb_x as u16);
-                    if render_enabled {
-                        self.render_dot(fb_x, fb_y);
-                    }
+                if fb_y < 224 && render_enabled {
+                    self.render_dot(fb_x, fb_y);
                 }
             }
 

@@ -71,6 +71,19 @@ pub fn apu_force_port1() -> Option<u8> {
     .clone()
 }
 
+// Force S-CPU data bank (DB) to a fixed value (debug: FORCE_DB=0x7E etc.)
+pub fn force_db() -> Option<u8> {
+    static VAL: OnceLock<Option<u8>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("FORCE_DB").ok().and_then(|v| {
+            u8::from_str_radix(v.trim_start_matches("0x"), 16)
+                .ok()
+                .or_else(|| v.parse().ok())
+        })
+    })
+    .clone()
+}
+
 // CPU テスト専用の簡易HLE（VBlank/JOY/4210 を強制値で返す）
 pub fn cpu_test_hle() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -238,6 +251,21 @@ pub fn trace_burnin_apu_writes() -> bool {
     *ON.get_or_init(|| env_present("TRACE_BURNIN_APU_WRITES"))
 }
 
+pub fn trace_burnin_apu_check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_APU_CHECK"))
+}
+
+pub fn trace_burnin_apu_f1() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_APU_F1"))
+}
+
+pub fn trace_burnin_apu_port1() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_BURNIN_APU_PORT1"))
+}
+
 pub fn trace_wram_stack_dma() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_present("TRACE_WRAM_STACK_DMA"))
@@ -271,6 +299,21 @@ pub fn trace_handshake() -> bool {
 pub fn trace_p_change() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_present("TRACE_P_CHANGE"))
+}
+
+pub fn trace_irq() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_IRQ"))
+}
+
+pub fn trace_wai() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_WAI"))
+}
+
+pub fn debug_dq3_loop() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("DEBUG_DQ3_LOOP"))
 }
 
 pub fn watch_pc_flow() -> bool {

@@ -4394,6 +4394,21 @@ impl Bus {
         self.apu.clone()
     }
 
+    #[inline]
+    pub fn with_apu_mut<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut crate::apu::Apu),
+    {
+        if let Some(apu_mutex) = Arc::get_mut(&mut self.apu) {
+            let apu = apu_mutex.get_mut().unwrap_or_else(|e| e.into_inner());
+            f(apu);
+            return;
+        }
+
+        let mut apu = self.apu.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut apu);
+    }
+
     pub fn set_mapper_type(&mut self, mapper: crate::cartridge::MapperType) {
         self.mapper_type = mapper;
     }
