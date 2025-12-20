@@ -82,8 +82,8 @@ if [[ -n "${QUIET:-}" ]]; then
   # 3: +all remaining debug (very quiet)
   level=${QUIET:-1}
   case "$level" in
-    1) DEFAULT_QUIET_PATTERNS='^WARNING: read_u24|^JML from NMI|^NMI |^\\$4200 |GRAPHICS DETECTED' ;;
-    2) DEFAULT_QUIET_PATTERNS='^WARNING: read_u24|^JML from NMI|^NMI |^\\$4200 |^PPU: |GRAPHICS DETECTED' ;;
+    1) DEFAULT_QUIET_PATTERNS='^WARNING: read_u24|^JML from NMI|^NMI |^\\$4200 |GRAPHICS DETECTED|RENDER STATS|WINDOW UPDATE|COPYING FRAMEBUFFER|FIRST PIXELS|PPU FRAMEBUFFER|PPU SAMPLE|PIXEL \\(10,10\\)' ;;
+    2) DEFAULT_QUIET_PATTERNS='^WARNING: read_u24|^JML from NMI|^NMI |^\\$4200 |^PPU: |GRAPHICS DETECTED|RENDER STATS|WINDOW UPDATE|COPYING FRAMEBUFFER|FIRST PIXELS|PPU FRAMEBUFFER|PPU SAMPLE|PIXEL \\(10,10\\)' ;;
     *) DEFAULT_QUIET_PATTERNS='^.|^$' ;; # drop almost everything
   esac
   # Category toggles (1 = drop, 0 = keep). Defaults drop most noisy.
