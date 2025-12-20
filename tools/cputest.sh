@@ -39,16 +39,36 @@ trap '[[ -n "$TMP_LOG" && -f "$TMP_LOG" && -z "${CPUTEST_KEEP_LOG:-}" ]] && rm -
 
 echo "[cputest] Running headless (${FRAMES} frames max): $ROM_ARG"
 set +e
-CPU_TEST_MODE=1 \
-HEADLESS=1 \
-HEADLESS_FAST_RENDER="${HEADLESS_FAST_RENDER:-1}" \
-HEADLESS_FAST_RENDER_LAST="${HEADLESS_FAST_RENDER_LAST:-1}" \
-HEADLESS_FRAMES="${FRAMES}" \
-HEADLESS_SUMMARY=0 \
-QUIET=1 \
-"$BIN" "$ROM_ARG" 2>&1 \
-  | tee "$TMP_LOG" \
-  | tail -n "$TAIL_LINES"
+#
+# Note: Developers often keep DEBUG_* / TRACE_* env vars in their shell; those can
+# dramatically slow headless regressions. Default to a clean env for reproducible speed.
+# Set CPUTEST_CLEAN_ENV=0 to inherit the current environment.
+if [[ "${CPUTEST_CLEAN_ENV:-1}" == "0" ]]; then
+  CPU_TEST_MODE=1 \
+  HEADLESS=1 \
+  HEADLESS_FAST_RENDER="${HEADLESS_FAST_RENDER:-1}" \
+  HEADLESS_FAST_RENDER_LAST="${HEADLESS_FAST_RENDER_LAST:-1}" \
+  HEADLESS_FRAMES="${FRAMES}" \
+  HEADLESS_SUMMARY=0 \
+  QUIET=1 \
+  "$BIN" "$ROM_ARG" 2>&1 \
+    | tee "$TMP_LOG" \
+    | tail -n "$TAIL_LINES"
+else
+  env -i \
+    PATH="$PATH" \
+    HOME="${HOME:-/}" \
+    CPU_TEST_MODE=1 \
+    HEADLESS=1 \
+    HEADLESS_FAST_RENDER="${HEADLESS_FAST_RENDER:-1}" \
+    HEADLESS_FAST_RENDER_LAST="${HEADLESS_FAST_RENDER_LAST:-1}" \
+    HEADLESS_FRAMES="${FRAMES}" \
+    HEADLESS_SUMMARY=0 \
+    QUIET=1 \
+    "$BIN" "$ROM_ARG" 2>&1 \
+      | tee "$TMP_LOG" \
+      | tail -n "$TAIL_LINES"
+fi
 status=${PIPESTATUS[0]}
 set -e
 

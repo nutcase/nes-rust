@@ -51,17 +51,38 @@ rm -f logs/headless_fb.ppm
 
 echo "[burnin] Running headless (${FRAMES} frames): $ROM_ARG"
 set +e
-AUTO_INPUT_EVENTS="$AUTO_EVENTS" \
-HEADLESS=1 \
-HEADLESS_FAST_RENDER="${HEADLESS_FAST_RENDER:-1}" \
-HEADLESS_FAST_RENDER_LAST="${HEADLESS_FAST_RENDER_LAST:-1}" \
-HEADLESS_FRAMES="${FRAMES}" \
-HEADLESS_DUMP_FRAME=1 \
-HEADLESS_SUMMARY=0 \
-QUIET=1 \
-"$BIN" "$ROM_ARG" 2>&1 \
+#
+# Note: Developers often keep DEBUG_* / TRACE_* env vars in their shell; those can
+# dramatically slow headless regressions. Default to a clean env for reproducible speed.
+# Set BURNIN_CLEAN_ENV=0 to inherit the current environment.
+if [[ "${BURNIN_CLEAN_ENV:-1}" == "0" ]]; then
+  AUTO_INPUT_EVENTS="$AUTO_EVENTS" \
+  HEADLESS=1 \
+  HEADLESS_FAST_RENDER="${HEADLESS_FAST_RENDER:-1}" \
+  HEADLESS_FAST_RENDER_LAST="${HEADLESS_FAST_RENDER_LAST:-1}" \
+  HEADLESS_FRAMES="${FRAMES}" \
+  HEADLESS_DUMP_FRAME=1 \
+  HEADLESS_SUMMARY=0 \
+  QUIET=1 \
+  "$BIN" "$ROM_ARG" 2>&1 \
   | tee "$TMP_LOG" \
   | tail -n "$TAIL_LINES"
+else
+  env -i \
+    PATH="$PATH" \
+    HOME="${HOME:-/}" \
+    AUTO_INPUT_EVENTS="$AUTO_EVENTS" \
+    HEADLESS=1 \
+    HEADLESS_FAST_RENDER="${HEADLESS_FAST_RENDER:-1}" \
+    HEADLESS_FAST_RENDER_LAST="${HEADLESS_FAST_RENDER_LAST:-1}" \
+    HEADLESS_FRAMES="${FRAMES}" \
+    HEADLESS_DUMP_FRAME=1 \
+    HEADLESS_SUMMARY=0 \
+    QUIET=1 \
+    "$BIN" "$ROM_ARG" 2>&1 \
+    | tee "$TMP_LOG" \
+    | tail -n "$TAIL_LINES"
+fi
 status=${PIPESTATUS[0]}
 set -e
 
