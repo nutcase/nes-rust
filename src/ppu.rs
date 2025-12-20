@@ -210,6 +210,11 @@ pub struct Ppu {
     main_obj_window_lut: [u8; 256], // 1: OBJ masked on main at x
     sub_obj_window_lut: [u8; 256], // 1: OBJ masked on sub at x
 
+    // --- Mode 2 offset-per-tile (BG3 OPT) cached per visible scanline ---
+    // Index is tile-column on screen (0..32). Column 0 is never affected by OPT.
+    mode2_opt_hscroll_lut: [[u16; 33]; 2], // [BG1/BG2][col] -> effective HOFS
+    mode2_opt_vscroll_lut: [[u16; 33]; 2], // [BG1/BG2][col] -> effective VOFS
+
     // internal OAM byte address (internal_oamadd, 10-bit)
     oam_internal_addr: u16,
 
@@ -573,6 +578,8 @@ impl Ppu {
             sub_bg_window_lut: [[0; 256]; 4],
             main_obj_window_lut: [0; 256],
             sub_obj_window_lut: [0; 256],
+            mode2_opt_hscroll_lut: [[0; 33]; 2],
+            mode2_opt_vscroll_lut: [[0; 33]; 2],
             oam_internal_addr: 0,
             hdma_head_busy_until: 0,
 
@@ -670,6 +677,7 @@ impl Ppu {
                 if y >= 1 && y <= vis_last {
                     // Prepare window LUTs at line start (OBJ list is prepared during previous HBlank)
                     self.prepare_line_window_luts();
+                    self.prepare_line_opt_luts();
                 }
             }
 
@@ -2753,14 +2761,6 @@ impl Ppu {
             }
         }
 
-        let tile_16 = self.bg_tile_16[bg_num as usize];
-        let tile_px = if tile_16 { 16 } else { 8 } as u16;
-        let ss = self.bg_screen_size[bg_num as usize];
-        let width_tiles = if ss == 1 || ss == 3 { 64 } else { 32 } as u16;
-        let height_tiles = if ss == 2 || ss == 3 { 64 } else { 32 } as u16;
-        let wrap_x = width_tiles * tile_px;
-        let wrap_y = height_tiles * tile_px;
-
         let (mosaic_x, mosaic_y) = self.apply_mosaic(x, y, bg_num);
         let (scroll_x, scroll_y) = match bg_num {
             0 => (self.bg1_hscroll, self.bg1_vscroll),
@@ -2769,6 +2769,25 @@ impl Ppu {
             3 => (self.bg4_hscroll, self.bg4_vscroll),
             _ => (0, 0),
         };
+        self.render_bg_4bpp_impl(bg_num, mosaic_x, mosaic_y, scroll_x, scroll_y)
+    }
+
+    fn render_bg_4bpp_impl(
+        &self,
+        bg_num: u8,
+        mosaic_x: u16,
+        mosaic_y: u16,
+        scroll_x: u16,
+        scroll_y: u16,
+    ) -> (u32, u8) {
+        let tile_16 = self.bg_tile_16[bg_num as usize];
+        let tile_px = if tile_16 { 16 } else { 8 } as u16;
+        let ss = self.bg_screen_size[bg_num as usize];
+        let width_tiles = if ss == 1 || ss == 3 { 64 } else { 32 } as u16;
+        let height_tiles = if ss == 2 || ss == 3 { 64 } else { 32 } as u16;
+        let wrap_x = width_tiles * tile_px;
+        let wrap_y = height_tiles * tile_px;
+
         let bg_x = (mosaic_x + scroll_x) % wrap_x;
         let bg_y = (mosaic_y + scroll_y) % wrap_y;
 
@@ -2806,7 +2825,7 @@ impl Ppu {
             static mut DEBUG_TILEMAP_COUNT: u32 = 0;
             unsafe {
                 DEBUG_TILEMAP_COUNT += 1;
-                if DEBUG_TILEMAP_COUNT <= 3 && x < 5 && y < 5 {
+                if DEBUG_TILEMAP_COUNT <= 3 && mosaic_x < 5 && mosaic_y < 5 {
                     println!(
                         "  BG{} tilemap_base=0x{:04X}, map_entry_addr=0x{:04X}, VRAM_len=0x{:04X}",
                         bg_num,
@@ -2840,7 +2859,7 @@ impl Ppu {
         let map_entry = ((map_entry_hi as u16) << 8) | (map_entry_lo as u16);
 
         // Optional tilemap sampling (disabled by default)
-        if crate::debug_flags::boot_verbose() && x == 0 && y == 0 {
+        if crate::debug_flags::boot_verbose() && mosaic_x == 0 && mosaic_y == 0 {
             println!(
                 "Tilemap entry @0x{:04X} = 0x{:04X}",
                 map_entry_addr, map_entry
@@ -2949,10 +2968,10 @@ impl Ppu {
             static mut TILE_DEBUG_COUNT: u32 = 0;
             unsafe {
                 TILE_DEBUG_COUNT += 1;
-                if TILE_DEBUG_COUNT <= 10 && x < 4 && y < 4 {
+                if TILE_DEBUG_COUNT <= 10 && mosaic_x < 4 && mosaic_y < 4 {
                     println!(
                         "Tile({},{}) tile=0x{:03X} planes=[{:02X},{:02X},{:02X},{:02X}]",
-                        x, y, tile_id, plane0, plane1, plane2, plane3
+                        mosaic_x, mosaic_y, tile_id, plane0, plane1, plane2, plane3
                     );
                 }
             }
@@ -3330,48 +3349,25 @@ impl Ppu {
     }
 
     fn render_bg_mode2(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
-        // Mode 2: BG1/BG2は4bpp + オフセットパータイル（簡易実装）
+        // Mode 2: BG1/BG2 are 4bpp with offset-per-tile (OPT) using BG3 tilemap entries.
         if bg_num > 1 {
             return (0, 0);
         }
 
-        // オフセットテーブルはBG3のタイルマップを想定（簡易）
-        let tilemap_base = self.bg3_tilemap_base;
-
-        // 画面座標を8x8タイル座標へ
-        let tile_x = ((x + match bg_num {
-            0 => self.bg1_hscroll,
-            1 => self.bg2_hscroll,
-            _ => 0,
-        }) / 8)
-            & 0x1F;
-        let tile_y = ((y + match bg_num {
-            0 => self.bg1_vscroll,
-            1 => self.bg2_vscroll,
-            _ => 0,
-        }) / 8)
-            & 0x1F;
-
-        // Tilemap base is a word address, convert to byte address
-        let map_addr = ((tilemap_base as u32) * 2)
-            .wrapping_add(((tile_y as u32) * 32 + tile_x as u32) * 2)
-            & 0xFFFF;
-
-        let (off_x, off_y) = if (map_addr as usize + 1) < self.vram.len() {
-            let lo = self.vram[map_addr as usize];
-            let hi = self.vram[map_addr as usize + 1];
-            // 簡易: 符号付き8bitのX/Yオフセット
-            (lo as i8 as i16, hi as i8 as i16)
+        // Determine which tile column on screen we're sampling. OPT never affects column 0.
+        let base_hscroll = if bg_num == 0 {
+            self.bg1_hscroll
         } else {
-            (0, 0)
+            self.bg2_hscroll
         };
+        let fine = base_hscroll & 0x0007;
+        let (mosaic_x, mosaic_y) = self.apply_mosaic(x, y, bg_num);
+        let col = ((mosaic_x + fine) / 8) as usize;
+        let col = col.min(32);
 
-        // 画面座標にオフセットを反映（ラップ考慮）
-        let sx = x.wrapping_add(off_x as u16);
-        let sy = y.wrapping_add(off_y as u16);
-
-        // 既存の4bpp描画を利用（内部でスクロールを加味）
-        self.render_bg_4bpp(sx, sy, bg_num)
+        let scroll_x = self.mode2_opt_hscroll_lut[bg_num as usize][col];
+        let scroll_y = self.mode2_opt_vscroll_lut[bg_num as usize][col];
+        self.render_bg_4bpp_impl(bg_num, mosaic_x, mosaic_y, scroll_x, scroll_y)
     }
 
     fn render_bg_mode5(&self, x: u16, y: u16, bg_num: u8, is_main: bool) -> (u32, u8) {
@@ -6082,6 +6078,109 @@ impl Ppu {
                 0
             };
         }
+    }
+
+    // Prepare per-tile-column offset-per-tile (OPT) tables for Mode 2.
+    //
+    // Reference: https://snes.nesdev.org/wiki/Offset-per-tile
+    fn prepare_line_opt_luts(&mut self) {
+        if self.bg_mode != 2 {
+            return;
+        }
+
+        let bg3_ss = self.bg_screen_size[2];
+        let bg3_width_tiles: u16 = if bg3_ss == 1 || bg3_ss == 3 { 64 } else { 32 };
+        let bg3_height_tiles: u16 = if bg3_ss == 2 || bg3_ss == 3 { 64 } else { 32 };
+
+        // Current visible Y coordinate (0-based within the framebuffer).
+        //
+        // Note: PPU scanline 1 maps to framebuffer row 0 (see render_dot call site).
+        let screen_y = self.scanline.saturating_sub(1);
+
+        // BG3HOFS low 3 bits are ignored for OPT indexing.
+        let base_col = ((self.bg3_hscroll >> 3) % bg3_width_tiles) as u16;
+
+        // Mode 2 uses two BG3 tilemap rows per 8px: one for horizontal offsets (even row),
+        // followed by one for vertical offsets (odd row).
+        let tile_y = ((screen_y as u16).wrapping_add(self.bg3_vscroll) >> 3) % bg3_height_tiles;
+        let h_row = tile_y.wrapping_mul(2) % bg3_height_tiles;
+        let v_row = (h_row + 1) % bg3_height_tiles;
+
+        // Column 0 is never affected (per OPT rules).
+        self.mode2_opt_hscroll_lut[0][0] = self.bg1_hscroll;
+        self.mode2_opt_vscroll_lut[0][0] = self.bg1_vscroll;
+        self.mode2_opt_hscroll_lut[1][0] = self.bg2_hscroll;
+        self.mode2_opt_vscroll_lut[1][0] = self.bg2_vscroll;
+
+        for col in 1..=32usize {
+            let entry_x = (base_col + (col as u16 - 1)) % bg3_width_tiles;
+            let h_entry = self.read_bg_tilemap_entry_word(2, entry_x, h_row);
+            let v_entry = self.read_bg_tilemap_entry_word(2, entry_x, v_row);
+
+            // bit13 applies to BG1, bit14 applies to BG2.
+            let bg1_apply = (h_entry & 0x2000) != 0;
+            let bg2_apply = (h_entry & 0x4000) != 0;
+            let bg1_apply_v = (v_entry & 0x2000) != 0;
+            let bg2_apply_v = (v_entry & 0x4000) != 0;
+
+            // Lower 10 bits are the new scroll value. For horizontal, low 3 bits are ignored.
+            let h_val = h_entry & 0x03FF;
+            let v_val = v_entry & 0x03FF;
+
+            let bg1_fine = self.bg1_hscroll & 0x0007;
+            let bg2_fine = self.bg2_hscroll & 0x0007;
+
+            let bg1_h = if bg1_apply {
+                (h_val & !0x0007) | bg1_fine
+            } else {
+                self.bg1_hscroll
+            };
+            let bg2_h = if bg2_apply {
+                (h_val & !0x0007) | bg2_fine
+            } else {
+                self.bg2_hscroll
+            };
+            let bg1_v = if bg1_apply_v { v_val } else { self.bg1_vscroll };
+            let bg2_v = if bg2_apply_v { v_val } else { self.bg2_vscroll };
+
+            self.mode2_opt_hscroll_lut[0][col] = bg1_h;
+            self.mode2_opt_vscroll_lut[0][col] = bg1_v;
+            self.mode2_opt_hscroll_lut[1][col] = bg2_h;
+            self.mode2_opt_vscroll_lut[1][col] = bg2_v;
+        }
+    }
+
+    // Read a tilemap entry word for BG1..BG4 at the given (tile_x, tile_y).
+    // bg_num is 0..3 for BG1..BG4.
+    #[inline]
+    fn read_bg_tilemap_entry_word(&self, bg_num: u8, tile_x: u16, tile_y: u16) -> u16 {
+        let ss = self.bg_screen_size[bg_num as usize];
+        let width_screens = if ss == 1 || ss == 3 { 2 } else { 1 } as u32;
+
+        let tilemap_base_word = match bg_num {
+            0 => self.bg1_tilemap_base as u32,
+            1 => self.bg2_tilemap_base as u32,
+            2 => self.bg3_tilemap_base as u32,
+            _ => self.bg4_tilemap_base as u32,
+        };
+
+        let map_tx = (tile_x % 32) as u32;
+        let map_ty = (tile_y % 32) as u32;
+        let scx = (tile_x / 32) as u32;
+        let scy = (tile_y / 32) as u32;
+        let quadrant = scx + scy * width_screens;
+
+        let word_addr = tilemap_base_word
+            .saturating_add(quadrant * 0x400)
+            .saturating_add(map_ty * 32 + map_tx)
+            & 0x7FFF;
+        let addr = (word_addr * 2) as usize;
+        if addr + 1 >= self.vram.len() {
+            return 0;
+        }
+        let lo = self.vram[addr];
+        let hi = self.vram[addr + 1];
+        ((hi as u16) << 8) | (lo as u16)
     }
 
     // Summarize VRAM writes since last call, including FG mode info. Resets counters.
