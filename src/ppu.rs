@@ -1903,6 +1903,7 @@ impl Ppu {
         self.get_sprite_pixel_common(x, y, enabled, true)
     }
 
+    #[allow(dead_code)]
     fn get_main_bg_layers(&mut self, x: u16, y: u16) -> Vec<(u32, u8, u8)> {
         // Return all background layers with their colors, priorities, and layer IDs
         let mut bg_results = Vec::new();
@@ -6407,12 +6408,144 @@ impl Ppu {
 
     // メインスクリーン用BGの最前面色とその優先度を取得
     fn get_main_bg_pixel(&mut self, x: u16, y: u16) -> (u32, u8, u8) {
-        let bg_layers = self.get_main_bg_layers(x, y);
-        bg_layers
-            .into_iter()
-            .filter(|(c, _, _)| *c != 0)
-            .max_by_key(|(_, p, n)| (self.z_rank_for_bg(*n, *p), *n))
-            .unwrap_or((0, 0, 0))
+        // Hot path: avoid per-pixel heap allocations.
+        let enables = self.effective_main_screen_designation();
+
+        let mut best_color: u32 = 0;
+        let mut best_pr: u8 = 0;
+        let mut best_id: u8 = 0;
+        let mut best_z: i16 = i16::MIN;
+
+        // Keep ordering consistent with the previous max_by_key:
+        // (z_rank_for_bg(layer, pr), layer_id)
+        macro_rules! consider {
+            ($color:expr, $pr:expr, $id:expr) => {{
+                let color: u32 = $color;
+                if color == 0 {
+                    // Transparent
+                } else {
+                    let pr: u8 = $pr;
+                    let id: u8 = $id;
+                    let z = self.z_rank_for_bg(id, pr);
+                    if z > best_z || (z == best_z && id > best_id) {
+                        best_color = color;
+                        best_pr = pr;
+                        best_id = id;
+                        best_z = z;
+                    }
+                }
+            }};
+        }
+
+        match self.bg_mode {
+            0 => {
+                // Mode 0: BG1-4 all 2bpp
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, true) {
+                    let (c, p) = self.render_bg_mode0_with_priority(x, y, 0);
+                    consider!(c, p, 0);
+                }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, true) {
+                    let (c, p) = self.render_bg_mode0_with_priority(x, y, 1);
+                    consider!(c, p, 1);
+                }
+                if (enables & 0x04) != 0 && !self.should_mask_bg(x, 2, true) {
+                    let (c, p) = self.render_bg_mode0_with_priority(x, y, 2);
+                    consider!(c, p, 2);
+                }
+                if (enables & 0x08) != 0 && !self.should_mask_bg(x, 3, true) {
+                    let (c, p) = self.render_bg_mode0_with_priority(x, y, 3);
+                    consider!(c, p, 3);
+                }
+            }
+            1 => {
+                // Mode 1: BG1/BG2 are 4bpp, BG3 is 2bpp
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, true) {
+                    let (c, p) = self.render_bg_4bpp_with_priority(x, y, 0);
+                    consider!(c, p, 0);
+                }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, true) {
+                    let (c, p) = self.render_bg_4bpp_with_priority(x, y, 1);
+                    consider!(c, p, 1);
+                }
+                // NOTE: preserve legacy behavior (no BG3 window mask check here).
+                if (enables & 0x04) != 0 {
+                    let (c, p) = self.render_bg_mode0_with_priority(x, y, 2);
+                    consider!(c, p, 2);
+                }
+            }
+            2 => {
+                // Mode 2: BG1/BG2 are 4bpp with offset-per-tile
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, true) {
+                    let (c, p) = self.render_bg_mode2_with_priority(x, y, 0);
+                    consider!(c, p, 0);
+                }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, true) {
+                    let (c, p) = self.render_bg_mode2_with_priority(x, y, 1);
+                    consider!(c, p, 1);
+                }
+            }
+            3 => {
+                // Mode 3: BG1 is 8bpp, BG2 is 4bpp
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, true) {
+                    let (c, p) = self.render_bg_8bpp_with_priority(x, y, 0);
+                    consider!(c, p, 0);
+                }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, true) {
+                    let (c, p) = self.render_bg_4bpp_with_priority(x, y, 1);
+                    consider!(c, p, 1);
+                }
+            }
+            4 => {
+                // Mode 4: BG1 is 8bpp, BG2 is 2bpp
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, true) {
+                    let (c, p) = self.render_bg_8bpp_with_priority(x, y, 0);
+                    consider!(c, p, 0);
+                }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, true) {
+                    let (c, p) = self.render_bg_mode0_with_priority(x, y, 1);
+                    consider!(c, p, 1);
+                }
+            }
+            5 => {
+                // Mode 5: BG1 is 4bpp, BG2 is 2bpp (hires); some games also use BG3
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, true) {
+                    let (c, p) = self.render_bg_mode5_with_priority(x, y, 0);
+                    consider!(c, p, 0);
+                }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, true) {
+                    let (c, p) = self.render_bg_mode5_with_priority(x, y, 1);
+                    consider!(c, p, 1);
+                }
+                if (enables & 0x04) != 0 && !self.should_mask_bg(x, 2, true) {
+                    let (c, p) = self.render_bg_mode5_with_priority(x, y, 2);
+                    consider!(c, p, 2);
+                }
+            }
+            6 => {
+                // Mode 6: BG1 is 4bpp (hires)
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, true) {
+                    let (c, p) = self.render_bg_mode6_with_priority(x, y, 0);
+                    consider!(c, p, 0);
+                }
+            }
+            7 => {
+                let (c, p, lid) = self.render_mode7_with_layer(x, y);
+                if c != 0 {
+                    let id = if self.extbg { lid } else { 0 };
+                    let en_bit = 1u8 << id;
+                    if (enables & en_bit) != 0 && !self.should_mask_bg(x, id, true) {
+                        consider!(c, p, id);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if best_color != 0 {
+            (best_color, best_pr, best_id)
+        } else {
+            (0, 0, 0)
+        }
     }
 
     // サブスクリーン描画
@@ -6465,117 +6598,112 @@ impl Ppu {
 
     // サブスクリーン用BG描画（メインと同等のモード対応）
     fn get_sub_bg_pixel(&mut self, x: u16, y: u16) -> (u32, u8, u8) {
-        let mut bg_results = Vec::new();
+        // Hot path: avoid per-pixel heap allocations.
+        let enables = self.sub_screen_designation;
+
+        let mut best_color: u32 = 0;
+        let mut best_pr: u8 = 0;
+        let mut best_id: u8 = 0;
+        let mut best_z: i16 = i16::MIN;
+
+        // Keep ordering consistent with the previous max_by_key:
+        // (z_rank_for_bg(layer, pr), layer_id)
+        macro_rules! consider {
+            ($color:expr, $pr:expr, $id:expr) => {{
+                let color: u32 = $color;
+                if color == 0 {
+                    // Transparent
+                } else {
+                    let pr: u8 = $pr;
+                    let id: u8 = $id;
+                    let z = self.z_rank_for_bg(id, pr);
+                    if z > best_z || (z == best_z && id > best_id) {
+                        best_color = color;
+                        best_pr = pr;
+                        best_id = id;
+                        best_z = z;
+                    }
+                }
+            }};
+        }
 
         match self.bg_mode {
             0 => {
-                if self.sub_screen_designation & 0x01 != 0 && !self.should_mask_bg(x, 0, false) {
-                    let (color, priority) = self.render_bg_mode0(x, y, 0);
-                    if color != 0 {
-                        bg_results.push((color, priority, 0));
-                    }
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, false) {
+                    let (c, p) = self.render_bg_mode0(x, y, 0);
+                    consider!(c, p, 0);
                 }
-                if self.sub_screen_designation & 0x02 != 0 && !self.should_mask_bg(x, 1, false) {
-                    let (color, priority) = self.render_bg_mode0(x, y, 1);
-                    if color != 0 {
-                        bg_results.push((color, priority, 1));
-                    }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, false) {
+                    let (c, p) = self.render_bg_mode0(x, y, 1);
+                    consider!(c, p, 1);
                 }
-                if self.sub_screen_designation & 0x04 != 0 && !self.should_mask_bg(x, 2, false) {
-                    let (color, priority) = self.render_bg_mode0(x, y, 2);
-                    if color != 0 {
-                        bg_results.push((color, priority, 2));
-                    }
+                if (enables & 0x04) != 0 && !self.should_mask_bg(x, 2, false) {
+                    let (c, p) = self.render_bg_mode0(x, y, 2);
+                    consider!(c, p, 2);
                 }
-                if self.sub_screen_designation & 0x08 != 0 && !self.should_mask_bg(x, 3, false) {
-                    let (color, priority) = self.render_bg_mode0(x, y, 3);
-                    if color != 0 {
-                        bg_results.push((color, priority, 3));
-                    }
+                if (enables & 0x08) != 0 && !self.should_mask_bg(x, 3, false) {
+                    let (c, p) = self.render_bg_mode0(x, y, 3);
+                    consider!(c, p, 3);
                 }
             }
             1 => {
-                if self.sub_screen_designation & 0x01 != 0 && !self.should_mask_bg(x, 0, false) {
-                    let (color, priority) = self.render_bg_4bpp(x, y, 0);
-                    if color != 0 {
-                        bg_results.push((color, priority, 0));
-                    }
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, false) {
+                    let (c, p) = self.render_bg_4bpp(x, y, 0);
+                    consider!(c, p, 0);
                 }
-                if self.sub_screen_designation & 0x02 != 0 && !self.should_mask_bg(x, 1, false) {
-                    let (color, priority) = self.render_bg_4bpp(x, y, 1);
-                    if color != 0 {
-                        bg_results.push((color, priority, 1));
-                    }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, false) {
+                    let (c, p) = self.render_bg_4bpp(x, y, 1);
+                    consider!(c, p, 1);
                 }
-                if self.sub_screen_designation & 0x04 != 0 && !self.should_mask_bg(x, 2, false) {
-                    let (color, priority) = self.render_bg_mode0(x, y, 2);
-                    if color != 0 {
-                        bg_results.push((color, priority, 2));
-                    }
+                if (enables & 0x04) != 0 && !self.should_mask_bg(x, 2, false) {
+                    let (c, p) = self.render_bg_mode0(x, y, 2);
+                    consider!(c, p, 2);
                 }
             }
             2 => {
-                if self.sub_screen_designation & 0x01 != 0 && !self.should_mask_bg(x, 0, false) {
-                    let (color, priority) = self.render_bg_mode2(x, y, 0);
-                    if color != 0 {
-                        bg_results.push((color, priority, 0));
-                    }
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, false) {
+                    let (c, p) = self.render_bg_mode2(x, y, 0);
+                    consider!(c, p, 0);
                 }
-                if self.sub_screen_designation & 0x02 != 0 && !self.should_mask_bg(x, 1, false) {
-                    let (color, priority) = self.render_bg_mode2(x, y, 1);
-                    if color != 0 {
-                        bg_results.push((color, priority, 1));
-                    }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, false) {
+                    let (c, p) = self.render_bg_mode2(x, y, 1);
+                    consider!(c, p, 1);
                 }
             }
             3 => {
-                if self.sub_screen_designation & 0x01 != 0 && !self.should_mask_bg(x, 0, false) {
-                    let (color, priority) = self.render_bg_8bpp(x, y, 0);
-                    if color != 0 {
-                        bg_results.push((color, priority, 0));
-                    }
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, false) {
+                    let (c, p) = self.render_bg_8bpp(x, y, 0);
+                    consider!(c, p, 0);
                 }
-                if self.sub_screen_designation & 0x02 != 0 && !self.should_mask_bg(x, 1, false) {
-                    let (color, priority) = self.render_bg_4bpp(x, y, 1);
-                    if color != 0 {
-                        bg_results.push((color, priority, 1));
-                    }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, false) {
+                    let (c, p) = self.render_bg_4bpp(x, y, 1);
+                    consider!(c, p, 1);
                 }
             }
             4 => {
-                if self.sub_screen_designation & 0x01 != 0 && !self.should_mask_bg(x, 0, false) {
-                    let (color, priority) = self.render_bg_8bpp(x, y, 0);
-                    if color != 0 {
-                        bg_results.push((color, priority, 0));
-                    }
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, false) {
+                    let (c, p) = self.render_bg_8bpp(x, y, 0);
+                    consider!(c, p, 0);
                 }
-                if self.sub_screen_designation & 0x02 != 0 && !self.should_mask_bg(x, 1, false) {
-                    let (color, priority) = self.render_bg_mode0(x, y, 1);
-                    if color != 0 {
-                        bg_results.push((color, priority, 1));
-                    }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, false) {
+                    let (c, p) = self.render_bg_mode0(x, y, 1);
+                    consider!(c, p, 1);
                 }
             }
             5 => {
-                if self.sub_screen_designation & 0x01 != 0 && !self.should_mask_bg(x, 0, false) {
-                    let (color, priority) = self.render_bg_mode5(x, y, 0, false);
-                    if color != 0 {
-                        bg_results.push((color, priority, 0));
-                    }
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, false) {
+                    let (c, p) = self.render_bg_mode5(x, y, 0, false);
+                    consider!(c, p, 0);
                 }
-                if self.sub_screen_designation & 0x02 != 0 && !self.should_mask_bg(x, 1, false) {
-                    let (color, priority) = self.render_bg_mode5(x, y, 1, false);
-                    if color != 0 {
-                        bg_results.push((color, priority, 1));
-                    }
+                if (enables & 0x02) != 0 && !self.should_mask_bg(x, 1, false) {
+                    let (c, p) = self.render_bg_mode5(x, y, 1, false);
+                    consider!(c, p, 1);
                 }
             }
             6 => {
-                if self.sub_screen_designation & 0x01 != 0 && !self.should_mask_bg(x, 0, false) {
-                    let (color, priority) = self.render_bg_mode6(x, y, 0, false);
-                    if color != 0 {
-                        bg_results.push((color, priority, 0));
-                    }
+                if (enables & 0x01) != 0 && !self.should_mask_bg(x, 0, false) {
+                    let (c, p) = self.render_bg_mode6(x, y, 0, false);
+                    consider!(c, p, 0);
                 }
             }
             7 => {
@@ -6583,21 +6711,19 @@ impl Ppu {
                 if c != 0 {
                     let id = if self.extbg { lid } else { 0 };
                     let en_bit = 1u8 << id;
-                    if (self.sub_screen_designation & en_bit) != 0
-                        && !self.should_mask_bg(x, id, false)
-                    {
-                        bg_results.push((c, p, id));
+                    if (enables & en_bit) != 0 && !self.should_mask_bg(x, id, false) {
+                        consider!(c, p, id);
                     }
                 }
             }
             _ => {}
         }
 
-        // 最も高いプライオリティのBGを返す
-        bg_results
-            .into_iter()
-            .max_by_key(|(_, p, n)| (self.z_rank_for_bg(*n, *p), *n))
-            .unwrap_or((0, 0, 0))
+        if best_color != 0 {
+            (best_color, best_pr, best_id)
+        } else {
+            (0, 0, 0)
+        }
     }
 
     // サブスクリーン用スプライト描画（簡易版）
