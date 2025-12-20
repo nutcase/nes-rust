@@ -4736,13 +4736,30 @@ impl Bus {
             }
 
             // HDMA転送実行
-            self.perform_hdma_transfer(i);
+            //
+            // SNES HDMA line-counter semantics:
+            // - repeat=0: transfer once, then pause for (count-1) scanlines (register value holds)
+            // - repeat=1: transfer every scanline for `count` scanlines, consuming new data each line
+            let do_transfer = self.dma_controller.channels[i].hdma_do_transfer;
+            if do_transfer {
+                self.perform_hdma_transfer(i);
+                if !self.dma_controller.channels[i].hdma_repeat_flag {
+                    self.dma_controller.channels[i].hdma_do_transfer = false;
+                }
+            }
 
             // 行カウンタをデクリメント
             let new_count = self.dma_controller.channels[i]
                 .hdma_line_counter
                 .saturating_sub(1);
             self.dma_controller.channels[i].hdma_line_counter = new_count;
+            if new_count == 0 {
+                // Next scanline will load a new entry (which re-enables do_transfer as appropriate).
+                self.dma_controller.channels[i].hdma_do_transfer = false;
+            } else if self.dma_controller.channels[i].hdma_repeat_flag {
+                // repeat=1 transfers on every scanline while the counter is nonzero.
+                self.dma_controller.channels[i].hdma_do_transfer = true;
+            }
         }
     }
 
@@ -4765,52 +4782,31 @@ impl Bus {
 
         let repeat_flag = (line_info & 0x80) != 0;
         let line_count = line_info & 0x7F;
-        let unit = control & 0x07;
-        let data_len = Self::hdma_transfer_len(unit) as u32;
         let indirect = (control & 0x40) != 0; // bit6: indirect addressing
 
-        // まず基本フィールドを更新
+        // NOTE: HDMA tables live in the bank specified by A1Bn ($43x4) / src_address bank.
+        // Indirect HDMA data blocks live in the bank specified by DASB ($43x7).
         {
             let ch = &mut self.dma_controller.channels[channel];
             ch.hdma_line_counter = line_count;
             ch.hdma_repeat_flag = repeat_flag;
-            ch.hdma_table_addr = Bus::add16_in_bank(table_addr, 1); // ヘッダ分（16bit）進める
+            ch.hdma_do_transfer = true; // first line always transfers
+            ch.hdma_indirect = indirect;
             ch.hdma_latched = [0; 4];
             ch.hdma_latched_len = 0;
-            ch.hdma_indirect = indirect;
+            // Advance table pointer past the line counter byte.
+            ch.hdma_table_addr = Bus::add16_in_bank(table_addr, 1);
         }
 
-        // 間接アドレッシング：2バイトのアドレスを読み込み（バンクは初期のsrc.bank）
         if indirect {
-            let lo = self.read_u8(self.dma_controller.channels[channel].hdma_table_addr) as u32;
-            let hi = self.read_u8(Bus::add16_in_bank(
-                self.dma_controller.channels[channel].hdma_table_addr,
-                1,
-            )) as u32;
-            let bank = (self.dma_controller.channels[channel].src_address >> 16) & 0xFF;
-            {
-                let ch = &mut self.dma_controller.channels[channel];
-                ch.hdma_indirect_addr = (bank << 16) | (hi << 8) | lo;
-                ch.hdma_table_addr = Bus::add16_in_bank(ch.hdma_table_addr, 2);
-            }
-        } else if repeat_flag {
-            // 直接モード＋リピート: データを一度だけ読み込んでラッチ
-            let start = Bus::add16_in_bank(table_addr, 1);
-            let mut buf = [0u8; 4];
-            for i in 0..data_len {
-                buf[i as usize] = self.read_u8(Bus::add16_in_bank(start, i));
-            }
-            {
-                let ch = &mut self.dma_controller.channels[channel];
-                ch.hdma_latched[..data_len as usize].copy_from_slice(&buf[..data_len as usize]);
-                ch.hdma_latched_len = data_len as u8;
-                ch.hdma_table_addr = Bus::add16_in_bank(start, data_len);
-            }
-        } else {
-            // 直接モード＋ノンリピート: テーブルポインタをデータ長分進めるだけ
-            let start = Bus::add16_in_bank(table_addr, 1);
-            let ch = &mut self.dma_controller.channels[channel];
-            ch.hdma_table_addr = Bus::add16_in_bank(start, data_len);
+            let ptr = self.dma_controller.channels[channel].hdma_table_addr;
+            let lo = self.read_u8(ptr) as u32;
+            let hi = self.read_u8(Bus::add16_in_bank(ptr, 1)) as u32;
+            let bank = self.dma_controller.channels[channel].dasb as u32;
+            let mut ch = &mut self.dma_controller.channels[channel];
+            ch.hdma_indirect_addr = (bank << 16) | (hi << 8) | lo;
+            // Advance table pointer past the 16-bit indirect address.
+            ch.hdma_table_addr = Bus::add16_in_bank(ch.hdma_table_addr, 2);
         }
 
         true
@@ -4822,38 +4818,27 @@ impl Bus {
         // 必要な情報を事前に取得して、借用を短く保つ
         let dest_base = { self.dma_controller.channels[channel].dest_address };
         let control = { self.dma_controller.channels[channel].control };
-        let repeat_flag = { self.dma_controller.channels[channel].hdma_repeat_flag };
-        let latched_len = { self.dma_controller.channels[channel].hdma_latched_len } as usize;
         let unit = control & 0x07;
         let len = Self::hdma_transfer_len(unit) as usize;
         let indirect = (control & 0x40) != 0;
-
-        let use_latched = repeat_flag && latched_len == len;
-        let table_addr_snapshot = { self.dma_controller.channels[channel].hdma_table_addr };
-
-        // 1ライン分のデータを用意
-        let mut bytes: [u8; 4] = [0; 4];
-        if use_latched {
-            let latched = { self.dma_controller.channels[channel].hdma_latched };
-            bytes[..len].copy_from_slice(&latched[..len]);
-        } else if indirect {
-            // 間接アドレッシング：間接アドレスから読み出す
-            let start = { self.dma_controller.channels[channel].hdma_indirect_addr };
-            for (i, slot) in bytes.iter_mut().enumerate().take(len) {
-                *slot = self.read_u8(Bus::add16_in_bank(start, i as u32));
-            }
-            // HDMAでは間接アドレスは毎ライン len 分前進（リピート有無に関わらず）
-            let ch = &mut self.dma_controller.channels[channel];
-            ch.hdma_indirect_addr = Bus::add16_in_bank(start, len as u32);
+        let src = if indirect {
+            self.dma_controller.channels[channel].hdma_indirect_addr
         } else {
-            for (i, slot) in bytes.iter_mut().enumerate().take(len) {
-                *slot = self.read_u8(Bus::add16_in_bank(table_addr_snapshot, i as u32));
-            }
-            // テーブルアドレスを進める
-            {
-                let ch = &mut self.dma_controller.channels[channel];
-                ch.hdma_table_addr = Bus::add16_in_bank(table_addr_snapshot, len as u32);
-            }
+            self.dma_controller.channels[channel].hdma_table_addr
+        };
+
+        // 1ライン分のデータを読み出し
+        let mut bytes: [u8; 4] = [0; 4];
+        for (i, slot) in bytes.iter_mut().enumerate().take(len) {
+            *slot = self.read_u8(Bus::add16_in_bank(src, i as u32));
+        }
+        // Transfer consumes bytes only on scanlines where it executes.
+        if indirect {
+            self.dma_controller.channels[channel].hdma_indirect_addr =
+                Bus::add16_in_bank(src, len as u32);
+        } else {
+            self.dma_controller.channels[channel].hdma_table_addr =
+                Bus::add16_in_bank(src, len as u32);
         }
 
         // 書き込み（PPU writable or APU I/O）

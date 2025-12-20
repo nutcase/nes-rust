@@ -16,6 +16,7 @@ pub struct DmaChannel {
     pub hdma_table_addr: u32,   // HDMAテーブルアドレス ($43X2-$43X4)
     pub hdma_line_counter: u8,  // HDMAライン残数 ($43X0の下位7ビット)
     pub hdma_repeat_flag: bool, // HDMAリピートフラグ ($43X0の7ビット目)
+    pub hdma_do_transfer: bool, // HDMAがこのラインで転送するか（repeat=0時の「最初の1回」制御）
     pub hdma_enabled: bool,     // HDMAが有効か
     pub hdma_terminated: bool,  // HDMAが終了したか
     // HDMAデータ（リピート用ラッチ）
@@ -59,6 +60,7 @@ impl DmaChannel {
             hdma_table_addr: 0,
             hdma_line_counter: 0,
             hdma_repeat_flag: false,
+            hdma_do_transfer: false,
             hdma_enabled: false,
             hdma_terminated: false,
             hdma_latched: [0; 4],
@@ -419,6 +421,7 @@ impl DmaController {
         // HDMAテーブルから最初のエントリを読み込み
         self.channels[channel].hdma_line_counter = 0;
         self.channels[channel].hdma_repeat_flag = false;
+        self.channels[channel].hdma_do_transfer = false;
         self.channels[channel].hdma_latched = [0; 4];
         self.channels[channel].hdma_latched_len = 0;
         // テーブル開始点は src_address

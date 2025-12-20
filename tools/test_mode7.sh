@@ -16,7 +16,7 @@ cargo build --release >/dev/null
 echo "[mode7] Running Mode 7 diagnostic (60 frames)"
 set +e
 OUT=$(HEADLESS=1 HEADLESS_FRAMES=60 MODE7_TEST=1 FORCE_DISPLAY=1 DEBUG_RENDER_METRICS=1 \
-      cargo run --release --quiet -- "$ROM_ARG" 2>&1)
+      cargo run --release --quiet --bin snes_emulator -- "$ROM_ARG" 2>&1)
 status=$?
 set -e
 

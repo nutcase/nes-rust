@@ -56,6 +56,7 @@ set +e
 # dramatically slow headless regressions. Default to a clean env for reproducible speed.
 # Set BURNIN_CLEAN_ENV=0 to inherit the current environment.
 if [[ "${BURNIN_CLEAN_ENV:-1}" == "0" ]]; then
+  AUTO_INPUT=1 \
   AUTO_INPUT_EVENTS="$AUTO_EVENTS" \
   HEADLESS=1 \
   HEADLESS_FAST_RENDER="${HEADLESS_FAST_RENDER:-1}" \
@@ -71,6 +72,7 @@ else
   env -i \
     PATH="$PATH" \
     HOME="${HOME:-/}" \
+    AUTO_INPUT=1 \
     AUTO_INPUT_EVENTS="$AUTO_EVENTS" \
     HEADLESS=1 \
     HEADLESS_FAST_RENDER="${HEADLESS_FAST_RENDER:-1}" \

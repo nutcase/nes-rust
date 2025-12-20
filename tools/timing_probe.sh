@@ -34,7 +34,7 @@ cargo build --release >/dev/null
 echo "[probe] Running STRICT_PPU_TIMING on: $ROM_PATH (frames=$FRAMES)" >&2
 set +e
 OUT=$(STRICT_PPU_TIMING=1 DEBUG_PPU_WRITE=1 HEADLESS=1 HEADLESS_FRAMES="$FRAMES" \
-      cargo run --release --quiet -- "$ROM_PATH" 2>&1)
+      cargo run --release --quiet --bin snes_emulator -- "$ROM_PATH" 2>&1)
 status=$?
 set -e
 
@@ -58,4 +58,3 @@ if (( vr_lo + vr_hi + cg_wr + oam_wr > 0 )); then
 fi
 
 exit 0
-

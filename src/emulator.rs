@@ -1789,8 +1789,11 @@ impl Emulator {
         }
     }
 
-    /// Auto-inject button input for testing (controlled by AUTO_INPUT_FRAMES env var)
+    /// Auto-inject button input for testing (AUTO_INPUT=1 + AUTO_INPUT_* env vars)
     fn maybe_inject_auto_input(&mut self) {
+        if !crate::debug_flags::auto_input() {
+            return;
+        }
         let frame = self.frame_count;
 
         fn parse_buttons(spec: &str) -> u16 {
@@ -2903,15 +2906,15 @@ impl Emulator {
                     .tick_timers_hv(old_cycle, DOTS_PER_LINE, old_scanline);
             }
 
-            // H-Blank入りでHDMA実行（画面内ラインのみ）
+            // H-Blank入りでHDMA実行
+            //
+            // SNES HDMA runs at the start of HBlank for *every* scanline (including scanline 0,
+            // which is always hidden in blanking).  Some titles (notably Mode 7 perspective)
+            // rely on the scanline-0 transfer to set up the first visible line.
             if !was_hblank && is_hblank {
-                let vis_last = self.bus.get_ppu().get_visible_height();
-                let line_is_visible = old_scanline >= 1 && old_scanline <= vis_last;
-                if line_is_visible {
-                    // Guard a few dots at HBlank head for HDMA operations
-                    self.bus.get_ppu_mut().on_hblank_start_guard();
-                    self.bus.hdma_hblank();
-                }
+                // Guard a few dots at HBlank head for HDMA operations
+                self.bus.get_ppu_mut().on_hblank_start_guard();
+                self.bus.hdma_hblank();
             }
 
             // スキャンライン変更時はタイマを進める
@@ -3195,8 +3198,8 @@ impl Emulator {
         // One-time setup on first frame
         if self.frame_count == 0 {
             println!("MODE7_TEST: configuring PPU for Mode 7 diagnostic");
-            // Unblank
-            ppu.write(0x00, 0x0F);
+            // Forced blank during VRAM/CGRAM setup so writes are accepted regardless of timing.
+            ppu.write(0x00, 0x8F);
             // Mode 7
             ppu.write(0x05, 0x07);
             // EXTBG on/off per env (default on)
@@ -3204,8 +3207,8 @@ impl Emulator {
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(true);
             ppu.write(0x33, if extbg { 0x40 } else { 0x00 });
-            // Main screen: BG1 only
-            ppu.write(0x2C, 0x01);
+            // Main screen: BG1, and BG2 as well when EXTBG is enabled.
+            ppu.write(0x2C, if extbg { 0x03 } else { 0x01 });
             // M7SEL: from env flags; defaults R=1 (fill), F=1 (char0), flips off
             let r = std::env::var("M7_R")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -3260,25 +3263,11 @@ impl Emulator {
             w16(ppu, 0x1C, b); // B
             w16(ppu, 0x1D, c); // C
             w16(ppu, 0x1E, d); // D
-            w16(ppu, 0x1F, 128 << 8); // center X
-            w16(ppu, 0x20, 128 << 8); // center Y
-                                      // Tile0 8bpp linear: 64 bytes gradient 0..63 (BG1)
-            ppu.write(0x16, 0x00);
-            ppu.write(0x17, 0x00); // VMADD=0x0000
-            for i in 0..64u8 {
-                ppu.write(0x18, i);
-                ppu.write(0x19, 0x00);
-            }
-            // Tile1 8bpp linear: 64 bytes gradient 128..191 (BG2 when EXTBG)
-            ppu.write(0x16, 0x80);
-            ppu.write(0x17, 0x00); // VMADD=0x0040
-            for i in 128..192u16 {
-                ppu.write(0x18, (i & 0xFF) as u8);
-                ppu.write(0x19, 0x00);
-            }
-            // Palette: first 64 entries gradient
+            w16(ppu, 0x1F, 128); // center X (13-bit signed integer)
+            w16(ppu, 0x20, 128); // center Y (13-bit signed integer)
+                                 // Palette: 256 entries gradient (covers both EXTBG and non-EXTBG cases)
             ppu.write(0x21, 0x00);
-            for i in 0..64u16 {
+            for i in 0..256u16 {
                 let r = ((i >> 1) & 0x1F) as u16;
                 let g = ((i >> 1) & 0x1F) as u16;
                 let b = (i & 0x1F) as u16;
@@ -3286,19 +3275,35 @@ impl Emulator {
                 ppu.write(0x22, (col & 0xFF) as u8);
                 ppu.write(0x22, ((col >> 8) as u8) & 0x7F);
             }
-            // Fill entire Mode 7 map (0x2000..0x5FFF) with tile #1 (ensures BG2 when EXTBG)
+
+            // Mode 7 VRAM layout (words 0x0000..0x3FFF):
+            // - Low byte: tilemap (128x128 bytes)
+            // - High byte: tile data (256 tiles * 64 bytes)
+            //
+            // Fill tilemap with tile #1, and define tile #0/#1 with distinct gradients.
             // Configure VMAIN: increment after HIGH (bit7=1), inc=1
             ppu.write(0x15, 0x80);
-            // VMADD = 0x2000 bytes -> word address 0x1000
+            // VMADD = 0x0000 (word address)
             ppu.write(0x16, 0x00);
-            ppu.write(0x17, 0x10);
-            for _ in 0..(128 * 128 / 2) {
-                // write two bytes per word: 0x01, 0x01
-                ppu.write(0x18, 0x01); // low
-                ppu.write(0x19, 0x01); // high -> increments word address
+            ppu.write(0x17, 0x00);
+            for w in 0..(128 * 128) {
+                let lo = 0x01u8; // map: tile #1 everywhere
+                let hi = if w < 64 {
+                    // tile0: 0..63 (BG1)
+                    w as u8
+                } else if w < 128 {
+                    // tile1: 128..191 (BG2 when EXTBG)
+                    128u8.wrapping_add((w - 64) as u8)
+                } else {
+                    0u8
+                };
+                ppu.write(0x18, lo);
+                ppu.write(0x19, hi); // increments word address
             }
             // Restore VMAIN to default (inc after LOW, inc=1)
             ppu.write(0x15, 0x00);
+            // Unblank at full brightness
+            ppu.write(0x00, 0x0F);
             println!(
                 "MODE7_TEST: scale={:.2} angle_deg={:.1} EXTBG={} R={} F={} flips=({},{}) z:OBJ[3,2,1,0]=[{},{},{},{}] BG1={} BG2={}",
                 scale, angle_deg, extbg, r, f, flipx, flipy,

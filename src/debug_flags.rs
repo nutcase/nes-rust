@@ -155,6 +155,12 @@ pub fn headless() -> bool {
     *ON.get_or_init(|| env_flag("HEADLESS", false))
 }
 
+// Enable scripted/forced input (AUTO_INPUT_EVENTS/AUTO_INPUT_FRAMES/AUTO_JOYPAD*_MASK).
+pub fn auto_input() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("AUTO_INPUT", false))
+}
+
 // Hot-path traces: use env presence semantics to avoid repeated env lookups.
 pub fn trace_vectors() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -179,6 +185,11 @@ pub fn trace_sfr_values() -> bool {
 pub fn trace_sfr_val() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_present("TRACE_SFR_VAL"))
+}
+
+pub fn trace_mode7_regs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("TRACE_MODE7_REGS"))
 }
 
 pub fn trace_bwram_sys() -> bool {

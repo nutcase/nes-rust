@@ -121,15 +121,15 @@ pub struct Ppu {
     mode7_matrix_b: i16, // Mode 7変換行列B ($211C)
     mode7_matrix_c: i16, // Mode 7変換行列C ($211D)
     mode7_matrix_d: i16, // Mode 7変換行列D ($211E)
-    mode7_center_x: i16, // Mode 7回転中心X ($211F)
-    mode7_center_y: i16, // Mode 7回転中心Y ($2120)
+    mode7_center_x: i16, // Mode 7回転中心X ($211F) (13-bit signed)
+    mode7_center_y: i16, // Mode 7回転中心Y ($2120) (13-bit signed)
+    mode7_hofs: i16,     // $210D: M7HOFS (13-bit signed)
+    mode7_vofs: i16,     // $210E: M7VOFS (13-bit signed)
+    mode7_latch: u8,     // Shared latch for Mode 7 regs ($210D/$210E/$211B-$2120)
+    mode7_mul_b: i8,     // Last 8-bit value written to M7B for $2134-$2136
 
     // Mode 7 乗算結果キャッシュ ($2134-$2136)
     mode7_mul_result: u32, // 24bit 有効（下位3バイト）
-
-    // Mode 7 register write latches (two-write: low then high)
-    m7_latch_low: [u8; 6],
-    m7_latch_second: [bool; 6],
 
     framebuffer: Vec<u32>,
     subscreen_buffer: Vec<u32>, // サブスクリーン用バッファ
@@ -378,6 +378,38 @@ impl Ppu {
     }
 
     #[inline]
+    fn sign_extend13(value: u16) -> i16 {
+        // Mode 7 center/offset registers are 13-bit signed.
+        let v = value & 0x1FFF;
+        if (v & 0x1000) != 0 {
+            (v | 0xE000) as i16
+        } else {
+            v as i16
+        }
+    }
+
+    #[inline]
+    fn mode7_combine(&mut self, value: u8) -> u16 {
+        // SNESdev: Mode 7 registers share a single latch. Each write forms:
+        //   reg = (value<<8) | mode7_latch; mode7_latch = value
+        let combined = ((value as u16) << 8) | (self.mode7_latch as u16);
+        self.mode7_latch = value;
+        combined
+    }
+
+    #[inline]
+    fn write_m7hofs(&mut self, value: u8) {
+        let combined = self.mode7_combine(value);
+        self.mode7_hofs = Self::sign_extend13(combined);
+    }
+
+    #[inline]
+    fn write_m7vofs(&mut self, value: u8) {
+        let combined = self.mode7_combine(value);
+        self.mode7_vofs = Self::sign_extend13(combined);
+    }
+
+    #[inline]
     fn write_bghofs(&mut self, bg_num: usize, value: u8) {
         // BGnHOFS ($210D/$210F/$2111/$2113)
         // SNESdev wiki: BGnHOFS = (value<<8) | (bgofs_latch & ~7) | (bghofs_latch & 7)
@@ -514,10 +546,11 @@ impl Ppu {
             mode7_matrix_d: 256, // 1.0 in fixed point (8.8)
             mode7_center_x: 0,
             mode7_center_y: 0,
+            mode7_hofs: 0,
+            mode7_vofs: 0,
+            mode7_latch: 0,
+            mode7_mul_b: 0,
             mode7_mul_result: 0,
-
-            m7_latch_low: [0; 6],
-            m7_latch_second: [false; 6],
 
             framebuffer: vec![0; 256 * 224],
             subscreen_buffer: vec![0; 256 * 224],
@@ -2383,8 +2416,8 @@ impl Ppu {
                         let tile_y = (iy >> 3) & 0x7F;
                         let px = (ix & 7) as u8;
                         let py = (iy & 7) as u8;
-                        let map_base = 0x2000usize;
-                        let map_index = map_base + (tile_y as usize) * 128 + (tile_x as usize);
+                        let map_word = ((tile_y as usize) << 7) | (tile_x as usize);
+                        let map_index = map_word * 2;
                         if map_index < self.vram.len() {
                             let tile_id = self.vram[map_index] as u16;
                             let (col, pr, lid) = self.sample_mode7_with_layer(tile_id, px, py);
@@ -3227,8 +3260,11 @@ impl Ppu {
             let tile_y = (iy >> 3) & 0x7F; // 0..127
             let px = (((ix % 8) + 8) % 8) as u8;
             let py = (((iy % 8) + 8) % 8) as u8;
-            let map_base = 0x2000usize;
-            let map_index = map_base + (tile_y as usize) * 128 + (tile_x as usize);
+            // Mode 7 VRAM layout:
+            // - Tilemap: low byte of VRAM words 0x0000..0x3FFF (128x128 bytes)
+            // - Tile data: high byte of the same VRAM words (256 tiles * 64 bytes = 16384 bytes)
+            let map_word = ((tile_y as usize) << 7) | (tile_x as usize);
+            let map_index = map_word * 2;
             if map_index >= self.vram.len() {
                 return (0, 0, desired_layer, wrapped, false, false, false);
             }
@@ -3307,10 +3343,10 @@ impl Ppu {
     // SNES Mode 7 tiles are 8x8, 8bpp, linear (64 bytes per tile).
     #[inline]
     fn sample_mode7_color_only(&self, tile_id: u16, px: u8, py: u8) -> (u32, u8) {
-        let chr_base = 0x0000usize;
-        let tile_addr = chr_base + (tile_id as usize) * 64;
-        let row_off = (py as usize) * 8;
-        let addr = tile_addr + row_off + (px as usize);
+        // Mode 7 tile data is stored in the high byte of VRAM words 0x0000..0x3FFF.
+        // Treating the high bytes as a contiguous byte array yields 256 tiles * 64 bytes.
+        let data_word = ((tile_id as usize) << 6) | ((py as usize) << 3) | (px as usize); // 0..16383
+        let addr = data_word * 2 + 1;
         if addr >= self.vram.len() {
             return (0, 0);
         }
@@ -3318,8 +3354,14 @@ impl Ppu {
         if color_index == 0 {
             return (0, 0);
         }
-        let palette_index = self.get_bg_palette_index(0, color_index, 8);
-        let color = self.cgram_to_rgb(palette_index);
+        // Direct color mode (CGWSEL bit0) for 8bpp BGs; in Mode 7 there are no tilemap palette bits.
+        let use_direct_color = (self.cgwsel & 0x01) != 0;
+        let color = if use_direct_color {
+            self.direct_color_to_rgb(0, color_index)
+        } else {
+            let palette_index = self.get_bg_palette_index(0, color_index, 8);
+            self.cgram_to_rgb(palette_index)
+        };
         (color, 1)
     }
 
@@ -3327,24 +3369,29 @@ impl Ppu {
     // Returns (ARGB, priority, layer_id: 0=BG1, 1=BG2 when EXTBG and color>=128)
     #[inline]
     fn sample_mode7_with_layer(&self, tile_id: u16, px: u8, py: u8) -> (u32, u8, u8) {
-        let chr_base = 0x0000usize;
-        let tile_addr = chr_base + (tile_id as usize) * 64;
-        let row_off = (py as usize) * 8;
-        let addr = tile_addr + row_off + (px as usize);
+        let data_word = ((tile_id as usize) << 6) | ((py as usize) << 3) | (px as usize); // 0..16383
+        let addr = data_word * 2 + 1;
         if addr >= self.vram.len() {
             return (0, 0, 0);
         }
-        let color_index = self.vram[addr];
+        let raw = self.vram[addr];
+        // EXTBG: pixels 128..255 are BG2; bit7 is then cleared for color selection.
+        let (layer_id, color_index) = if self.extbg && (raw & 0x80) != 0 {
+            (1u8, raw & 0x7F)
+        } else {
+            (0u8, raw)
+        };
         if color_index == 0 {
             return (0, 0, 0);
         }
-        let layer_id = if self.extbg && (color_index & 0x80) != 0 {
-            1
+        let use_direct_color = (self.cgwsel & 0x01) != 0;
+        // EXTBG: direct color is available for BG1 only; BG2 always uses indexed color.
+        let color = if layer_id == 0 && use_direct_color {
+            self.direct_color_to_rgb(0, color_index)
         } else {
-            0
+            let palette_index = self.get_bg_palette_index(0, color_index, 8);
+            self.cgram_to_rgb(palette_index)
         };
-        let palette_index = self.get_bg_palette_index(0, color_index, 8);
-        let color = self.cgram_to_rgb(palette_index);
         (color, 1, layer_id)
     }
 
@@ -4920,9 +4967,13 @@ impl Ppu {
             }
             0x0D => {
                 self.write_bghofs(0, value);
+                // $210D also maps to M7HOFS (Mode 7)
+                self.write_m7hofs(value);
             }
             0x0E => {
                 self.write_bgvofs(0, value);
+                // $210E also maps to M7VOFS (Mode 7)
+                self.write_m7vofs(value);
             }
             0x0F => {
                 self.write_bghofs(1, value);
@@ -5323,7 +5374,10 @@ impl Ppu {
                     static mut CGRAM_WRITE_COUNT: u32 = 0;
                     unsafe {
                         CGRAM_WRITE_COUNT += 1;
-                        if CGRAM_WRITE_COUNT <= 10 && !crate::debug_flags::quiet() {
+                        if (crate::debug_flags::ppu_write() || crate::debug_flags::boot_verbose())
+                            && CGRAM_WRITE_COUNT <= 10
+                            && !crate::debug_flags::quiet()
+                        {
                             println!(
                                 "CGRAM write[{}]: color=0x{:02X}, LOW byte, value=0x{:02X}",
                                 CGRAM_WRITE_COUNT, self.cgram_addr, value
@@ -5538,50 +5592,49 @@ impl Ppu {
             }
             // Mode 7レジスタ（2回書き込みで16ビット値を構成）
             0x1B..=0x20 => {
-                // Mode 7 registers: two writes (low then high), signed 16-bit (8.8 fixed)
+                // Mode 7 registers share a single latch. Writing low then high yields the intended
+                // 16-bit value after the second write, but each write updates the register.
                 let idx = (addr - 0x1B) as usize; // 0..5 (A,B,C,D,CenterX,CenterY)
-                if !self.m7_latch_second[idx] {
-                    self.m7_latch_low[idx] = value;
-                    self.m7_latch_second[idx] = true;
-                } else {
-                    let low = self.m7_latch_low[idx] as u16;
-                    let high = value as u16;
-                    let combined = ((high << 8) | low) as i16;
-                    match idx {
-                        0 => {
-                            self.mode7_matrix_a = combined;
-                            self.update_mode7_mul_result();
-                        }
-                        1 => {
-                            self.mode7_matrix_b = combined;
-                            self.update_mode7_mul_result();
-                            if !crate::debug_flags::quiet() {
-                                static M7B_LOG: std::sync::atomic::AtomicU32 =
-                                    std::sync::atomic::AtomicU32::new(0);
-                                let n = M7B_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if n < 4 {
-                                    println!("PPU: Mode 7 matrix B set to {}", self.mode7_matrix_b);
-                                }
+                let combined_u16 = self.mode7_combine(value);
+                let combined_i16 = combined_u16 as i16;
+                match idx {
+                    0 => {
+                        self.mode7_matrix_a = combined_i16;
+                        self.update_mode7_mul_result();
+                    }
+                    1 => {
+                        self.mode7_matrix_b = combined_i16;
+                        // $2134-$2136 uses the last 8-bit value written to M7B.
+                        self.mode7_mul_b = value as i8;
+                        self.update_mode7_mul_result();
+                        if crate::debug_flags::trace_mode7_regs() && !crate::debug_flags::quiet() {
+                            static M7B_LOG: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            let n = M7B_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 4 {
+                                println!("PPU: Mode 7 matrix B set to {}", self.mode7_matrix_b);
                             }
                         }
-                        2 => {
-                            self.mode7_matrix_c = combined;
-                        }
-                        3 => {
-                            self.mode7_matrix_d = combined;
-                        }
-                        4 => {
-                            self.mode7_center_x = combined;
-                        }
-                        5 => {
-                            self.mode7_center_y = combined;
-                        }
-                        _ => {}
                     }
-                    self.m7_latch_second[idx] = false;
-                    if idx == 0 && !crate::debug_flags::quiet() {
-                        println!("PPU: Mode 7 matrix A set to {}", self.mode7_matrix_a);
+                    2 => {
+                        self.mode7_matrix_c = combined_i16;
                     }
+                    3 => {
+                        self.mode7_matrix_d = combined_i16;
+                    }
+                    4 => {
+                        self.mode7_center_x = Self::sign_extend13(combined_u16);
+                    }
+                    5 => {
+                        self.mode7_center_y = Self::sign_extend13(combined_u16);
+                    }
+                    _ => {}
+                }
+                if idx == 0
+                    && crate::debug_flags::trace_mode7_regs()
+                    && !crate::debug_flags::quiet()
+                {
+                    println!("PPU: Mode 7 matrix A set to {}", self.mode7_matrix_a);
                 }
             }
 
@@ -5615,7 +5668,7 @@ impl Ppu {
                 let b = self.mode7_matrix_b as i32;
                 a * b
             } else {
-                let b = (self.mode7_matrix_b as i8) as i32; // low byte, sign-extend 8bit
+                let b = self.mode7_mul_b as i32; // last 8-bit value written to M7B
                 a * b
             }
         };
@@ -6425,8 +6478,8 @@ impl Ppu {
         let sy = screen_y as i32 - 128;
 
         // 回転中心からの相対座標
-        let rel_x = sx - (self.mode7_center_x >> 8) as i32;
-        let rel_y = sy - (self.mode7_center_y >> 8) as i32;
+        let rel_x = sx - (self.mode7_center_x as i32);
+        let rel_y = sy - (self.mode7_center_y as i32);
 
         // 変換行列適用 (固定小数点演算)
         let a = self.mode7_matrix_a as i32;
@@ -6434,36 +6487,36 @@ impl Ppu {
         let c = self.mode7_matrix_c as i32;
         let d = self.mode7_matrix_d as i32;
 
-        let transformed_x = ((a * rel_x + b * rel_y) >> 8) + (self.mode7_center_x >> 8) as i32;
-        let transformed_y = ((c * rel_x + d * rel_y) >> 8) + (self.mode7_center_y >> 8) as i32;
+        let transformed_x = ((a * rel_x + b * rel_y) >> 8) + (self.mode7_center_x as i32);
+        let transformed_y = ((c * rel_x + d * rel_y) >> 8) + (self.mode7_center_y as i32);
 
         (transformed_x, transformed_y)
     }
 
-    // 8.8 fixed math producing integer world pixels (includes proper center/origin compensation)
+    // Mode 7 affine transform producing integer world pixels.
     fn mode7_world_xy_int(&self, sx: i32, sy: i32) -> (i32, i32) {
-        // Promote to i64 to avoid overflow in worst-case affine products
+        // Promote to i64 to avoid overflow in affine products.
+        //
+        // SNESdev / Super Famicom Wiki:
+        //   [X]   [A B] [SX + M7HOFS - CX] + [CX]
+        //   [Y] = [C D] [SY + M7VOFS - CY] + [CY]
+        //
+        // A..D are signed 8.8 fixed; SX/SY, HOFS/VOFS, CX/CY are signed integers.
         let a = self.mode7_matrix_a as i64;
         let b = self.mode7_matrix_b as i64;
         let c = self.mode7_matrix_c as i64;
         let d = self.mode7_matrix_d as i64;
-        let cx = self.mode7_center_x as i64; // 8.8
-        let cy = self.mode7_center_y as i64; // 8.8
-        let xs = (sx as i64) << 8; // 8.8
-        let ys = (sy as i64) << 8; // 8.8
+        let cx = self.mode7_center_x as i64;
+        let cy = self.mode7_center_y as i64;
+        let hofs = self.mode7_hofs as i64;
+        let vofs = self.mode7_vofs as i64;
 
-        // Proper SNES Mode 7 compensation:
-        // Xw = A*(Xs - Cx) + B*(Ys - Cy) + H*256 + A*Cx + B*Cy
-        // Yw = C*(Xs - Cx) + D*(Ys - Cy) + V*256 + C*Cx + D*Cy
-        let hx = (self.bg1_hscroll as i64) << 8;
-        let vy = (self.bg1_vscroll as i64) << 8;
+        let dx = (sx as i64) + hofs - cx;
+        let dy = (sy as i64) + vofs - cy;
 
-        let dx = xs - cx;
-        let dy = ys - cy;
-        // First multiply still 8.8; sum of terms stays 16.8 then >>8 to integer pixels
-        let xw = a * dx + b * dy + hx + a * cx + b * cy;
-        let yw = c * dx + d * dy + vy + c * cx + d * cy;
-        (Self::fixed8_floor(xw), Self::fixed8_floor(yw))
+        let x = ((a * dx + b * dy) >> 8) + cx;
+        let y = ((c * dx + d * dy) >> 8) + cy;
+        (x as i32, y as i32)
     }
 
     // メインスクリーン描画（レイヤID付き）
