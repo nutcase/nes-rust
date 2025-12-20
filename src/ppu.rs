@@ -4092,16 +4092,16 @@ impl Ppu {
     // ウィンドウマスク関連関数
     fn is_inside_window1(&self, x: u16) -> bool {
         let x = x as u8;
-        self.window1_left <= self.window1_right && x >= self.window1_left && x <= self.window1_right
-            || self.window1_left > self.window1_right
-                && (x >= self.window1_left || x <= self.window1_right)
+        // SNES window effect is defined only for left <= x <= right.
+        // If left > right, the window effect is nowhere (all 0 output).
+        // See: https://snes.nesdev.org/wiki/Windows
+        x >= self.window1_left && x <= self.window1_right
     }
 
     fn is_inside_window2(&self, x: u16) -> bool {
         let x = x as u8;
-        self.window2_left <= self.window2_right && x >= self.window2_left && x <= self.window2_right
-            || self.window2_left > self.window2_right
-                && (x >= self.window2_left || x <= self.window2_right)
+        // Same rule as window 1 (no wrap-around behavior).
+        x >= self.window2_left && x <= self.window2_right
     }
 
     fn evaluate_window_mask(&self, x: u16, mask_setting: u8, logic: u8) -> bool {
