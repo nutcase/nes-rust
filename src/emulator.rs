@@ -2163,6 +2163,22 @@ impl Emulator {
             }
         }
 
+        // PERF_VERBOSE=1 enables expensive per-instruction timing/profiling.
+        // Default is off to keep headless regression tests fast.
+        let perf_verbose = std::env::var("PERF_VERBOSE")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        // CPU_BATCH is opt-in; reading env per instruction is expensive, so cache per frame.
+        let batch_exec = std::env::var("CPU_BATCH")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        // Instruction trace is extremely expensive; keep it opt-in.
+        let trace_exec = std::env::var("TRACE_EXEC")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        let trace_loop_cycles = std::env::var_os("TRACE_LOOP_CYCLES").is_some();
+        let trace_pc_ffff_once = std::env::var_os("TRACE_PC_FFFF_ONCE").is_some();
+
         while self.master_cycles - start_cycles < cycles_per_frame {
             loop_iterations += 1;
             if loop_iterations > max_iterations {
@@ -2420,22 +2436,35 @@ impl Emulator {
                 batch_cycles = 1;
             }
 
-            // 現在の命令をデバッガに記録
-            let opcode = self.bus.read_u8(pc);
-            let operands = self.fetch_operands(pc, opcode);
-            self.debugger
-                .record_trace(&self.cpu, &self.bus, opcode, &operands);
+            // Optional: record instruction trace (debugger/TRACE_EXEC=1)
+            let record_trace = trace_exec || self.debugger.is_paused();
+            let need_opcode = record_trace || trace_loop_cycles || trace_pc_ffff_once;
+            let opcode = if need_opcode { self.bus.read_u8(pc) } else { 0 };
+            if record_trace {
+                let operands = self.fetch_operands(pc, opcode);
+                self.debugger
+                    .record_trace(&self.cpu, &self.bus, opcode, &operands);
+            }
 
-            // Measure CPU execution time
-            let cpu_start = Instant::now();
             let before_pc = pc;
             // Batch execution is a performance optimization but it breaks timing-sensitive
             // software (e.g., official burn-in HV latch tests) because PPU/APU are stepped only
             // once per batch. Keep it opt-in.
-            let batch_exec = std::env::var("CPU_BATCH")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false);
-            let cpu_cycles = if batch_exec
+            let cpu_cycles = if perf_verbose {
+                let cpu_start = Instant::now();
+                let cycles = if batch_exec
+                    && batch_cycles > 8
+                    && self.adaptive_timing
+                    && !self.debugger.is_paused()
+                {
+                    self.cpu.step_multiple(&mut self.bus, batch_cycles)
+                } else {
+                    self.cpu.step(&mut self.bus)
+                };
+                let cpu_time = cpu_start.elapsed();
+                self.performance_stats.add_cpu_time(cpu_time);
+                cycles
+            } else if batch_exec
                 && batch_cycles > 8
                 && self.adaptive_timing
                 && !self.debugger.is_paused()
@@ -2444,7 +2473,7 @@ impl Emulator {
             } else {
                 self.cpu.step(&mut self.bus)
             };
-            if std::env::var_os("TRACE_LOOP_CYCLES").is_some() && loop_iterations < 20 {
+            if trace_loop_cycles && loop_iterations < 20 {
                 println!(
                     "[loop] iter={} cpu_cycles={} master_cycles={} pc={:02X}:{:04X}",
                     loop_iterations + 1,
@@ -2455,7 +2484,7 @@ impl Emulator {
                 );
             }
             let after_pc = self.cpu.get_pc();
-            if std::env::var_os("TRACE_PC_FFFF_ONCE").is_some()
+            if trace_pc_ffff_once
                 && before_pc != 0x00FF_FF
                 && after_pc == 0x00FF_FF
             {
@@ -2479,25 +2508,27 @@ impl Emulator {
                     );
                     LAST_GOOD_PC = before_pc;
                 }
-            } else if std::env::var_os("TRACE_PC_FFFF_ONCE").is_some() {
+            } else if trace_pc_ffff_once {
                 static mut LAST_GOOD_PC: u32 = 0;
                 unsafe {
                     LAST_GOOD_PC = before_pc;
                 }
             }
-            let cpu_time = cpu_start.elapsed();
-            self.performance_stats.add_cpu_time(cpu_time);
 
-            // Measure SA-1 execution time
-            let sa1_start = Instant::now();
-            self.bus.run_sa1_scheduler(cpu_cycles);
-            // Process any pending SA-1 DMA/CC-DMA transfers after SA-1 execution
-            self.bus.process_sa1_dma();
-            let sa1_time = sa1_start.elapsed();
-            self.performance_stats.add_sa1_time(sa1_time);
+            if perf_verbose {
+                // Measure SA-1 execution time
+                let sa1_start = Instant::now();
+                self.bus.run_sa1_scheduler(cpu_cycles);
+                // Process any pending SA-1 DMA/CC-DMA transfers after SA-1 execution
+                self.bus.process_sa1_dma();
+                let sa1_time = sa1_start.elapsed();
+                self.performance_stats.add_sa1_time(sa1_time);
+            } else {
+                self.bus.run_sa1_scheduler(cpu_cycles);
+                // Process any pending SA-1 DMA/CC-DMA transfers after SA-1 execution
+                self.bus.process_sa1_dma();
+            }
 
-            // Measure PPU rendering time
-            let ppu_start = Instant::now();
             // CPU:PPU=6:4 の比率で進める。端数は ppu_cycle_accum に保持してロスを防ぐ。
             let ppu_cycles_f =
                 cpu_cycles as f64 * CPU_CLOCK_DIVIDER / PPU_CLOCK_DIVIDER + self.ppu_cycle_accum;
@@ -2507,9 +2538,15 @@ impl Emulator {
             if ppu_cycles == 0 {
                 ppu_cycles = 1;
             }
-            self.step_ppu(ppu_cycles);
-            let ppu_time = ppu_start.elapsed();
-            self.performance_stats.add_ppu_time(ppu_time);
+            if perf_verbose {
+                // Measure PPU rendering time
+                let ppu_start = Instant::now();
+                self.step_ppu(ppu_cycles);
+                let ppu_time = ppu_start.elapsed();
+                self.performance_stats.add_ppu_time(ppu_time);
+            } else {
+                self.step_ppu(ppu_cycles);
+            }
 
             // APU も更新
             let apu_cycles = cpu_cycles; // APUはCPUと同じクロック
