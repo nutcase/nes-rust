@@ -133,6 +133,9 @@ pub struct Ppu {
 
     framebuffer: Vec<u32>,
     subscreen_buffer: Vec<u32>, // サブスクリーン用バッファ
+    // Headless高速化用: PPUのピクセル合成（フレームバッファ書き込み）を無効化できる。
+    // 画面出力が不要なフレームをスキップし、最終フレームだけ描画する用途を想定。
+    framebuffer_rendering_enabled: bool,
 
     // SETINI ($2133)
     setini: u8,
@@ -513,6 +516,7 @@ impl Ppu {
 
             framebuffer: vec![0; 256 * 224],
             subscreen_buffer: vec![0; 256 * 224],
+            framebuffer_rendering_enabled: true,
 
             setini: 0,
             pseudo_hires: false,
@@ -635,6 +639,7 @@ impl Ppu {
         let dots_per_line = self.dots_per_line();
         let first_hblank = self.first_hblank_dot();
         let first_visible = self.first_visible_dot();
+        let render_enabled = self.framebuffer_rendering_enabled;
         for _ in 0..cycles {
             // Advance any deferred control effects before processing this dot
             self.tick_deferred_ctrl_effects();
@@ -679,7 +684,9 @@ impl Ppu {
                 let fb_y = (y - 1) as usize;
                 if fb_y < 224 {
                     self.update_obj_time_over_at_x(fb_x as u16);
-                    self.render_dot(fb_x, fb_y);
+                    if render_enabled {
+                        self.render_dot(fb_x, fb_y);
+                    }
                 }
             }
 
@@ -780,6 +787,15 @@ impl Ppu {
         self.wio_latch_enable = enabled;
     }
 
+    pub fn set_framebuffer_rendering_enabled(&mut self, enabled: bool) {
+        self.framebuffer_rendering_enabled = enabled;
+    }
+
+    #[allow(dead_code)]
+    pub fn framebuffer_rendering_enabled(&self) -> bool {
+        self.framebuffer_rendering_enabled
+    }
+
     // Render one pixel at the current (x,y)
     fn render_dot(&mut self, x: usize, y: usize) {
         // Debug at start of each scanline - only when not forced blank
@@ -851,13 +867,29 @@ impl Ppu {
             self.render_sub_screen_pixel_with_layer(x as u16, y as u16);
         let hires_out = self.pseudo_hires || matches!(self.bg_mode, 5 | 6);
         let final_color = if hires_out {
-            let even_mix =
-                self.apply_color_math_screens(main_color, sub_color, main_layer_id, x as u16, sub_transparent);
-            let odd_mix =
-                self.apply_color_math_screens(sub_color, main_color, sub_layer_id, x as u16, main_transparent);
+            let even_mix = self.apply_color_math_screens(
+                main_color,
+                sub_color,
+                main_layer_id,
+                x as u16,
+                sub_transparent,
+            );
+            let odd_mix = self.apply_color_math_screens(
+                sub_color,
+                main_color,
+                sub_layer_id,
+                x as u16,
+                main_transparent,
+            );
             Self::average_rgb(even_mix, odd_mix)
         } else {
-            self.apply_color_math_screens(main_color, sub_color, main_layer_id, x as u16, sub_transparent)
+            self.apply_color_math_screens(
+                main_color,
+                sub_color,
+                main_layer_id,
+                x as u16,
+                sub_transparent,
+            )
         };
 
         let pixel_offset = y * 256 + x;
@@ -6799,8 +6831,8 @@ impl Ppu {
 
         // Subsource is only used for color math; transparent main becomes backdrop earlier
         let use_sub_src = (self.cgwsel & 0x02) != 0; // 1=subscreen, 0=fixed
-        // NOTE: If the subscreen pixel is transparent, real hardware uses fixed color ($2132)
-        // as the addend, *and* disables half color math for that pixel.
+                                                     // NOTE: If the subscreen pixel is transparent, real hardware uses fixed color ($2132)
+                                                     // as the addend, *and* disables half color math for that pixel.
         let sub_is_fixed_fallback = use_sub_src && sub_transparent;
         let sub_src = if use_sub_src {
             if sub_is_fixed_fallback {

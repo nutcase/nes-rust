@@ -140,8 +140,8 @@ const SCREEN_HEIGHT: usize = 224;
 const MASTER_CLOCK_NTSC: f64 = 21_477_272.0;
 // 実機は CPU:PPU=6:4（=3:2）。
 // ここでは「master clock からの分周」を使って CPUサイクル→PPUドット数へ変換する。
-const CPU_CLOCK_DIVIDER: f64 = 6.0;
-const PPU_CLOCK_DIVIDER: f64 = 4.0;
+const CPU_CLOCK_DIVIDER: u64 = 6;
+const PPU_CLOCK_DIVIDER: u64 = 4;
 
 pub struct Emulator {
     cpu: Cpu,
@@ -151,8 +151,8 @@ pub struct Emulator {
     master_cycles: u64,
     // Pending "stall" time in master cycles (e.g., MDMA); CPU is halted while PPU/APU advance.
     pending_stall_master_cycles: u64,
-    // PPU クロックの端数を蓄積して CPU:PPU=6:4 の比率を正確に保つ
-    ppu_cycle_accum: f64,
+    // CPU->PPU 変換時の端数（master cycles を PPU_CLOCK_DIVIDER で割った余り; 0..PPU_CLOCK_DIVIDER-1）
+    ppu_cycle_accum: u8,
     last_frame_time: Instant,
     target_frame_duration: Duration,
     rom_checksum: u32,
@@ -558,7 +558,7 @@ impl Emulator {
             frame_buffer,
             master_cycles: 0,
             pending_stall_master_cycles: 0,
-            ppu_cycle_accum: 0.0,
+            ppu_cycle_accum: 0,
             last_frame_time: Instant::now(),
             target_frame_duration,
             rom_checksum,
@@ -609,6 +609,16 @@ impl Emulator {
         }
 
         let is_dq3 = self.is_dq3_title();
+        let headless_fast_render = std::env::var("HEADLESS_FAST_RENDER")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        let headless_fast_render_last: u64 = std::env::var("HEADLESS_FAST_RENDER_LAST")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1);
+        let headless_fast_render_from = self
+            .headless_max_frames
+            .saturating_sub(headless_fast_render_last.max(1));
 
         if self.headless {
             if !quiet {
@@ -619,6 +629,12 @@ impl Emulator {
             }
             while self.frame_count < self.headless_max_frames && !shutdown::should_quit() {
                 let frame_start = Instant::now();
+                if headless_fast_render {
+                    let enable = self.frame_count >= headless_fast_render_from;
+                    self.bus
+                        .get_ppu_mut()
+                        .set_framebuffer_rendering_enabled(enable);
+                }
                 // 先にヘッドレス自動入力を反映しておく（オートジョイパッドのラッチがVBlank頭で走るため）
                 self.inject_auto_input_headless();
                 if is_dq3 && self.frame_count == 0 {
@@ -640,8 +656,11 @@ impl Emulator {
                 if is_dq3 {
                     self.maybe_force_display_dq3();
                 }
-                // Headlessでもレンダーパイプを通し、フォールバック描画/テストパターンを反映させる
-                self.render();
+                // Headlessでもレンダーパイプを通し、フォールバック描画/テストパターンを反映させる。
+                // ただし HEADLESS_FAST_RENDER=1 の場合は、最後の数フレームのみ描画して高速化する。
+                if !headless_fast_render || self.frame_count >= headless_fast_render_from {
+                    self.render();
+                }
                 // CPUテストROM: 終了状態（PASS/FAIL）に到達したら早期終了する
                 self.maybe_quit_on_cpu_test_result();
                 if shutdown::should_quit() {
@@ -1928,7 +1947,7 @@ impl Emulator {
         const SCANLINES_PER_FRAME_NTSC: u64 = 262;
         let cycles_per_frame = DOTS_PER_LINE_NTSC
             .saturating_mul(SCANLINES_PER_FRAME_NTSC)
-            .saturating_mul(PPU_CLOCK_DIVIDER as u64);
+            .saturating_mul(PPU_CLOCK_DIVIDER);
         let start_cycles = self.master_cycles;
 
         static mut FRAME_COUNT: u32 = 0;
@@ -2429,7 +2448,7 @@ impl Emulator {
             let mut batch_cycles = if self.debugger.is_paused() {
                 1 // デバッグモードでは1命令ずつ実行
             } else {
-                (remaining_cycles / (CPU_CLOCK_DIVIDER as u64)).min(32) as u8
+                (remaining_cycles / CPU_CLOCK_DIVIDER).min(32) as u8
             };
             // 端数で0になってしまうとフレーム末尾で永久ループに入るため、最低1サイクルは回す
             if batch_cycles == 0 {
@@ -2484,10 +2503,7 @@ impl Emulator {
                 );
             }
             let after_pc = self.cpu.get_pc();
-            if trace_pc_ffff_once
-                && before_pc != 0x00FF_FF
-                && after_pc == 0x00FF_FF
-            {
+            if trace_pc_ffff_once && before_pc != 0x00FF_FF && after_pc == 0x00FF_FF {
                 static mut LAST_GOOD_PC: u32 = 0;
                 unsafe {
                     println!(
@@ -2529,11 +2545,12 @@ impl Emulator {
                 self.bus.process_sa1_dma();
             }
 
-            // CPU:PPU=6:4 の比率で進める。端数は ppu_cycle_accum に保持してロスを防ぐ。
-            let ppu_cycles_f =
-                cpu_cycles as f64 * CPU_CLOCK_DIVIDER / PPU_CLOCK_DIVIDER + self.ppu_cycle_accum;
-            let mut ppu_cycles = ppu_cycles_f.floor() as u16;
-            self.ppu_cycle_accum = ppu_cycles_f - (ppu_cycles as f64);
+            // CPU:PPU=6:4 の比率で進める。端数は master cycles の余りとして保持してロスを防ぐ。
+            let master = (cpu_cycles as u64)
+                .saturating_mul(CPU_CLOCK_DIVIDER)
+                .saturating_add(self.ppu_cycle_accum as u64);
+            let mut ppu_cycles = (master / PPU_CLOCK_DIVIDER) as u16;
+            self.ppu_cycle_accum = (master % PPU_CLOCK_DIVIDER) as u8;
             // CPUがビジーループで止まっていても時間を進めるため、最低1サイクルは進める
             if ppu_cycles == 0 {
                 ppu_cycles = 1;
@@ -2563,7 +2580,7 @@ impl Emulator {
                 self.bus.clear_irq_pending();
             }
 
-            self.master_cycles += (cpu_cycles as u64) * (CPU_CLOCK_DIVIDER as u64);
+            self.master_cycles += (cpu_cycles as u64) * CPU_CLOCK_DIVIDER;
 
             // Drain any time consumed by DMA stalls that occurred during this instruction slice.
             // The CPU should remain halted for that duration, but PPU/APU continue to advance.
@@ -2587,7 +2604,7 @@ impl Emulator {
 
         // Step SA-1 scheduler (if present) during the stall.
         // Use S-CPU cycle equivalents as a rough proxy for elapsed time.
-        let mut sa1_cycles = master_cycles / (CPU_CLOCK_DIVIDER as u64);
+        let mut sa1_cycles = master_cycles / CPU_CLOCK_DIVIDER;
         while sa1_cycles > 0 {
             let chunk = sa1_cycles.min(u8::MAX as u64) as u8;
             self.bus.run_sa1_scheduler(chunk);
@@ -2596,7 +2613,7 @@ impl Emulator {
         }
 
         // Step PPU: PPU clock is master/4.
-        let mut ppu_cycles = master_cycles / (PPU_CLOCK_DIVIDER as u64);
+        let mut ppu_cycles = master_cycles / PPU_CLOCK_DIVIDER;
         while ppu_cycles > 0 {
             let chunk = ppu_cycles.min(u16::MAX as u64) as u16;
             self.step_ppu(chunk);
@@ -3072,10 +3089,12 @@ impl Emulator {
                     }
                 }
 
-                for (i, &px) in ppu_framebuffer.iter().enumerate() {
-                    if i < self.frame_buffer.len() {
-                        self.frame_buffer[i] = px;
-                    }
+                let len = self.frame_buffer.len().min(ppu_framebuffer.len());
+                if len > 0 {
+                    self.frame_buffer[..len].copy_from_slice(&ppu_framebuffer[..len]);
+                }
+                if len < self.frame_buffer.len() {
+                    self.frame_buffer[len..].fill(0xFF000000);
                 }
 
                 // Debug: override final framebuffer at the very end to verify render path
