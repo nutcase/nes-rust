@@ -715,9 +715,6 @@ impl Emulator {
                 self.performance_stats.update(frame_time);
                 self.frame_count += 1;
 
-                // Auto-inject button input (for testing)
-                self.maybe_inject_auto_input();
-
                 // Periodic SRAM autosave (optional)
                 self.maybe_autosave_sram();
                 if self.frame_count == 60
@@ -1784,151 +1781,6 @@ impl Emulator {
         }
     }
 
-    /// Auto-inject button input for testing (AUTO_INPUT=1 + AUTO_INPUT_* env vars)
-    fn maybe_inject_auto_input(&mut self) {
-        if !crate::debug_flags::auto_input() {
-            return;
-        }
-        let frame = self.frame_count;
-
-        fn parse_buttons(spec: &str) -> u16 {
-            spec.split(|c| c == ',' || c == '+' || c == '|')
-                .filter_map(|name| match name.trim().to_uppercase().as_str() {
-                    "A" => Some(crate::input::button::A),
-                    "B" => Some(crate::input::button::B),
-                    "X" => Some(crate::input::button::X),
-                    "Y" => Some(crate::input::button::Y),
-                    "L" => Some(crate::input::button::L),
-                    "R" => Some(crate::input::button::R),
-                    "START" => Some(crate::input::button::START),
-                    "SELECT" => Some(crate::input::button::SELECT),
-                    "UP" => Some(crate::input::button::UP),
-                    "DOWN" => Some(crate::input::button::DOWN),
-                    "LEFT" => Some(crate::input::button::LEFT),
-                    "RIGHT" => Some(crate::input::button::RIGHT),
-                    _ => None,
-                })
-                .fold(0u16, |acc, v| acc | v)
-        }
-
-        fn parse_range(spec: &str) -> Option<(u64, u64)> {
-            let s = spec.trim();
-            if s.is_empty() {
-                return None;
-            }
-            if let Some((a, b)) = s.split_once('-') {
-                let start = a.trim().parse::<u64>().ok()?;
-                let end = b.trim().parse::<u64>().ok()?;
-                Some((start, end))
-            } else {
-                let t = s.parse::<u64>().ok()?;
-                Some((t, t))
-            }
-        }
-
-        // New format: AUTO_INPUT_EVENTS="20-22:SELECT;40-42:SELECT;100-110:START"
-        // - Entries are separated by ';'
-        // - Buttons can be separated by ',', '+', or '|'
-        let mut inject_mask: u16 = 0;
-        let mut injected = false;
-        if let Ok(events) = std::env::var("AUTO_INPUT_EVENTS") {
-            for ent in events.split(';') {
-                let ent = ent.trim();
-                if ent.is_empty() {
-                    continue;
-                }
-                let (range_s, buttons_s) = ent
-                    .split_once(':')
-                    .map(|(r, b)| (r.trim(), b.trim()))
-                    .unwrap_or((ent, "START"));
-                let (start, end) = match parse_range(range_s) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                if frame >= start && frame <= end {
-                    inject_mask |= parse_buttons(buttons_s);
-                    injected = true;
-                }
-            }
-        } else {
-            // Legacy format: AUTO_INPUT_FRAMES="200-210,300-305" + AUTO_INPUT_BUTTONS="START"
-            let auto_input = match std::env::var("AUTO_INPUT_FRAMES").ok() {
-                Some(v) => v,
-                None => return,
-            };
-
-            let button_mask = std::env::var("AUTO_INPUT_BUTTONS")
-                .ok()
-                .map(|s| parse_buttons(&s))
-                .filter(|m| *m != 0)
-                .unwrap_or(crate::input::button::START);
-
-            injected = auto_input.split(',').any(|range| {
-                if let Some((start, end)) = range.split_once('-') {
-                    if let (Ok(s), Ok(e)) = (start.trim().parse::<u64>(), end.trim().parse::<u64>())
-                    {
-                        return frame >= s && frame <= e;
-                    }
-                }
-                false
-            });
-            if injected {
-                inject_mask = button_mask;
-            }
-        }
-
-        if injected && inject_mask != 0 {
-            // Inject button press.
-            let input_port = std::env::var("INPUT_PORT")
-                .ok()
-                .and_then(|v| v.parse::<u8>().ok())
-                .unwrap_or(1);
-            match input_port {
-                2 => self
-                    .bus
-                    .get_input_system_mut()
-                    .controller2
-                    .set_buttons(inject_mask),
-                _ => self
-                    .bus
-                    .get_input_system_mut()
-                    .controller1
-                    .set_buttons(inject_mask),
-            }
-            // Optional: mirror P1 injection to P2 as well (useful for manual test ROMs)
-            if std::env::var_os("INPUT_MIRROR_P1_TO_P2").is_some() {
-                self.bus
-                    .get_input_system_mut()
-                    .controller2
-                    .set_buttons(inject_mask);
-            }
-
-            static mut INJECT_LOG_COUNT: u32 = 0;
-            unsafe {
-                INJECT_LOG_COUNT += 1;
-                if INJECT_LOG_COUNT <= 5 && !crate::debug_flags::quiet() {
-                    println!(
-                        "🎮 Auto-input: Injecting buttons=0x{:04X} at frame {}",
-                        inject_mask, frame
-                    );
-                }
-            }
-        } else {
-            // Clear buttons when not in injection range
-            let input_port = std::env::var("INPUT_PORT")
-                .ok()
-                .and_then(|v| v.parse::<u8>().ok())
-                .unwrap_or(1);
-            match input_port {
-                2 => self.bus.get_input_system_mut().controller2.set_buttons(0),
-                _ => self.bus.get_input_system_mut().controller1.set_buttons(0),
-            }
-            if std::env::var_os("INPUT_MIRROR_P1_TO_P2").is_some() {
-                self.bus.get_input_system_mut().controller2.set_buttons(0);
-            }
-        }
-    }
-
     fn run_frame(&mut self) {
         // Run exactly one NTSC PPU frame worth of master cycles:
         // 341 dots/line * 262 lines/frame * 4 master cycles/dot.
@@ -2923,6 +2775,10 @@ impl Emulator {
                 self.bus.tick_timers();
                 // JOYBUSYの更新
                 self.bus.on_scanline_advance();
+                // Frame start (scanline counter wrapped to 0)
+                if new_scanline < old_scanline {
+                    self.bus.on_frame_start();
+                }
                 // VBlank突入検知
                 let vblank_start = self.bus.get_ppu().get_visible_height().saturating_add(1);
                 if old_scanline < vblank_start && new_scanline >= vblank_start {

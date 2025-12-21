@@ -110,6 +110,7 @@ pub struct Bus {
     hdma_bytes_vram: u32,
     hdma_bytes_cgram: u32,
     hdma_bytes_oam: u32,
+    hdma_bytes_window: u32,
     rdnmi_consumed: bool,
     rdnmi_high_byte_for_test: u8,
 
@@ -376,6 +377,7 @@ impl Bus {
             hdma_bytes_vram: 0,
             hdma_bytes_cgram: 0,
             hdma_bytes_oam: 0,
+            hdma_bytes_window: 0,
             rdnmi_consumed: false,
             rdnmi_high_byte_for_test: 0,
             pending_stall_master_cycles: 0,
@@ -575,6 +577,7 @@ impl Bus {
             hdma_bytes_vram: 0,
             hdma_bytes_cgram: 0,
             hdma_bytes_oam: 0,
+            hdma_bytes_window: 0,
             rdnmi_consumed: false,
             rdnmi_high_byte_for_test: 0,
             pending_stall_master_cycles: 0,
@@ -4713,6 +4716,36 @@ impl Bus {
         }
     }
 
+    // Called when the PPU scanline counter wraps to 0 (start of a new frame).
+    //
+    // Hardware behavior: HDMA channels are re-initialized every frame. The table start
+    // address (A1T/A1B) is copied into the current table address (A2A), and per-channel
+    // processing resumes even if the channel terminated earlier due to a $00 line-count.
+    pub fn on_frame_start(&mut self) {
+        let mask = self.dma_controller.hdma_enable;
+        for i in 0..8usize {
+            if (mask & (1 << i)) == 0 {
+                continue;
+            }
+            let ch = &mut self.dma_controller.channels[i];
+            // If a channel wasn't configured, leave it alone (prevents wandering reads).
+            if !ch.configured {
+                continue;
+            }
+            ch.hdma_enabled = true;
+            ch.hdma_terminated = false;
+            ch.hdma_line_counter = 0;
+            ch.hdma_repeat_flag = false;
+            ch.hdma_do_transfer = false;
+            ch.hdma_indirect = (ch.control & 0x40) != 0;
+            ch.hdma_indirect_addr = 0;
+            ch.hdma_table_addr = ch.src_address;
+            // Mirror into readable HDMA state registers.
+            ch.a2a = (ch.src_address & 0xFFFF) as u16;
+            ch.nltr = 0x80; // reload flag set; counter will be loaded from the table
+        }
+    }
+
     // Called once per scanline to update JOYBUSY timing
     pub fn on_scanline_advance(&mut self) {
         if self.joy_busy_counter > 0 {
@@ -4781,7 +4814,16 @@ impl Bus {
         }
 
         let repeat_flag = (line_info & 0x80) != 0;
-        let line_count = line_info & 0x7F;
+        // HDMA line-count semantics per SNESdev:
+        // - $00: terminate for the rest of the frame
+        // - $01..$80: non-repeat, wait N scanlines
+        // - $81..$FF: repeat, transfer every scanline for (N-$80) scanlines
+        //
+        // The low 7 bits encode the count, except $80 means 128 (not 0).
+        let mut line_count = line_info & 0x7F;
+        if line_count == 0 {
+            line_count = 128;
+        }
         let indirect = (control & 0x40) != 0; // bit6: indirect addressing
 
         // NOTE: HDMA tables live in the bank specified by A1Bn ($43x4) / src_address bank.
@@ -4846,6 +4888,22 @@ impl Bus {
             let dest_off = Self::hdma_dest_offset(unit, dest_base, i as u8);
             let dest_addr = 0x2100u32 + dest_off as u32;
             if dest_off <= 0x33 || (0x40..=0x43).contains(&dest_off) {
+                if (0x26..=0x29).contains(&dest_off) && crate::debug_flags::trace_hdma_window() {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static CNT: AtomicU32 = AtomicU32::new(0);
+                    let n = CNT.fetch_add(1, Ordering::Relaxed);
+                    if n < 2048 && !crate::debug_flags::quiet() {
+                        println!(
+                            "[HDMA-WIN] frame={} sl={} cyc={} ch{} dest=$21{:02X} val={:02X}",
+                            self.ppu.get_frame(),
+                            self.ppu.scanline,
+                            self.ppu.get_cycle(),
+                            channel,
+                            dest_off,
+                            *data
+                        );
+                    }
+                }
                 self.write_u8(dest_addr, *data);
                 // Aggregate per-port stats for concise logs
                 match dest_off {
@@ -4860,6 +4918,10 @@ impl Bus {
                     0x04 => {
                         // OAMDATA
                         self.hdma_bytes_oam = self.hdma_bytes_oam.saturating_add(1);
+                    }
+                    0x26..=0x29 => {
+                        // Window positions (WH0..WH3)
+                        self.hdma_bytes_window = self.hdma_bytes_window.saturating_add(1);
                     }
                     _ => {}
                 }
@@ -5733,16 +5795,18 @@ impl Bus {
         let vram = self.hdma_bytes_vram;
         let cgram = self.hdma_bytes_cgram;
         let oam = self.hdma_bytes_oam;
+        let win = self.hdma_bytes_window;
         self.hdma_lines_executed = 0;
         self.hdma_bytes_vram = 0;
         self.hdma_bytes_cgram = 0;
         self.hdma_bytes_oam = 0;
-        if lines == 0 && vram == 0 && cgram == 0 && oam == 0 {
+        self.hdma_bytes_window = 0;
+        if lines == 0 && vram == 0 && cgram == 0 && oam == 0 && win == 0 {
             "HDMA: none".to_string()
         } else {
             format!(
-                "HDMA: lines={} VRAM={} CGRAM={} OAM={}",
-                lines, vram, cgram, oam
+                "HDMA: lines={} VRAM={} CGRAM={} OAM={} WIN={}",
+                lines, vram, cgram, oam, win
             )
         }
     }

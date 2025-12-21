@@ -42,6 +42,43 @@ fn trace_scanline_state_config() -> Option<TraceScanlineStateConfig> {
     .clone()
 }
 
+#[derive(Clone, Copy)]
+struct TraceSampleDotConfig {
+    frame: u64,
+    x: u16,
+    y: u16,
+}
+
+fn trace_sample_dot_config() -> Option<TraceSampleDotConfig> {
+    static CFG: OnceLock<Option<TraceSampleDotConfig>> = OnceLock::new();
+    CFG.get_or_init(|| {
+        if std::env::var_os("TRACE_SAMPLE_DOT").is_none() {
+            return None;
+        }
+
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(default)
+        }
+
+        fn env_u16(key: &str, default: u16) -> u16 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(default)
+        }
+
+        Some(TraceSampleDotConfig {
+            frame: env_u64("TRACE_SAMPLE_DOT_FRAME", 0),
+            x: env_u16("TRACE_SAMPLE_DOT_X", 0),
+            y: env_u16("TRACE_SAMPLE_DOT_Y", 0),
+        })
+    })
+    .clone()
+}
+
 pub struct Ppu {
     vram: Vec<u8>,
     cgram: Vec<u8>,
@@ -906,8 +943,15 @@ impl Ppu {
                 {
                     let forced_blank = (self.screen_display & 0x80) != 0;
                     let effective_tm = self.effective_main_screen_designation();
+                    let w12sel =
+                        ((self.window_bg_mask[1] & 0x0F) << 4) | (self.window_bg_mask[0] & 0x0F);
+                    let w34sel =
+                        ((self.window_bg_mask[3] & 0x0F) << 4) | (self.window_bg_mask[2] & 0x0F);
+                    let wobjsel =
+                        ((self.window_color_mask & 0x0F) << 4) | (self.window_obj_mask & 0x0F);
+                    let wobjlog = ((self.color_window_logic & 0x03) << 2) | (self.obj_window_logic & 0x03);
                     println!(
-                        "[TRACE_SCANLINE_STATE] frame={} y={} INIDISP=0x{:02X} (blank={} bright={}) TM=0x{:02X} TS=0x{:02X} CGWSEL=0x{:02X} CGADSUB=0x{:02X}",
+                        "[TRACE_SCANLINE_STATE] frame={} y={} INIDISP=0x{:02X} (blank={} bright={}) TM=0x{:02X} TS=0x{:02X} CGWSEL=0x{:02X} CGADSUB=0x{:02X} WH0={} WH1={} WH2={} WH3={} W12SEL=0x{:02X} W34SEL=0x{:02X} WOBJSEL=0x{:02X} WBGLOG=0x{:02X} WOBJLOG=0x{:02X} TMW=0x{:02X} TSW=0x{:02X}",
                         self.frame,
                         y,
                         self.screen_display,
@@ -916,7 +960,21 @@ impl Ppu {
                         effective_tm,
                         self.sub_screen_designation,
                         self.cgwsel,
-                        self.cgadsub
+                        self.cgadsub,
+                        self.window1_left,
+                        self.window1_right,
+                        self.window2_left,
+                        self.window2_right,
+                        w12sel,
+                        w34sel,
+                        wobjsel,
+                        (self.bg_window_logic[0] & 0x03)
+                            | ((self.bg_window_logic[1] & 0x03) << 2)
+                            | ((self.bg_window_logic[2] & 0x03) << 4)
+                            | ((self.bg_window_logic[3] & 0x03) << 6),
+                        wobjlog,
+                        self.tmw_mask,
+                        self.tsw_mask
                     );
                 }
             }
@@ -989,6 +1047,56 @@ impl Ppu {
         }
         let (sub_color, sub_layer_id, sub_transparent) =
             self.render_sub_screen_pixel_with_layer(x as u16, y as u16);
+
+        if let Some(cfg) = trace_sample_dot_config() {
+            if self.frame == cfg.frame && (x as u16) == cfg.x && (y as u16) == cfg.y {
+                let x_u = x as u16;
+                let y_u = y as u16;
+                let bg1_eval = self.evaluate_window_mask(
+                    x_u,
+                    self.window_bg_mask[0],
+                    self.bg_window_logic[0],
+                );
+                let bg2_eval = self.evaluate_window_mask(
+                    x_u,
+                    self.window_bg_mask[1],
+                    self.bg_window_logic[1],
+                );
+                let bg1_mask = self.should_mask_bg(x_u, 0, true);
+                let bg2_mask = self.should_mask_bg(x_u, 1, true);
+                let (bg1_color, bg1_pr) = self.render_bg_mode2_with_priority(x_u, y_u, 0);
+                let (bg2_color, bg2_pr) = self.render_bg_mode2_with_priority(x_u, y_u, 1);
+                println!(
+                    "[TRACE_SAMPLE_DOT] frame={} x={} y={} TM=0x{:02X} TMW=0x{:02X} WH0={} WH1={} WH2={} WH3={} W12SEL=0x{:02X} WBGLOG=0x{:02X} w1_in={} w2_in={} bg1_eval={} bg2_eval={} bg1_mask={} bg2_mask={} bg1=(0x{:08X},pr={}) bg2=(0x{:08X},pr={}) main=(0x{:08X},lid={}) sub=(0x{:08X},lid={},t={})",
+                    self.frame,
+                    x_u,
+                    y_u,
+                    self.effective_main_screen_designation(),
+                    self.tmw_mask,
+                    self.window1_left,
+                    self.window1_right,
+                    self.window2_left,
+                    self.window2_right,
+                    ((self.window_bg_mask[1] & 0x0F) << 4) | (self.window_bg_mask[0] & 0x0F),
+                    (self.bg_window_logic[0] & 0x03) | ((self.bg_window_logic[1] & 0x03) << 2),
+                    self.is_inside_window1(x_u) as u8,
+                    self.is_inside_window2(x_u) as u8,
+                    bg1_eval as u8,
+                    bg2_eval as u8,
+                    bg1_mask as u8,
+                    bg2_mask as u8,
+                    bg1_color,
+                    bg1_pr,
+                    bg2_color,
+                    bg2_pr,
+                    main_color,
+                    main_layer_id,
+                    sub_color,
+                    sub_layer_id,
+                    sub_transparent as u8
+                );
+            }
+        }
         let hires_out = self.pseudo_hires || matches!(self.bg_mode, 5 | 6);
         let final_color = if hires_out {
             let even_mix = self.apply_color_math_screens(
@@ -3484,15 +3592,11 @@ impl Ppu {
             return (0, 0);
         }
 
-        // Determine which tile column on screen we're sampling. OPT never affects column 0.
-        let base_hscroll = if bg_num == 0 {
-            self.bg1_hscroll
-        } else {
-            self.bg2_hscroll
-        };
-        let fine = base_hscroll & 0x0007;
         let (mosaic_x, mosaic_y) = self.apply_mosaic(x, y, bg_num);
-        let col = ((mosaic_x + fine) / 8) as usize;
+        // OPT applies to screen tile columns 1..32; the leftmost 8 pixels are never affected.
+        // The offset map itself is read from BG3 using BG3HOFS/BG3VOFS, so the screen-column
+        // selection must not depend on BG1/BG2 fine scroll.
+        let col = (mosaic_x / 8) as usize;
         let col = col.min(32);
 
         let scroll_x = self.mode2_opt_hscroll_lut[bg_num as usize][col];
@@ -4231,7 +4335,7 @@ impl Ppu {
     }
 
     fn evaluate_window_mask(&self, x: u16, mask_setting: u8, logic: u8) -> bool {
-        // マスク設定のビット構成:
+        // マスク設定のビット構成 (W12SEL/W34SEL/WOBJSEL の各4bit):
         // Bit 0: Window 1 Inverted
         // Bit 1: Window 1 Enabled
         // Bit 2: Window 2 Inverted
@@ -6163,7 +6267,7 @@ impl Ppu {
         for x in 0..256u16 {
             // Color window
             let wcol = if self.window_color_mask == 0 {
-                true
+                false
             } else {
                 self.evaluate_window_mask(x, self.window_color_mask, self.color_window_logic)
             };
@@ -7016,56 +7120,53 @@ impl Ppu {
             return 0;
         }
 
-        // Determine color window W(x) for color math/force black gating
+        // Color window W(x): 1=inside, 0=outside.
+        // If the color window is disabled by WOBJSEL, everything is "outside".
         let win = if self.line_window_prepared {
             self.color_window_lut.get(x as usize).copied().unwrap_or(0) != 0
         } else if self.window_color_mask == 0 {
-            true
+            false
         } else {
             self.evaluate_window_mask(x, self.window_color_mask, self.color_window_logic)
         };
-        let math_mode = (self.cgwsel >> 4) & 0x03; // CGWSEL bits 5-4
-        let black_mode = (self.cgwsel >> 6) & 0x03; // CGWSEL bits 7-6
-                                                    // Map per SNES: math_mode 0=always,1=inside,2=outside,3=never
-        let gate_math = |mode: u8, w: bool| -> bool {
-            match mode {
-                0 => true,
-                1 => w,
-                2 => !w,
-                _ => false,
-            }
-        };
-        // Black clip: 0=never,1=inside,2=outside,3=always
-        let gate_black = |mode: u8, w: bool| -> bool {
+
+        // CGWSEL region types (MM / SS): 0=nowhere, 1=outside, 2=inside, 3=everywhere.
+        let mm = (self.cgwsel >> 6) & 0x03; // main screen black region
+        let ss = (self.cgwsel >> 4) & 0x03; // sub screen transparent region
+        let region_hit = |mode: u8, inside: bool| -> bool {
             match mode {
                 0 => false,
-                1 => w,
-                2 => !w,
-                _ => true,
+                1 => !inside, // outside
+                2 => inside,  // inside
+                _ => true,    // everywhere
             }
         };
 
-        // Force black clip is a hard override: return black and skip math entirely
-        // But FORCE_DISPLAY debug flag should bypass this (like it bypasses forced blank)
-        if gate_black(black_mode, win) && !self.force_display_active() {
+        // Apply main-screen black region *before* color math, but do not suppress color math.
+        // (Real hardware still performs color math even when the main screen is replaced with black.)
+        let mut main_color = main_color_in;
+        if region_hit(mm, win) && !self.force_display_active() {
             if crate::debug_flags::render_metrics() {
-                if (self.cgwsel >> 6) & 0x03 == 1 {
-                    self.dbg_clip_inside = self.dbg_clip_inside.saturating_add(1);
-                } else if (self.cgwsel >> 6) & 0x03 == 2 {
+                if mm == 1 {
                     self.dbg_clip_outside = self.dbg_clip_outside.saturating_add(1);
-                }
-                if main_layer_id == 4 {
-                    if (self.cgwsel >> 6) & 0x03 == 1 {
-                        self.dbg_clip_obj_inside = self.dbg_clip_obj_inside.saturating_add(1);
-                    } else if (self.cgwsel >> 6) & 0x03 == 2 {
+                    if main_layer_id == 4 {
                         self.dbg_clip_obj_outside = self.dbg_clip_obj_outside.saturating_add(1);
+                    }
+                } else if mm == 2 {
+                    self.dbg_clip_inside = self.dbg_clip_inside.saturating_add(1);
+                    if main_layer_id == 4 {
+                        self.dbg_clip_obj_inside = self.dbg_clip_obj_inside.saturating_add(1);
                     }
                 }
             }
-            return 0;
+            main_color = 0xFF000000;
         }
 
-        let main_color = main_color_in;
+        // Mask color math via the sub-screen transparent region.
+        // When active, output the (possibly black-clipped) main screen color unchanged.
+        if region_hit(ss, win) && !self.force_display_active() {
+            return main_color;
+        }
 
         // Subsource is only used for color math; transparent main becomes backdrop earlier
         let use_sub_src = (self.cgwsel & 0x02) != 0; // 1=subscreen, 0=fixed
@@ -7082,10 +7183,6 @@ impl Ppu {
             self.fixed_color_to_rgb()
         };
 
-        // Color math enable gating via window
-        if !gate_math(math_mode, win) {
-            return main_color;
-        }
         // このメインレイヤにカラー演算が許可されているか
         if !self.is_color_math_enabled(main_layer_id) {
             if crate::debug_flags::render_metrics() {
@@ -7374,6 +7471,25 @@ impl Ppu {
         println!(
             "Color Math: CGWSEL=0x{:02X} CGADSUB=0x{:02X} fixed=0x{:04X}",
             self.cgwsel, self.cgadsub, self.fixed_color
+        );
+        println!(
+            "Windows: W1=({}, {}) W2=({}, {}) W12SEL=0x{:02X} W34SEL=0x{:02X} WOBJSEL(obj=0x{:01X} col=0x{:01X}) WBGLOG=[{}, {}, {}, {}] WOBJLOG(obj={} col={}) TMW=0x{:02X} TSW=0x{:02X}",
+            self.window1_left,
+            self.window1_right,
+            self.window2_left,
+            self.window2_right,
+            ((self.window_bg_mask[1] & 0x0F) << 4) | (self.window_bg_mask[0] & 0x0F),
+            ((self.window_bg_mask[3] & 0x0F) << 4) | (self.window_bg_mask[2] & 0x0F),
+            (self.window_obj_mask & 0x0F),
+            (self.window_color_mask & 0x0F),
+            self.bg_window_logic[0],
+            self.bg_window_logic[1],
+            self.bg_window_logic[2],
+            self.bg_window_logic[3],
+            self.obj_window_logic,
+            self.color_window_logic,
+            self.tmw_mask,
+            self.tsw_mask
         );
         println!("Screen Display: 0x{:02X}", self.screen_display);
         println!("NMI: enabled={}, flag={}", self.nmi_enabled, self.nmi_flag);

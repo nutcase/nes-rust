@@ -207,7 +207,6 @@ Related helpers:
 Input options:
 - `MULTITAP=1` enables a simple multitap mode; JOY3/JOY4 registers are filled from additional controller slots. Keyboard mapping for 3P/4P is not defined yet (skeleton only).
 - `JOYBUSY_SCANLINES=<n>` adjusts how long the auto‑joypad `JOYBUSY` flag stays high after VBlank begins (default: 2 scanlines).
-- `AUTO_INPUT_FRAMES="<ranges>"` auto-injects button presses during headless runs for testing. Format: `"200-210,400-410"` (comma-separated frame ranges). Currently injects START button. Useful for testing game progression timing (e.g., palette transfer after menu navigation).
 
 Debug helpers (for development):
 - `D`: Print PPU state to console (and logs)
