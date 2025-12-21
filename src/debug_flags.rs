@@ -155,7 +155,7 @@ pub fn headless() -> bool {
     *ON.get_or_init(|| env_flag("HEADLESS", false))
 }
 
-// Enable scripted/forced input (AUTO_INPUT_EVENTS/AUTO_INPUT_FRAMES/AUTO_JOYPAD*_MASK).
+// Enable scripted/forced input (AUTO_INPUT_EVENTS/AUTO_INPUT_FRAMES).
 pub fn auto_input() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("AUTO_INPUT", false))

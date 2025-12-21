@@ -3,6 +3,45 @@
 const IMPORTANT_WRITE_LIMIT: u32 = 10; // How many important writes to print
 use std::sync::OnceLock;
 
+#[derive(Clone, Copy)]
+struct TraceScanlineStateConfig {
+    frame_min: u64,
+    frame_max: u64,
+    y_min: u16,
+    y_max: u16,
+}
+
+fn trace_scanline_state_config() -> Option<TraceScanlineStateConfig> {
+    static CFG: OnceLock<Option<TraceScanlineStateConfig>> = OnceLock::new();
+    CFG.get_or_init(|| {
+        if std::env::var_os("TRACE_SCANLINE_STATE").is_none() {
+            return None;
+        }
+
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(default)
+        }
+
+        fn env_u16(key: &str, default: u16) -> u16 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(default)
+        }
+
+        Some(TraceScanlineStateConfig {
+            frame_min: env_u64("TRACE_SCANLINE_FRAME_MIN", 0),
+            frame_max: env_u64("TRACE_SCANLINE_FRAME_MAX", u64::MAX),
+            y_min: env_u16("TRACE_SCANLINE_Y_MIN", 0),
+            y_max: env_u16("TRACE_SCANLINE_Y_MAX", u16::MAX),
+        })
+    })
+    .clone()
+}
+
 pub struct Ppu {
     vram: Vec<u8>,
     cgram: Vec<u8>,
@@ -131,8 +170,14 @@ pub struct Ppu {
     // Mode 7 乗算結果キャッシュ ($2134-$2136)
     mode7_mul_result: u32, // 24bit 有効（下位3バイト）
 
+    // Present buffers (last completed frame). The emulator's main loop can overshoot a
+    // PPU frame boundary (instruction granularity), which would otherwise partially
+    // overwrite the top of the next frame before the host presents → visible tearing.
     framebuffer: Vec<u32>,
     subscreen_buffer: Vec<u32>, // サブスクリーン用バッファ
+    // Render (back) buffers for the current in-progress frame.
+    render_framebuffer: Vec<u32>,
+    render_subscreen_buffer: Vec<u32>,
     // Headless高速化用: PPUのピクセル合成（フレームバッファ書き込み）を無効化できる。
     // 画面出力が不要なフレームをスキップし、最終フレームだけ描画する用途を想定。
     framebuffer_rendering_enabled: bool,
@@ -554,6 +599,8 @@ impl Ppu {
 
             framebuffer: vec![0; 256 * 224],
             subscreen_buffer: vec![0; 256 * 224],
+            render_framebuffer: vec![0; 256 * 224],
+            render_subscreen_buffer: vec![0; 256 * 224],
             framebuffer_rendering_enabled: true,
 
             setini: 0,
@@ -751,6 +798,16 @@ impl Ppu {
                     if crate::debug_flags::boot_verbose() {
                         println!("📺 FRAME END: scanline 262, resetting to 0");
                     }
+                    // Present the last completed 256x224 frame before the next frame starts
+                    // overwriting the top scanlines. This avoids visible tearing when the
+                    // outer loop overshoots the boundary at instruction granularity.
+                    if render_enabled {
+                        std::mem::swap(&mut self.framebuffer, &mut self.render_framebuffer);
+                        std::mem::swap(
+                            &mut self.subscreen_buffer,
+                            &mut self.render_subscreen_buffer,
+                        );
+                    }
                     self.exit_vblank();
                     self.scanline = 0;
                     self.frame = self.frame.wrapping_add(1);
@@ -839,6 +896,32 @@ impl Ppu {
 
     // Render one pixel at the current (x,y)
     fn render_dot(&mut self, x: usize, y: usize) {
+        if x == 0 {
+            if let Some(cfg) = trace_scanline_state_config() {
+                let y_u16 = y as u16;
+                if self.frame >= cfg.frame_min
+                    && self.frame <= cfg.frame_max
+                    && y_u16 >= cfg.y_min
+                    && y_u16 <= cfg.y_max
+                {
+                    let forced_blank = (self.screen_display & 0x80) != 0;
+                    let effective_tm = self.effective_main_screen_designation();
+                    println!(
+                        "[TRACE_SCANLINE_STATE] frame={} y={} INIDISP=0x{:02X} (blank={} bright={}) TM=0x{:02X} TS=0x{:02X} CGWSEL=0x{:02X} CGADSUB=0x{:02X}",
+                        self.frame,
+                        y,
+                        self.screen_display,
+                        forced_blank as u8,
+                        self.brightness & 0x0F,
+                        effective_tm,
+                        self.sub_screen_designation,
+                        self.cgwsel,
+                        self.cgadsub
+                    );
+                }
+            }
+        }
+
         // Debug at start of each scanline - only when not forced blank
         if x == 0 && crate::debug_flags::debug_render_dot() {
             static mut LINE_DEBUG_COUNT: u32 = 0;
@@ -935,11 +1018,11 @@ impl Ppu {
 
         let pixel_offset = y * 256 + x;
         let final_brightness_color = self.apply_brightness(final_color);
-        if pixel_offset < self.framebuffer.len() {
-            self.framebuffer[pixel_offset] = final_brightness_color;
+        if pixel_offset < self.render_framebuffer.len() {
+            self.render_framebuffer[pixel_offset] = final_brightness_color;
         }
-        if pixel_offset < self.subscreen_buffer.len() {
-            self.subscreen_buffer[pixel_offset] = sub_color;
+        if pixel_offset < self.render_subscreen_buffer.len() {
+            self.render_subscreen_buffer[pixel_offset] = sub_color;
         }
     }
 
@@ -1526,7 +1609,7 @@ impl Ppu {
 
             // 画面の明度（INIDISP）を適用
             let final_brightness_color = self.apply_brightness(final_color);
-            self.framebuffer[pixel_offset] = final_brightness_color;
+            self.render_framebuffer[pixel_offset] = final_brightness_color;
 
             // Debug white pixel writing to framebuffer
             if crate::debug_flags::boot_verbose() {
@@ -1546,7 +1629,7 @@ impl Ppu {
                     }
                 }
             }
-            self.subscreen_buffer[pixel_offset] = sub_color;
+            self.render_subscreen_buffer[pixel_offset] = sub_color;
 
             // Debug framebuffer writes
             if crate::debug_flags::boot_verbose() {
@@ -5682,9 +5765,12 @@ impl Ppu {
 
     /// フレームバッファを指定色で塗りつぶす（強制フォールバック用）
     pub fn force_framebuffer_color(&mut self, color: u32) {
-        for px in self.framebuffer.iter_mut() {
-            *px = color;
-        }
+        // Fill both the present (front) and render (back) buffers so the forced color
+        // remains visible even if the emulator overshoots a frame boundary and swaps.
+        self.framebuffer.fill(color);
+        self.render_framebuffer.fill(color);
+        self.subscreen_buffer.fill(color);
+        self.render_subscreen_buffer.fill(color);
     }
 
     /// DQ3デバッグ用: INIDISP への DMA/HDMA 書き込みを無視するかを設定
@@ -6145,19 +6231,19 @@ impl Ppu {
         let bg3_width_tiles: u16 = if bg3_ss == 1 || bg3_ss == 3 { 64 } else { 32 };
         let bg3_height_tiles: u16 = if bg3_ss == 2 || bg3_ss == 3 { 64 } else { 32 };
 
-        // Current visible Y coordinate (0-based within the framebuffer).
-        //
-        // Note: PPU scanline 1 maps to framebuffer row 0 (see render_dot call site).
-        let screen_y = self.scanline.saturating_sub(1);
-
         // BG3HOFS low 3 bits are ignored for OPT indexing.
         let base_col = ((self.bg3_hscroll >> 3) % bg3_width_tiles) as u16;
 
-        // Mode 2 uses two BG3 tilemap rows per 8px: one for horizontal offsets (even row),
-        // followed by one for vertical offsets (odd row).
-        let tile_y = ((screen_y as u16).wrapping_add(self.bg3_vscroll) >> 3) % bg3_height_tiles;
-        let h_row = tile_y.wrapping_mul(2) % bg3_height_tiles;
-        let v_row = (h_row + 1) % bg3_height_tiles;
+        // In OPT modes, the screen Y position does not affect which BG3 rows are used.
+        // BG3VOFS selects the starting row within BG3's tilemap, allowing HDMA to switch
+        // between multiple 2-row "sets" over the course of the frame.
+        //
+        // The common layout is 2 rows of 32 entries: first row is horizontal offsets,
+        // second row is vertical offsets. For larger BG3 tilemaps, multiple sets may be
+        // placed in different rows.
+        let base_row = ((self.bg3_vscroll >> 3) % bg3_height_tiles) as u16;
+        let h_row = base_row;
+        let v_row = (base_row + 1) % bg3_height_tiles;
 
         // Column 0 is never affected (per OPT rules).
         self.mode2_opt_hscroll_lut[0][0] = self.bg1_hscroll;

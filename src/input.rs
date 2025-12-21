@@ -1,7 +1,5 @@
 // SNES Input Controller implementation
 
-use crate::debug_flags;
-
 #[derive(Debug, Clone, Default)]
 pub struct SnesController {
     // コントローラーの状態（ビットフィールド）
@@ -215,36 +213,8 @@ pub struct InputSystem {
 
 impl InputSystem {
     pub fn new() -> Self {
-        let mut controller1 = SnesController::new();
-        // 環境変数 AUTO_JOYPAD1_MASK で常時押下するボタンを指定できる（例: 0x0100 = A）
-        // ただし誤作動防止のため AUTO_INPUT=1 のときのみ有効化する。
-        if debug_flags::auto_input() {
-            if let Ok(val) = std::env::var("AUTO_JOYPAD1_MASK") {
-                if let Ok(mask) = u16::from_str_radix(val.trim_start_matches("0x"), 16)
-                    .or_else(|_| val.parse::<u16>())
-                {
-                    controller1.set_auto_buttons(mask);
-                    if !debug_flags::quiet() {
-                        println!("AUTO_JOYPAD1_MASK set: 0x{:04X}", mask);
-                    }
-                }
-            }
-        }
-        let mut controller2 = SnesController::new();
-        // 環境変数 AUTO_JOYPAD2_MASK で常時押下するボタンを指定できる（例: 0x0100 = A）
-        // ただし誤作動防止のため AUTO_INPUT=1 のときのみ有効化する。
-        if debug_flags::auto_input() {
-            if let Ok(val) = std::env::var("AUTO_JOYPAD2_MASK") {
-                if let Ok(mask) = u16::from_str_radix(val.trim_start_matches("0x"), 16)
-                    .or_else(|_| val.parse::<u16>())
-                {
-                    controller2.set_auto_buttons(mask);
-                    if !debug_flags::quiet() {
-                        println!("AUTO_JOYPAD2_MASK set: 0x{:04X}", mask);
-                    }
-                }
-            }
-        }
+        let controller1 = SnesController::new();
+        let controller2 = SnesController::new();
         Self {
             controller1,
             controller2,

@@ -1403,12 +1403,7 @@ impl Emulator {
         }
 
         // レンダラ側が何らかの理由でBGを描けない場合に備え、フレームバッファを直接白で塗る緊急フォールバック
-        {
-            let fb = ppu.get_framebuffer_mut();
-            for px in fb.iter_mut() {
-                *px = 0xFFFFFFFF; // opaque white
-            }
-        }
+        ppu.force_framebuffer_color(0xFFFFFFFF); // opaque white
     }
 
     /// DQ3初期化支援: 早期フレームでNMITIMENのIRQビットを強制ON（デフォルト: 有効）
@@ -2623,7 +2618,13 @@ impl Emulator {
         }
 
         // Step PPU: PPU clock is master/4.
-        let mut ppu_cycles = master_cycles / PPU_CLOCK_DIVIDER;
+        //
+        // IMPORTANT: Preserve master->PPU fractional remainder across CPU and stall paths.
+        // Otherwise, repeated small stalls (e.g., slow memory extra master cycles) will
+        // systematically drop remainder and cause video timing drift (tearing in dumps).
+        let master_with_rem = master_cycles.saturating_add(self.ppu_cycle_accum as u64);
+        let mut ppu_cycles = master_with_rem / PPU_CLOCK_DIVIDER;
+        self.ppu_cycle_accum = (master_with_rem % PPU_CLOCK_DIVIDER) as u8;
         while ppu_cycles > 0 {
             let chunk = ppu_cycles.min(u16::MAX as u64) as u16;
             self.step_ppu(chunk);
