@@ -610,6 +610,11 @@ impl Emulator {
         let disable_skip_env = std::env::var("DISABLE_FRAME_SKIP")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
+        let max_frame_skip = std::env::var("MAX_FRAME_SKIP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v.min(10))
+            .unwrap_or(2);
         Ok(Emulator {
             cpu,
             bus,
@@ -623,7 +628,7 @@ impl Emulator {
             rom_checksum,
             frame_count: 0,
             frame_skip_count: 0,
-            max_frame_skip: 2, // Allow skipping up to 2 frames for performance
+            max_frame_skip, // Allow skipping up to N frames for performance
             adaptive_timing: adaptive_timing_env && !disable_skip_env,
             performance_stats: PerformanceStats::new(),
             audio_system,
@@ -1168,8 +1173,16 @@ impl Emulator {
                 && self.frame_skip_count < self.max_frame_skip
                 && self.performance_stats.should_skip_frame(60.0);
 
-            // Dragon Quest III title screen fix: NEVER skip frames when title screen might be showing
-            let force_render_for_title_screen = true; // Always render for title screen
+            // Dragon Quest III title screen fix: avoid frame skip only for DQ3 (others can skip if slow)
+            let force_render_for_title_screen = if is_dq3 {
+                std::env::var("DQ3_FORCE_RENDER")
+                    .map(|v| v == "1" || v.to_lowercase() == "true")
+                    .unwrap_or(true)
+            } else {
+                std::env::var("FORCE_RENDER_ALL")
+                    .map(|v| v == "1" || v.to_lowercase() == "true")
+                    .unwrap_or(false)
+            };
             let final_should_skip = should_skip_frame && !force_render_for_title_screen;
 
             if crate::debug_flags::render_verbose() {
