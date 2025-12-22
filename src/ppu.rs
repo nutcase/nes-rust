@@ -2018,54 +2018,78 @@ impl Ppu {
     fn z_rank_for_bg(&self, layer: u8, pr: u8) -> i16 {
         match self.bg_mode {
             0 => {
-                // Any BG: hi over OBJ2; lo between OBJ2 and OBJ1
-                if pr >= 1 {
-                    80
-                } else {
-                    60
+                // Priority order for Mode 0 (front -> back):
+                //   S3 1H 2H S2 1L 2L S1 3H 4H S0 3L 4L
+                // Where:
+                //   S3..S0 = OBJ priorities 3..0
+                //   1..4   = BG1..BG4 (layer 0..3)
+                //   H/L    = tile priority bit (pr=1/0)
+                match (layer, pr >= 1) {
+                    // BG1
+                    (0, true) => 85,  // between S3(90) and S2(70)
+                    (0, false) => 65, // between S2(70) and S1(50)
+                    // BG2
+                    (1, true) => 80,  // between BG1H and S2
+                    (1, false) => 60, // between BG1L and S1
+                    // BG3
+                    (2, true) => 45,  // between S1(50) and S0(40)
+                    (2, false) => 35, // below S0
+                    // BG4
+                    (3, true) => 42,  // between BG3H and S0
+                    (3, false) => 30, // bottom-most BG
+                    _ => 30,
                 }
             }
             1 => {
-                // Distinguish BG1(0), BG2(1), BG3(2)
+                // Priority order for Mode 1 (front -> back):
+                //   If BGMODE bit3 (BG3 priority) = 1:
+                //     3H S3 1H 2H S2 1L 2L S1 S0 3L
+                //   If BGMODE bit3 = 0:
+                //     S3 1H 2H S2 1L 2L S1 3H S0 3L
+                // (BG4 not present.)
                 let bg3_slot_high = self.mode1_bg3_priority; // $2105 bit3
-                if layer == 2 {
-                    if bg3_slot_high {
-                        55
-                    } else {
-                        20
+                match layer {
+                    // BG3
+                    2 => {
+                        if pr >= 1 {
+                            if bg3_slot_high {
+                                95 // above S3
+                            } else {
+                                45 // between S1 and S0
+                            }
+                        } else {
+                            35 // 3L below S0
+                        }
                     }
-                } else if layer == 1 {
                     // BG2
-                    if pr >= 1 {
-                        80
-                    } else {
-                        60
+                    1 => {
+                        if pr >= 1 {
+                            80 // between S3 and S2
+                        } else {
+                            60 // between S2 and S1
+                        }
                     }
-                } else {
+                    // BG1 (default)
+                    _ => {
+                        if pr >= 1 {
+                            85 // between S3 and S2, above BG2H
+                        } else {
+                            65 // between S2 and S1, above BG2L
+                        }
+                    }
+                }
+            }
+            2 | 3 | 4 => {
+                // Priority order for Modes 2/3/4 (front -> back):
+                //   S3 1H S2 2H S1 1L S0 2L
+                match (layer, pr >= 1) {
                     // BG1
-                    if pr >= 1 {
-                        70
-                    } else {
-                        50
-                    }
-                }
-            }
-            2 => {
-                // BG1 over BG2 at each priority
-                match (layer, pr) {
-                    (0, 1) => 80,
-                    (1, 1) => 70,
-                    (0, _) => 50,
-                    _ => 40,
-                }
-            }
-            3 | 4 => {
-                // BG1 over BG2
-                match (layer, pr) {
-                    (0, 1) => 80,
-                    (1, 1) => 70,
-                    (0, _) => 50,
-                    _ => 40,
+                    (0, true) => 80,  // between S3 and S2
+                    (0, false) => 45, // between S1 and S0
+                    // BG2
+                    (1, true) => 60,  // between S2 and S1
+                    (1, false) => 35, // below S0
+                    _ => 35,
                 }
             }
             5 | 6 => {
