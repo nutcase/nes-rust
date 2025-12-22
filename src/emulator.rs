@@ -777,6 +777,7 @@ impl Emulator {
                 let frame_time = frame_start.elapsed();
                 self.performance_stats.update(frame_time);
                 self.frame_count += 1;
+                self.maybe_dump_mem_at();
 
                 // Periodic SRAM autosave (optional)
                 self.maybe_autosave_sram();
@@ -1212,6 +1213,7 @@ impl Emulator {
 
             self.frame_count += 1;
             self.maybe_dump_framebuffer_at();
+            self.maybe_dump_mem_at();
 
             // Periodic SRAM autosave (optional)
             self.maybe_autosave_sram();
@@ -1295,8 +1297,6 @@ impl Emulator {
             || rom_up.contains("III")  // Japanese titles often contain just "III"
             || self.is_dq3_title()
             || matches!(self.bus.get_mapper_type(), crate::cartridge::MapperType::DragonQuest3);
-        // SMW/SMC系の自動アンブランク（初期APU待ちで止まるケースへの保険）
-        let smw_auto = rom_up.contains("MARIO") || rom_up.contains("SUPERMARIO");
 
         static mut DQ3_DETECTED: bool = false;
         unsafe {
@@ -1309,7 +1309,9 @@ impl Emulator {
             }
         }
 
-        if !env_enabled && !dq3_auto && !smw_auto {
+        // NOTE: Avoid game-agnostic auto overrides by default.
+        // For non-DQ3 titles, enable explicitly via BOOT_FORCE_UNBLANK=1.
+        if !env_enabled && !dq3_auto {
             return;
         }
 
@@ -3443,6 +3445,91 @@ impl Emulator {
             eprintln!("DUMP_FRAME_AT: failed to write {}: {}", out_path, e);
         } else if !crate::debug_flags::quiet() {
             println!("DUMP_FRAME_AT: wrote {}", out_path);
+        }
+
+        if cfg.quit {
+            crate::shutdown::request_quit();
+        }
+    }
+
+    fn maybe_dump_mem_at(&mut self) {
+        #[derive(Clone)]
+        struct DumpCfg {
+            frame: u64,
+            prefix: String,
+            quit: bool,
+            ppu_state: bool,
+        }
+
+        static CFG: OnceLock<Option<DumpCfg>> = OnceLock::new();
+        let Some(cfg) = CFG
+            .get_or_init(|| {
+                let frame = std::env::var("DUMP_MEM_AT")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())?;
+                let prefix = std::env::var("DUMP_MEM_PREFIX")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| format!("logs/mem_{:05}", frame));
+                let quit = std::env::var("DUMP_MEM_QUIT")
+                    .map(|v| v == "1" || v.to_lowercase() == "true")
+                    .unwrap_or(false);
+                let ppu_state = std::env::var("DUMP_MEM_PPU_STATE")
+                    .map(|v| v == "1" || v.to_lowercase() == "true")
+                    .unwrap_or(false);
+                Some(DumpCfg {
+                    frame,
+                    prefix,
+                    quit,
+                    ppu_state,
+                })
+            })
+            .clone()
+        else {
+            return;
+        };
+
+        if self.frame_count != cfg.frame {
+            return;
+        }
+
+        let _ = std::fs::create_dir_all("logs");
+
+        let ppu = self.bus.get_ppu();
+        let bwram = self.bus.sa1_bwram_slice();
+        let write_bin = |suffix: &str, data: &[u8]| -> Result<(), std::io::Error> {
+            let path = format!("{}_{}.bin", cfg.prefix, suffix);
+            std::fs::write(path, data)
+        };
+
+        let mut ok = true;
+        if let Err(e) = write_bin("wram", self.bus.wram()) {
+            eprintln!("DUMP_MEM_AT: failed to write WRAM: {}", e);
+            ok = false;
+        }
+        if let Err(e) = write_bin("vram", ppu.get_vram()) {
+            eprintln!("DUMP_MEM_AT: failed to write VRAM: {}", e);
+            ok = false;
+        }
+        if let Err(e) = write_bin("cgram", ppu.get_cgram()) {
+            eprintln!("DUMP_MEM_AT: failed to write CGRAM: {}", e);
+            ok = false;
+        }
+        if let Err(e) = write_bin("oam", ppu.get_oam()) {
+            eprintln!("DUMP_MEM_AT: failed to write OAM: {}", e);
+            ok = false;
+        }
+        if !bwram.is_empty() {
+            if let Err(e) = write_bin("bwram", bwram) {
+                eprintln!("DUMP_MEM_AT: failed to write BW-RAM: {}", e);
+                ok = false;
+            }
+        }
+        if ok && !crate::debug_flags::quiet() {
+            println!("DUMP_MEM_AT: wrote {}_*", cfg.prefix);
+        }
+        if cfg.ppu_state {
+            self.bus.get_ppu().debug_ppu_state();
         }
 
         if cfg.quit {
