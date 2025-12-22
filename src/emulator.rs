@@ -2498,12 +2498,8 @@ impl Emulator {
                 self.bus.with_apu_mut(|apu| apu.step(apu_cycles));
             }
 
-            // NMIはCPU側の poll_nmi/service_nmi で処理する（重複トリガ防止）。
-            // Handle IRQ when pending
-            if self.bus.irq_is_pending() {
-                self.cpu.trigger_irq(&mut self.bus);
-                self.bus.clear_irq_pending();
-            }
+            // NMI/IRQ は CPU 側の poll_nmi/service_nmi/service_irq で処理する。
+            // ここで手動トリガ/クリアすると IRQ のレベル維持が崩れるため触らない。
 
             self.master_cycles += (cpu_cycles as u64) * CPU_CLOCK_DIVIDER;
 
