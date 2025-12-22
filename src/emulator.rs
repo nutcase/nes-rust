@@ -6,7 +6,9 @@
 // #![allow(dead_code)]
 // #![allow(static_mut_refs)]
 use minifb::{Key, Window, WindowOptions};
+use std::io::BufWriter;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioSystem;
@@ -16,6 +18,66 @@ use crate::cpu::Cpu;
 use crate::debugger::Debugger;
 use crate::savestate::*;
 use crate::shutdown;
+
+fn write_framebuffer_ppm(
+    path: &std::path::Path,
+    fb: &[u32],
+    width: usize,
+    height: usize,
+) -> Result<(), std::io::Error> {
+    let mut ppm = Vec::with_capacity(width * height * 3 + 32);
+    ppm.extend_from_slice(format!("P6\n{} {}\n255\n", width, height).as_bytes());
+    for &px in fb.iter().take(width * height) {
+        let r = ((px >> 16) & 0xFF) as u8;
+        let g = ((px >> 8) & 0xFF) as u8;
+        let b = (px & 0xFF) as u8;
+        ppm.extend_from_slice(&[r, g, b]);
+    }
+    std::fs::write(path, &ppm)
+}
+
+fn write_framebuffer_png(
+    path: &std::path::Path,
+    fb: &[u32],
+    width: usize,
+    height: usize,
+) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let w = BufWriter::new(file);
+
+    let mut encoder = png::Encoder::new(w, width as u32, height as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for &px in fb.iter().take(width * height) {
+        let r = ((px >> 16) & 0xFF) as u8;
+        let g = ((px >> 8) & 0xFF) as u8;
+        let b = (px & 0xFF) as u8;
+        let a = ((px >> 24) & 0xFF) as u8;
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+    writer
+        .write_image_data(&rgba)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn write_framebuffer_image(
+    path: &std::path::Path,
+    fb: &[u32],
+    width: usize,
+    height: usize,
+) -> Result<(), String> {
+    match path.extension().and_then(|s| s.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("ppm") => {
+            write_framebuffer_ppm(path, fb, width, height).map_err(|e| e.to_string())
+        }
+        Some(ext) if ext.eq_ignore_ascii_case("png") => write_framebuffer_png(path, fb, width, height),
+        _ => write_framebuffer_png(path, fb, width, height),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PerformanceStats {
@@ -626,6 +688,7 @@ impl Emulator {
             }
             while self.frame_count < self.headless_max_frames && !shutdown::should_quit() {
                 let frame_start = Instant::now();
+                self.apply_scripted_input_for_headless();
                 if headless_fast_render {
                     let enable = self.frame_count >= headless_fast_render_from;
                     self.bus
@@ -912,18 +975,20 @@ impl Emulator {
                 .unwrap_or(false)
             {
                 let fb = self.bus.get_ppu().get_framebuffer();
-                let mut ppm = Vec::with_capacity(256 * 224 * 3 + 32);
-                ppm.extend_from_slice(b"P6\n256 224\n255\n");
-                for &px in fb.iter().take(256 * 224) {
-                    let r = ((px >> 16) & 0xFF) as u8;
-                    let g = ((px >> 8) & 0xFF) as u8;
-                    let b = (px & 0xFF) as u8;
-                    ppm.extend_from_slice(&[r, g, b]);
-                }
-                if let Err(e) = std::fs::write("logs/headless_fb.ppm", &ppm) {
+                let _ = std::fs::create_dir_all("logs");
+                let out_path = std::env::var("HEADLESS_DUMP_FRAME_PATH")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "logs/headless_fb.png".to_string());
+                if let Err(e) = write_framebuffer_image(
+                    std::path::Path::new(&out_path),
+                    fb,
+                    256,
+                    224,
+                ) {
                     eprintln!("Failed to dump framebuffer: {}", e);
                 } else {
-                    println!("Framebuffer dumped to logs/headless_fb.ppm");
+                    println!("Framebuffer dumped to {}", out_path);
                 }
             }
 
@@ -1146,6 +1211,7 @@ impl Emulator {
             }
 
             self.frame_count += 1;
+            self.maybe_dump_framebuffer_at();
 
             // Periodic SRAM autosave (optional)
             self.maybe_autosave_sram();
@@ -3232,6 +3298,35 @@ impl Emulator {
         self.handle_audio_controls();
     }
 
+    fn apply_scripted_input_for_headless(&mut self) {
+        if !self.headless {
+            return;
+        }
+        let mask = crate::input::scripted_input_mask_for_frame(self.frame_count);
+        let input_port = std::env::var("INPUT_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(1);
+        match input_port {
+            2 => self
+                .bus
+                .get_input_system_mut()
+                .controller2
+                .set_buttons(mask),
+            _ => self
+                .bus
+                .get_input_system_mut()
+                .controller1
+                .set_buttons(mask),
+        }
+        if std::env::var_os("INPUT_MIRROR_P1_TO_P2").is_some() {
+            self.bus
+                .get_input_system_mut()
+                .controller2
+                .set_buttons(mask);
+        }
+    }
+
     fn maybe_quit_on_cpu_test_result(&mut self) {
         if !self.bus.is_cpu_test_mode() {
             return;
@@ -3309,6 +3404,50 @@ impl Emulator {
             std::thread::sleep(self.target_frame_duration - elapsed);
         }
         self.last_frame_time = Instant::now();
+    }
+
+    fn maybe_dump_framebuffer_at(&mut self) {
+        #[derive(Clone)]
+        struct DumpCfg {
+            frame: u64,
+            quit: bool,
+        }
+
+        static CFG: OnceLock<Option<DumpCfg>> = OnceLock::new();
+        let Some(cfg) = CFG
+            .get_or_init(|| {
+                let frame = std::env::var("DUMP_FRAME_AT")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())?;
+                let quit = std::env::var("DUMP_FRAME_QUIT")
+                    .map(|v| v == "1" || v.to_lowercase() == "true")
+                    .unwrap_or(false);
+                Some(DumpCfg { frame, quit })
+            })
+            .clone()
+        else {
+            return;
+        };
+
+        if self.frame_count != cfg.frame {
+            return;
+        }
+
+        let out_path = std::env::var("DUMP_FRAME_PATH")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("logs/frame_{:05}.png", self.frame_count));
+        let fb = self.bus.get_ppu().get_framebuffer();
+        let _ = std::fs::create_dir_all("logs");
+        if let Err(e) = write_framebuffer_image(std::path::Path::new(&out_path), fb, 256, 224) {
+            eprintln!("DUMP_FRAME_AT: failed to write {}: {}", out_path, e);
+        } else if !crate::debug_flags::quiet() {
+            println!("DUMP_FRAME_AT: wrote {}", out_path);
+        }
+
+        if cfg.quit {
+            crate::shutdown::request_quit();
+        }
     }
 
     fn print_performance_stats(&self) {

@@ -177,10 +177,11 @@ fn run_emulator() {
     //   --force-display    => FORCE_DISPLAY=1
     //   --headless         => HEADLESS=1
     //   --frames <N>       => HEADLESS_FRAMES=N
+    //   --input-events <S> => scripted controller input (mainly for headless runs)
     //   --help             => usage
     if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!(
-            "Usage: {} [--strict] [--force-display] [--headless] [--frames N] <rom>",
+            "Usage: {} [--strict] [--force-display] [--headless] [--frames N] [--input-events S] <rom>",
             args[0]
         );
         eprintln!("Supported formats: .sfc, .smc");
@@ -210,6 +211,17 @@ fn run_emulator() {
                     process::exit(2);
                 }
                 env::set_var("HEADLESS_FRAMES", &args[i + 1]);
+                i += 2;
+            }
+            "--input-events" => {
+                if i + 1 >= args.len() {
+                    eprintln!("--input-events requires a value");
+                    process::exit(2);
+                }
+                if let Err(e) = input::install_scripted_input_events(&args[i + 1]) {
+                    eprintln!("--input-events: {}", e);
+                    process::exit(2);
+                }
                 i += 2;
             }
             s if s.starts_with('-') => {

@@ -1,5 +1,7 @@
 // SNES Input Controller implementation
 
+use std::sync::OnceLock;
+
 #[derive(Debug, Clone, Default)]
 pub struct SnesController {
     // コントローラーの状態（ビットフィールド）
@@ -389,4 +391,98 @@ pub struct KeyStates {
     pub r: bool,
     pub start: bool,
     pub select: bool,
+}
+
+// --- Scripted input (opt-in; used by tools/headless runs) ---
+
+#[derive(Clone, Copy)]
+struct ScriptedInputEvent {
+    start: u64,
+    end: u64,
+    mask: u16,
+}
+
+static SCRIPTED_INPUT: OnceLock<Option<Vec<ScriptedInputEvent>>> = OnceLock::new();
+
+pub fn install_scripted_input_events(spec: &str) -> Result<(), String> {
+    fn parse_buttons(spec: &str) -> u16 {
+        spec.split(|c| c == ',' || c == '+' || c == '|')
+            .filter_map(|name| match name.trim().to_uppercase().as_str() {
+                "A" => Some(button::A),
+                "B" => Some(button::B),
+                "X" => Some(button::X),
+                "Y" => Some(button::Y),
+                "L" => Some(button::L),
+                "R" => Some(button::R),
+                "START" => Some(button::START),
+                "SELECT" => Some(button::SELECT),
+                "UP" => Some(button::UP),
+                "DOWN" => Some(button::DOWN),
+                "LEFT" => Some(button::LEFT),
+                "RIGHT" => Some(button::RIGHT),
+                _ => None,
+            })
+            .fold(0u16, |acc, v| acc | v)
+    }
+
+    fn parse_range(spec: &str) -> Option<(u64, u64)> {
+        let s = spec.trim();
+        if s.is_empty() {
+            return None;
+        }
+        if let Some((a, b)) = s.split_once('-') {
+            let start = a.trim().parse::<u64>().ok()?;
+            let end = b.trim().parse::<u64>().ok()?;
+            Some((start, end))
+        } else {
+            let t = s.parse::<u64>().ok()?;
+            Some((t, t))
+        }
+    }
+
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("input events spec is empty".to_string());
+    }
+
+    let mut events: Vec<ScriptedInputEvent> = Vec::new();
+    for ent in spec.split(';') {
+        let ent = ent.trim();
+        if ent.is_empty() {
+            continue;
+        }
+        let (range_s, buttons_s) = ent
+            .split_once(':')
+            .map(|(r, b)| (r.trim(), b.trim()))
+            .unwrap_or((ent, "START"));
+        let (start, end) = parse_range(range_s)
+            .ok_or_else(|| format!("invalid range in input event: '{}'", ent))?;
+        let mask = parse_buttons(buttons_s);
+        if mask == 0 {
+            return Err(format!("invalid buttons in input event: '{}'", ent));
+        }
+        events.push(ScriptedInputEvent { start, end, mask });
+    }
+
+    if events.is_empty() {
+        return Err("no valid input events parsed".to_string());
+    }
+
+    SCRIPTED_INPUT
+        .set(Some(events))
+        .map_err(|_| "scripted input already installed".to_string())?;
+    Ok(())
+}
+
+pub fn scripted_input_mask_for_frame(frame: u64) -> u16 {
+    let Some(events) = SCRIPTED_INPUT.get().and_then(|v| v.as_ref()) else {
+        return 0;
+    };
+    let mut mask: u16 = 0;
+    for e in events {
+        if frame >= e.start && frame <= e.end {
+            mask |= e.mask;
+        }
+    }
+    mask
 }
