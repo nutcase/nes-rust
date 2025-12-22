@@ -612,7 +612,7 @@ impl Emulator {
             .unwrap_or(false);
         let max_frame_skip = std::env::var("MAX_FRAME_SKIP")
             .ok()
-            .and_then(|v| v.parse::<u32>().ok())
+            .and_then(|v| v.parse::<u8>().ok())
             .map(|v| v.min(10))
             .unwrap_or(2);
         Ok(Emulator {
