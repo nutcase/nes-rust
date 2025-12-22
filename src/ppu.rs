@@ -505,6 +505,38 @@ impl Ppu {
         }
         self.bgofs_latch = value;
         self.bghofs_latch = value;
+
+        if crate::debug_flags::trace_ppu_scroll() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static CNT: AtomicU32 = AtomicU32::new(0);
+            let n = CNT.fetch_add(1, Ordering::Relaxed);
+            if n < 512 {
+                let who = match self.write_ctx {
+                    2 => "HDMA",
+                    1 => "MDMA",
+                    _ => "CPU",
+                };
+                let (h, v) = match bg_num {
+                    0 => (self.bg1_hscroll, self.bg1_vscroll),
+                    1 => (self.bg2_hscroll, self.bg2_vscroll),
+                    2 => (self.bg3_hscroll, self.bg3_vscroll),
+                    _ => (self.bg4_hscroll, self.bg4_vscroll),
+                };
+                println!(
+                    "[TRACE_PPU_SCROLL] {} frame={} sl={} cyc={} BG{}HOFS write=0x{:02X} -> h={} v={} (bgofs_latch=0x{:02X} bghofs_latch=0x{:02X})",
+                    who,
+                    self.frame,
+                    self.scanline,
+                    self.cycle,
+                    bg_num + 1,
+                    value,
+                    h,
+                    v,
+                    self.bgofs_latch,
+                    self.bghofs_latch
+                );
+            }
+        }
     }
 
     #[inline]
@@ -519,6 +551,37 @@ impl Ppu {
             _ => self.bg4_vscroll = ofs,
         }
         self.bgofs_latch = value;
+
+        if crate::debug_flags::trace_ppu_scroll() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static CNT: AtomicU32 = AtomicU32::new(0);
+            let n = CNT.fetch_add(1, Ordering::Relaxed);
+            if n < 512 {
+                let who = match self.write_ctx {
+                    2 => "HDMA",
+                    1 => "MDMA",
+                    _ => "CPU",
+                };
+                let (h, v) = match bg_num {
+                    0 => (self.bg1_hscroll, self.bg1_vscroll),
+                    1 => (self.bg2_hscroll, self.bg2_vscroll),
+                    2 => (self.bg3_hscroll, self.bg3_vscroll),
+                    _ => (self.bg4_hscroll, self.bg4_vscroll),
+                };
+                println!(
+                    "[TRACE_PPU_SCROLL] {} frame={} sl={} cyc={} BG{}VOFS write=0x{:02X} -> h={} v={} (bgofs_latch=0x{:02X})",
+                    who,
+                    self.frame,
+                    self.scanline,
+                    self.cycle,
+                    bg_num + 1,
+                    value,
+                    h,
+                    v,
+                    self.bgofs_latch
+                );
+            }
+        }
     }
 
     pub fn new() -> Self {
@@ -2178,6 +2241,9 @@ impl Ppu {
     // Helper: Get effective main screen designation for rendering
     #[inline]
     fn effective_main_screen_designation(&self) -> u8 {
+        if let Some(v) = crate::debug_flags::debug_force_tm() {
+            return v;
+        }
         if self.main_screen_designation == 0 {
             self.main_screen_designation_last_nonzero
         } else {
@@ -5635,13 +5701,37 @@ impl Ppu {
                 }
             }
             0x2C => {
-                if crate::debug_flags::strict_ppu_timing() && self.in_active_display() {
+                let strict_latched = crate::debug_flags::strict_ppu_timing() && self.in_active_display();
+                if strict_latched {
                     self.latched_tm = Some(value);
                 } else {
                     self.main_screen_designation = value;
                     // Remember non-zero values for rendering (workaround for timing issues)
                     if value != 0 {
                         self.main_screen_designation_last_nonzero = value;
+                    }
+                }
+                if crate::debug_flags::trace_ppu_tm() {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static CNT: AtomicU32 = AtomicU32::new(0);
+                    let n = CNT.fetch_add(1, Ordering::Relaxed);
+                    if n < 512 {
+                        let who = match self.write_ctx {
+                            2 => "HDMA",
+                            1 => "MDMA",
+                            _ => "CPU",
+                        };
+                        println!(
+                            "[TRACE_PPU_TM] {} frame={} sl={} cyc={} $212C=0x{:02X} (latched={}) raw_tm=0x{:02X} last_nonzero=0x{:02X}",
+                            who,
+                            self.frame,
+                            self.scanline,
+                            self.cycle,
+                            value,
+                            strict_latched as u8,
+                            self.main_screen_designation,
+                            self.main_screen_designation_last_nonzero
+                        );
                     }
                 }
                 if crate::debug_flags::ppu_write() && !crate::debug_flags::quiet() {

@@ -24,6 +24,15 @@ fn env_u32(key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+fn env_u8_opt(key: &str) -> Option<u8> {
+    std::env::var(key).ok().and_then(|v| {
+        let v = v.trim();
+        u8::from_str_radix(v.trim_start_matches("0x"), 16)
+            .ok()
+            .or_else(|| v.parse().ok())
+    })
+}
+
 pub fn dma() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("DEBUG_DMA", false))
@@ -694,6 +703,16 @@ pub fn trace_ppu_inidisp() -> bool {
     *ON.get_or_init(|| env_flag("TRACE_PPU_INIDISP", false))
 }
 
+pub fn trace_ppu_tm() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_PPU_TM", false))
+}
+
+pub fn trace_ppu_scroll() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("TRACE_PPU_SCROLL", false))
+}
+
 // Burn-in test (V224/V239) focused trace (RDNMI/SLHV/OPVCT). Very verbose; enable only when needed.
 pub fn trace_burnin_v224() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -716,6 +735,13 @@ pub fn trace() -> bool {
 pub fn force_display() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("FORCE_DISPLAY", false))
+}
+
+// Force main screen designation (TM / $212C) for debugging layer issues.
+// Example: DEBUG_FORCE_TM=0x01 (BG1 only), 0x02 (BG2 only), 0x10 (OBJ only)
+pub fn debug_force_tm() -> Option<u8> {
+    static VAL: OnceLock<Option<u8>> = OnceLock::new();
+    *VAL.get_or_init(|| env_u8_opt("DEBUG_FORCE_TM"))
 }
 
 // Ignore CPU writes to INIDISP (keep HDMA/MDMA). Debug aid for DQ3.

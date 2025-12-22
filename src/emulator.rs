@@ -2806,9 +2806,21 @@ impl Emulator {
             let was_hblank = self.bus.get_ppu().is_hblank();
 
             // Compute a slice that won't cross HBlank entry or scanline wrap.
+            //
+            // IMPORTANT:
+            // PPU's HBlank flag flips while *processing* the first HBlank dot (FIRST_HBLANK_DOT).
+            // If we slice exactly up to FIRST_HBLANK_DOT, the PPU will not have executed that dot
+            // yet, so `is_hblank()` stays false and we can miss the HDMA start-of-HBlank event.
+            //
+            // To reliably catch the transition, ensure we step at least 1 dot into HBlank
+            // (i.e., end at >= FIRST_HBLANK_DOT+1) before checking `is_hblank()`.
             let mut slice = remaining.min(DOTS_PER_LINE.saturating_sub(old_cycle).max(1));
-            if !was_hblank && old_cycle < FIRST_HBLANK_DOT {
-                slice = slice.min(FIRST_HBLANK_DOT - old_cycle);
+            if !was_hblank {
+                if old_cycle < FIRST_HBLANK_DOT {
+                    slice = slice.min((FIRST_HBLANK_DOT + 1).saturating_sub(old_cycle).max(1));
+                } else if old_cycle == FIRST_HBLANK_DOT {
+                    slice = slice.min(1);
+                }
             }
 
             self.bus.get_ppu_mut().step(slice);
