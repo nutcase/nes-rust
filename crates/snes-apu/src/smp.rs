@@ -1,4 +1,5 @@
 use super::apu::Apu;
+use std::sync::OnceLock;
 
 pub struct Smp {
     emulator: *mut Apu,
@@ -109,14 +110,21 @@ impl Smp {
         (if self.psw_c { 1 } else { 0 })
     }
 
+    pub fn is_stopped(&self) -> bool {
+        self.is_stopped
+    }
+
     fn is_negative(value: u32) -> bool {
         (value & 0x80) != 0
     }
 
     fn cycles(&mut self, num_cycles: i32) {
-        self.emulator().cpu_cycles_callback(num_cycles);
-        self.executed_cycles += num_cycles;
-        self.cycle_count -= num_cycles;
+        // S-SMP 1 CPU cycle corresponds to 2 internal APU ticks (2.048MHz base).
+        // Scale here so opcode timing stays in "CPU cycles" while timers/DSP tick correctly.
+        let scaled = num_cycles.saturating_mul(2);
+        self.emulator().cpu_cycles_callback(scaled);
+        self.executed_cycles += scaled;
+        self.cycle_count -= scaled;
     }
 
     fn read(&mut self, addr: u16) -> u8 {
@@ -155,12 +163,55 @@ impl Smp {
 
     fn write_dp(&mut self, addr: u8, value: u8) {
         let addr = (if self.psw_p { 0x0100 } else { 0 }) | (addr as u16);
+        if std::env::var_os("TRACE_SFS_SMP_WRITE_DP").is_some() {
+            let watch = matches!(
+                addr,
+                0x001E | 0x001F | 0x00F4 | 0x011E | 0x011F | 0x01F4
+            );
+            if watch && self.reg_pc < 0xFFC0 {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static CNT: AtomicU32 = AtomicU32::new(0);
+                let n = CNT.fetch_add(1, Ordering::Relaxed);
+                if n < 2048 {
+                    println!(
+                        "[SFS][SMP][DPW] pc={:04X} psw={:02X} ${:04X} <- {:02X}",
+                        self.reg_pc,
+                        self.get_psw(),
+                        addr,
+                        value
+                    );
+                }
+            }
+        }
         self.write(addr, value);
     }
 
     fn set_psw_n_z(&mut self, x: u32) {
         self.psw_n = Smp::is_negative(x);
         self.psw_z = x == 0;
+    }
+
+    fn trace_sfs_range() -> Option<(u16, u16)> {
+        static RANGE: OnceLock<Option<(u16, u16)>> = OnceLock::new();
+        *RANGE.get_or_init(|| {
+            let s = std::env::var("TRACE_SFS_SMP_RANGE").ok()?;
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            let (a, b) = if let Some((lhs, rhs)) = s.split_once('-') {
+                (lhs.trim(), rhs.trim())
+            } else {
+                return None;
+            };
+            let parse = |v: &str| -> Option<u16> {
+                let v = v.trim_start_matches("0x");
+                u16::from_str_radix(v, 16).ok().or_else(|| v.parse().ok())
+            };
+            let start = parse(a)?;
+            let end = parse(b)?;
+            Some((start.min(end), start.max(end)))
+        })
     }
 
     fn adc(&mut self, x: u8, y: u8) -> u8 {
@@ -730,7 +781,21 @@ impl Smp {
                 let addr = self.read_pc();
                 self.cycles(1);
                 let mut temp = $y;
-                let z = self.read_dp(addr + temp);
+                let eff = addr.wrapping_add(temp);
+                if std::env::var_os("TRACE_SFS_SMP_DP_I_READ").is_some() {
+                    let abs = (if self.psw_p { 0x0100 } else { 0 }) | (eff as u16);
+                    if (0x00F0..=0x00FF).contains(&abs) || (0x01F0..=0x01FF).contains(&abs) {
+                        println!(
+                            "[SFS][SMP][DPI] pc={:04X} psw={:02X} base={:02X} X/Y={:02X} -> ${:04X}",
+                            self.reg_pc,
+                            self.get_psw(),
+                            addr,
+                            temp,
+                            abs
+                        );
+                    }
+                }
+                let z = self.read_dp(eff);
                 temp = $x;
                 $x = self.$op(temp, z);
             })
@@ -911,7 +976,25 @@ impl Smp {
         self.cycle_count += target_cycles;
         while self.cycle_count > 0 {
             if !self.is_stopped {
+                let pc = self.reg_pc;
                 let opcode = self.read_pc();
+                if let Some((start, end)) = Self::trace_sfs_range() {
+                    if pc >= start && pc <= end {
+                        let b1 = self.emulator().peek_u8(self.reg_pc);
+                        let b2 = self.emulator().peek_u8(self.reg_pc.wrapping_add(1));
+                        println!(
+                            "[SFS][SMP][OP] pc={:04X} op={:02X} b1={:02X} b2={:02X} A={:02X} X={:02X} Y={:02X} PSW={:02X}",
+                            pc,
+                            opcode,
+                            b1,
+                            b2,
+                            self.reg_a,
+                            self.reg_x,
+                            self.reg_y,
+                            self.get_psw()
+                        );
+                    }
+                }
                 match opcode {
                     0x00 => self.nop(),
                     0x01 => self.jst(opcode),
