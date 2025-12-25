@@ -134,7 +134,8 @@ impl Dsp {
         self.echo_vol_right = 0x9c;
         self.noise_clock = 0;
         self.echo_write_enabled = false;
-        self.flg = 0x20;
+        // Power-on state: reset+mute+echo disabled (matches SNES DSP reset behavior).
+        self.flg = 0xE0;
         self.echo_feedback = 0;
         self.source_dir = 0;
         self.echo_start_address = Dsp::calculate_echo_start_address(0x60);
@@ -212,6 +213,15 @@ impl Dsp {
         self.is_flushing = true;
 
         while self.cycles_since_last_flush >= 64 {
+            let reset = (self.flg & 0x80) != 0;
+            let muted = (self.flg & 0x40) != 0 || reset;
+            if reset {
+                // When DSP reset is asserted, output silence and avoid advancing voices/echo.
+                self.output_buffer.write_sample(0, 0);
+                self.cycles_since_last_flush -= 64;
+                self.counter = (self.counter + 1) % COUNTER_RANGE;
+                continue;
+            }
             if !self.read_counter(self.noise_clock as i32) {
                 let feedback = (self.noise << 13) ^ (self.noise << 14);
                 self.noise = (feedback & 0x4000) ^ (self.noise >> 1);
@@ -254,8 +264,12 @@ impl Dsp {
             left_echo_in = dsp_helpers::clamp(self.left_filter.next(left_echo_in));
             right_echo_in = dsp_helpers::clamp(self.right_filter.next(right_echo_in));
 
-            let left_out = dsp_helpers::clamp(left_out + dsp_helpers::multiply_volume(left_echo_in, self.echo_vol_left)) as i16;
-            let right_out = dsp_helpers::clamp(right_out + dsp_helpers::multiply_volume(right_echo_in, self.echo_vol_right)) as i16;
+            let mut left_out = dsp_helpers::clamp(left_out + dsp_helpers::multiply_volume(left_echo_in, self.echo_vol_left)) as i16;
+            let mut right_out = dsp_helpers::clamp(right_out + dsp_helpers::multiply_volume(right_echo_in, self.echo_vol_right)) as i16;
+            if muted {
+                left_out = 0;
+                right_out = 0;
+            }
             self.output_buffer.write_sample(left_out, right_out);
 
             if self.echo_write_enabled {
@@ -423,8 +437,14 @@ impl Dsp {
     }
 
     fn set_flg(&mut self, value: u8) {
+        let prev = self.flg;
+        if (value & 0x80) != 0 && (prev & 0x80) == 0 {
+            // DSP reset bit: clear internal state on 0->1 transition.
+            self.reset();
+        }
         self.noise_clock = value & 0x1f;
         self.echo_write_enabled = (value & 0x20) == 0;
+        self.flg = value;
     }
 
     fn set_pmon(&mut self, voice_mask: u8) {
