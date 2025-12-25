@@ -4765,23 +4765,6 @@ impl Ppu {
     }
 
     pub fn write(&mut self, addr: u16, mut value: u8) {
-        // Debug $2105 writes to detect corruption
-        if addr == 0x05 {
-            static mut BG_MODE_WRITE_COUNT: u32 = 0;
-            unsafe {
-                BG_MODE_WRITE_COUNT += 1;
-                if BG_MODE_WRITE_COUNT <= 20 && !crate::debug_flags::quiet() {
-                    println!(
-                        "🔍 BG_MODE_WRITE[{}]: addr=0x{:02X}, value=0x{:02X} (Mode {})",
-                        BG_MODE_WRITE_COUNT,
-                        addr,
-                        value,
-                        value & 0x07
-                    );
-                }
-            }
-        }
-
         // デバッグ：全PPUレジスタ書き込み（抑制可能）
         if crate::debug_flags::ppu_write() {
             static mut TOTAL_PPU_WRITES: u32 = 0;
@@ -4962,43 +4945,7 @@ impl Ppu {
                 };
                 let forced_blank_prev = (prev_display & 0x80) != 0;
                 let forced_blank_new = (log_value & 0x80) != 0;
-                if crate::debug_flags::boot_verbose() {
-                    println!(
-                        "SCREEN CONTROL: brightness={} (forced_blank={}) value=0x{:02X}",
-                        log_value & 0x0F,
-                        forced_blank_new,
-                        log_value
-                    );
-                }
-                static mut SCREEN_CONTROL_COUNT: u32 = 0;
-                static mut SCREEN_CONTROL_SUPPRESSED: bool = false;
-                const SCREEN_CONTROL_LOG_LIMIT: u32 = 32;
-                let quiet = crate::debug_flags::quiet();
-                let verbose = (!quiet)
-                    && (crate::debug_flags::render_verbose()
-                        || crate::debug_flags::trace_ppu_inidisp());
-                unsafe {
-                    SCREEN_CONTROL_COUNT = SCREEN_CONTROL_COUNT.saturating_add(1);
-                    let count = SCREEN_CONTROL_COUNT;
-                    let should_log = (!quiet) && (verbose || count <= SCREEN_CONTROL_LOG_LIMIT);
-                    if should_log {
-                        println!(
-                            "PPU[{}]: Screen control {} 0x{:02X} (brightness={}, forced_blank={}, latched={})",
-                            count,
-                            if defer_update { "latched" } else { "set to" },
-                            log_value,
-                            log_value & 0x0F,
-                            forced_blank_new,
-                            defer_update
-                        );
-                    } else if !quiet && !SCREEN_CONTROL_SUPPRESSED {
-                        println!(
-                            "[ppu-screen] ログが多いため以降のINIDISP出力を抑制します (DEBUG_RENDER=1 で全件表示)"
-                        );
-                        SCREEN_CONTROL_SUPPRESSED = true;
-                    }
-                }
-                if !quiet && crate::debug_flags::trace_ppu_inidisp() {
+                if !crate::debug_flags::quiet() && crate::debug_flags::trace_ppu_inidisp() {
                     println!(
                         "TRACE_PPU_INIDISP: prev=0x{:02X} new=0x{:02X} forced_blank {}→{} brightness {}→{} (latched={})",
                         prev_display,
@@ -5158,12 +5105,6 @@ impl Ppu {
                 // Common reference formula (SNESdev): base word address = (value & 0xFC) << 8.
                 self.bg1_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[0] = value & 0x03;
-                if !crate::debug_flags::quiet() {
-                    println!(
-                        "PPU: BG1 tilemap base: 0x{:04X}, size={}",
-                        self.bg1_tilemap_base, self.bg_screen_size[0]
-                    );
-                }
             }
             0x08 => {
                 // BG2SC ($2108): store base as VRAM word address (see $2107)
@@ -5182,12 +5123,6 @@ impl Ppu {
                 // BG3SC ($2109): store base as VRAM word address (see $2107)
                 self.bg3_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[2] = value & 0x03;
-                if !crate::debug_flags::quiet() {
-                    println!(
-                        "PPU: BG3 tilemap base: raw=0x{:02X} -> base=0x{:04X} (byte=0x{:05X}), size={}",
-                        value, self.bg3_tilemap_base, (self.bg3_tilemap_base as u32) * 2, self.bg_screen_size[2]
-                    );
-                }
             }
             0x0A => {
                 // BG4SC ($210A): store base as VRAM word address (see $2107)
@@ -5203,12 +5138,6 @@ impl Ppu {
                 let bg2 = ((value >> 4) & 0x0F) as u16;
                 self.bg1_tile_base = bg1 << 12;
                 self.bg2_tile_base = bg2 << 12;
-                if !crate::debug_flags::quiet() {
-                    println!(
-                        "PPU: BG1 tile base: 0x{:04X}, BG2 tile base: 0x{:04X}",
-                        self.bg1_tile_base, self.bg2_tile_base
-                    );
-                }
             }
             0x0C => {
                 // BG34NBA ($210C): Character (tile) data area designation.
