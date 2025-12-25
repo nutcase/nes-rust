@@ -3565,6 +3565,7 @@ impl Bus {
                     }
                 }
 
+                let prev_irq_enabled = (self.nmitimen & 0x30) != 0;
                 self.nmitimen = actual_value;
                 self.nmitimen_writes_count = self.nmitimen_writes_count.saturating_add(1);
                 let prev_nmi_en = self.ppu.nmi_enabled;
@@ -3572,8 +3573,12 @@ impl Bus {
                 self.ppu.nmi_enabled = nmi_en;
                 self.irq_h_enabled = (value & 0x10) != 0;
                 self.irq_v_enabled = (value & 0x20) != 0;
+                let new_irq_enabled = (actual_value & 0x30) != 0;
                 // Reset HV shadow when enables change
                 self.irq_v_matched_line = None;
+                if prev_irq_enabled && !new_irq_enabled {
+                    self.irq_pending = false;
+                }
                 // If NMI is enabled mid-VBlank, hardware may latch an NMI immediately *only if*
                 // the NMI flag ($4210 bit7) is still set (i.e., the VBlank-edge has occurred and
                 // has not yet been acknowledged via $4210 read).
@@ -4200,7 +4205,7 @@ impl Bus {
             return;
         }
         let line = self.ppu.get_scanline();
-        let v_match = self.v_timer_set && (line == self.v_timer);
+        let v_match = line == self.v_timer;
         if self.irq_v_enabled && !self.irq_h_enabled {
             if v_match {
                 self.irq_pending = true;
@@ -4219,22 +4224,25 @@ impl Bus {
             return;
         }
 
-        let v_match = self.v_timer_set && (scanline == self.v_timer);
         let mut h_match = false;
-        if self.h_timer_set {
-            // Hardware note (coarse): H-IRQ triggers slightly after the programmed dot.
-            // Many docs describe ~HTIME+3.5 dots; approximate with +4 here.
-            let h = self.h_timer.wrapping_add(4);
-            // Detect crossing of the H timer threshold within this PPU step
-            if old_cycle <= new_cycle {
-                // same scanline
-                if old_cycle <= h && h < new_cycle {
-                    h_match = true;
-                }
-            } else {
-                // scanline advanced and dot counter wrapped
-                if old_cycle <= h || h < new_cycle {
-                    h_match = true;
+        // Hardware note (coarse): H-IRQ triggers slightly after the programmed dot.
+        // Many docs describe ~HTIME+3.5 dots; approximate with +4 here.
+        const DOTS_PER_LINE: u16 = 341;
+        const LAST_DOT: u16 = DOTS_PER_LINE - 1;
+        if self.h_timer <= LAST_DOT {
+            let h = self.h_timer.saturating_add(4);
+            if h <= LAST_DOT {
+                // Detect crossing of the H timer threshold within this PPU step
+                if old_cycle <= new_cycle {
+                    // same scanline
+                    if old_cycle <= h && h < new_cycle {
+                        h_match = true;
+                    }
+                } else {
+                    // scanline advanced and dot counter wrapped
+                    if old_cycle <= h || h < new_cycle {
+                        h_match = true;
+                    }
                 }
             }
         }
@@ -4256,9 +4264,7 @@ impl Bus {
                 }
             }
             (false, true) => {
-                if v_match {
-                    self.irq_pending = true;
-                }
+                // V-IRQ only is handled at scanline boundary in tick_timers().
             }
             _ => {}
         }
