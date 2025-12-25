@@ -139,7 +139,7 @@ impl Apu {
                 0xf3 => self.dsp.as_mut().unwrap().get_register(self.dsp_reg_address),
 
                 // Write-only timer targets read back as $00.
-                0xfa ... 0xfc => 0x00,
+                0xfa ..= 0xfc => 0x00,
 
                 0xfd => {
                     let v = self.timers[0].read_counter();
@@ -164,7 +164,7 @@ impl Apu {
                 0xff => self.timers[2].read_counter(),
 
                 // CPU->APU ports: reads return values written by the S-CPU.
-                0xf4 ... 0xf7 => {
+                0xf4 ..= 0xf7 => {
                     let idx = (address - 0xf4) as usize;
                     let v = self.cpu_to_apu_ports[idx];
                     if std::env::var_os("TRACE_SFS_APU_F4_READ").is_some() {
@@ -287,7 +287,7 @@ impl Apu {
                 0xf3 => { self.dsp.as_mut().unwrap().set_register(self.dsp_reg_address, value); },
 
                 // APU->CPU ports: writes update values readable by the S-CPU.
-                0xf4 ... 0xf7 => {
+                0xf4 ..= 0xf7 => {
                     let idx = (address - 0xf4) as usize;
                     let prev = self.apu_to_cpu_ports[idx];
                     self.apu_to_cpu_ports[idx] = value;
@@ -354,7 +354,7 @@ impl Apu {
                 },
 
                 // $F8-$F9 are general-purpose RAM locations (not CPU ports).
-                0xf8 ... 0xf9 => { self.ram[address as usize] = value; },
+                0xf8 ..= 0xf9 => { self.ram[address as usize] = value; },
 
                 0xfa => {
                     self.timers[0].set_target(value);

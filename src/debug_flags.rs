@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::OnceLock;
 
 fn env_flag(key: &str, default: bool) -> bool {

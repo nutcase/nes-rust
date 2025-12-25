@@ -121,7 +121,6 @@ pub struct Bus {
     fake_apu: bool,
     fake_apu_ports: [u8; 4],
     fake_apu_booted: bool,
-    fake_apu_upload: bool,
     fake_apu_upload_state: FakeApuUploadState,
     fake_apu_upload_bytes: u32,
     fake_apu_upload_data_bytes: u32,
@@ -286,10 +285,6 @@ impl Bus {
                     .map(|v| v == "1" || v.to_lowercase() == "true")
                     .unwrap_or(false)
             });
-        // Optional: also fake SPC upload protocol (short-circuit APU boot)
-        let fake_apu_upload = std::env::var("APU_FAKE_UPLOAD")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
         let fake_apu_fast_done = std::env::var("APU_FAKE_FASTDONE")
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
@@ -388,7 +383,6 @@ impl Bus {
                 [0; 4]
             },
             fake_apu_booted: false,
-            fake_apu_upload,
             fake_apu_upload_state: crate::fake_apu::FakeApuUploadState::default(),
             fake_apu_upload_bytes: 0,
             fake_apu_upload_data_bytes: 0,
@@ -441,9 +435,6 @@ impl Bus {
                     .map(|v| v == "1" || v.to_lowercase() == "true")
                     .unwrap_or(false)
             });
-        let fake_apu_upload = std::env::var("APU_FAKE_UPLOAD")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
         let fake_apu_fast_done = std::env::var("APU_FAKE_FASTDONE")
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
@@ -538,7 +529,6 @@ impl Bus {
                 [0; 4]
             },
             fake_apu_booted: false,
-            fake_apu_upload,
             fake_apu_upload_state: crate::fake_apu::FakeApuUploadState::default(),
             fake_apu_upload_bytes: 0,
             fake_apu_upload_data_bytes: 0,
@@ -585,6 +575,7 @@ impl Bus {
     }
 
     /// Force disable all IRQs (for SA-1 initialization delay)
+    #[allow(dead_code)]
     pub(crate) fn force_disable_irq(&mut self) {
         self.irq_h_enabled = false;
         self.irq_v_enabled = false;
@@ -1183,6 +1174,7 @@ impl Bus {
     }
 
     /// Copy a slice from SA-1 ROM into SA-1 IRAM (used to emulate the missing SA-1 IPL).
+    #[allow(dead_code)]
     fn copy_sa1_iram_from_rom(&mut self, bank: u8, offset: u16, len: usize) {
         let dst = &mut self.sa1_iram;
         let mut remaining = len.min(dst.len());
@@ -1233,6 +1225,7 @@ impl Bus {
     }
 
     /// Minimal SA-1 IPL stub: JML to given bank:address. Fills IRAM with 0xFF first.
+    #[allow(dead_code)]
     fn write_sa1_ipl_stub(&mut self, target_addr: u16, target_bank: u8) {
         self.sa1_iram.fill(0xFF);
         // JML absolute long: opcode 0x5C
@@ -2689,7 +2682,7 @@ impl Bus {
                                         self.ppu.scanline,
                                         self.ppu.get_cycle()
                                     );
-                                } else if let Ok(mut apu) = self.apu.lock() {
+                                } else if let Ok(apu) = self.apu.lock() {
                                     println!(
                                         "[APU-HS][W] ${:04X} <- {:02X} state={} pc={:06X} frame={} sl={} cyc={}",
                                         offset,
@@ -3862,6 +3855,7 @@ impl Bus {
 
     /// 現在のNMITIMEN値（$4200）を取得（デバッグ/フォールバック用）
     #[inline]
+    #[allow(dead_code)]
     pub fn nmitimen(&self) -> u8 {
         self.nmitimen
     }
@@ -3939,6 +3933,7 @@ impl Bus {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn try_with_apu_mut<F>(&mut self, f: F) -> bool
     where
         F: FnOnce(&mut crate::apu::Apu),
@@ -4021,6 +4016,7 @@ impl Bus {
         false
     }
 
+    #[allow(dead_code)]
     pub fn clear_irq_pending(&mut self) {
         self.irq_pending = false;
     }
@@ -4395,7 +4391,7 @@ impl Bus {
             let lo = self.read_u8(ptr) as u32;
             let hi = self.read_u8(Bus::add16_in_bank(ptr, 1)) as u32;
             let bank = self.dma_controller.channels[channel].dasb as u32;
-            let mut ch = &mut self.dma_controller.channels[channel];
+            let ch = &mut self.dma_controller.channels[channel];
             ch.hdma_indirect_addr = (bank << 16) | (hi << 8) | lo;
             // Advance table pointer past the 16-bit indirect address.
             ch.hdma_table_addr = Bus::add16_in_bank(ch.hdma_table_addr, 2);
@@ -4581,6 +4577,7 @@ impl Bus {
         // a small fingerprint and detect common off-by-one/latch issues.
         let trace_burnin_dma_mem = std::env::var_os("TRACE_BURNIN_DMA_MEMORY").is_some();
         #[derive(Clone, Copy)]
+        #[allow(dead_code)]
         struct BurninDmaSnap {
             pc: u32,
             frame: u64,
@@ -4841,7 +4838,6 @@ impl Bus {
         }
 
         // burn-in-test.sfc DMA MEMORY: capture the destination WRAM buffer before VRAM->WRAM DMA overwrites it.
-        let mut burnin_pre_wram_hash: Option<u64> = None;
         if trace_burnin_dma_mem
             && !cpu_to_ppu
             && channel == 7
@@ -4852,11 +4848,11 @@ impl Bus {
             && self.wram.len() >= 0x5000
         {
             let pre = &self.wram[0x4000..0x5000];
-            burnin_pre_wram_hash = Some(fnv1a64(pre));
+            let burnin_pre_wram_hash = fnv1a64(pre);
             println!(
                 "[BURNIN-DMAMEM] PREREAD-WRAM pc={:06X} hash={:016X}",
                 self.last_cpu_pc,
-                burnin_pre_wram_hash.unwrap()
+                burnin_pre_wram_hash
             );
         }
 

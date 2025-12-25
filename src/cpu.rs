@@ -418,6 +418,7 @@ impl Cpu {
                 u16,  // dp
                 bool, // emu
             ); 256] = [(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false); 256];
+            const RING_BUF_LEN: usize = 256;
             static mut RING_IDX: usize = 0;
             static mut RING_FILLED: bool = false;
 
@@ -430,7 +431,7 @@ impl Cpu {
                 // Peek opcode without advancing PC (safe for ROM/W-RAM)
                 let opcode = bus.read_u8(pc24);
                 unsafe {
-                    let idx = RING_IDX % RING_BUF.len();
+                    let idx = RING_IDX % RING_BUF_LEN;
                     RING_BUF[idx] = (
                         state_before.pb,
                         state_before.pc,
@@ -445,7 +446,7 @@ impl Cpu {
                         state_before.emulation_mode,
                     );
                     RING_IDX = RING_IDX.wrapping_add(1);
-                    if RING_IDX >= RING_BUF.len() {
+                    if RING_IDX >= RING_BUF_LEN {
                         RING_FILLED = true;
                     }
 
@@ -466,13 +467,9 @@ impl Cpu {
                         || dump_on_pc_hit
                         || (dump_ffff && (near_vector || near_zero))
                     {
-                        let count = if RING_FILLED {
-                            RING_BUF.len()
-                        } else {
-                            RING_IDX
-                        };
+                        let count = if RING_FILLED { RING_BUF_LEN } else { RING_IDX };
                         let start = if RING_FILLED {
-                            RING_IDX % RING_BUF.len()
+                            RING_IDX % RING_BUF_LEN
                         } else {
                             0
                         };
@@ -504,7 +501,7 @@ impl Cpu {
                                 );
                             }
                             for i in 0..count {
-                                let idx = (start + i) % RING_BUF.len();
+                                let idx = (start + i) % RING_BUF_LEN;
                                 let (pb, pc, op, a, x, y, sp, p, db, dp, emu) = RING_BUF[idx];
                                 println!(
                                     "[RING{:03}] {:02X}:{:04X} op={:02X} A={:04X} X={:04X} Y={:04X} SP={:04X} P={:02X} DB={:02X} DP={:04X} emu={}",

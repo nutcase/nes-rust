@@ -99,6 +99,7 @@ impl SnesController {
         self.buttons = buttons;
     }
 
+    #[allow(dead_code)]
     pub fn set_auto_buttons(&mut self, mask: u16) {
         self.auto_buttons = mask;
         // strobe High 時には shift_register を即更新するため、再ラッチしておく
@@ -108,6 +109,7 @@ impl SnesController {
     }
 
     // 現在のボタン状態を取得
+    #[allow(dead_code)]
     pub fn get_buttons(&self) -> u16 {
         self.buttons
     }
@@ -305,17 +307,21 @@ impl InputSystem {
         self.multitap_enabled
     }
 
+    #[allow(dead_code)]
     pub fn controller3_buttons(&self) -> u16 {
         self.controller3.get_buttons()
     }
+    #[allow(dead_code)]
     pub fn controller4_buttons(&self) -> u16 {
         self.controller4.get_buttons()
     }
 
+    #[allow(dead_code)]
     pub fn controller3_active_low(&self) -> u16 {
         self.controller3.active_low_bits()
     }
 
+    #[allow(dead_code)]
     pub fn controller4_active_low(&self) -> u16 {
         self.controller4.active_low_bits()
     }
@@ -392,6 +398,7 @@ struct ScriptedInputEvent {
 
 static SCRIPTED_INPUT: OnceLock<Option<Vec<ScriptedInputEvent>>> = OnceLock::new();
 
+#[allow(dead_code)]
 pub fn install_scripted_input_events(spec: &str) -> Result<(), String> {
     fn parse_buttons(spec: &str) -> u16 {
         spec.split(|c| c == ',' || c == '+' || c == '|')

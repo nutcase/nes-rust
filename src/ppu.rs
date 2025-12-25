@@ -159,6 +159,7 @@ pub struct Ppu {
     // STAT77 flags are sticky until end of VBlank.
     sprite_overflow_latched: bool,
     sprite_time_over_latched: bool,
+    #[allow(dead_code)]
     sprites_on_line_count: u8, // 現在のスキャンラインのスプライト数
 
     // スプライト関連
@@ -287,8 +288,11 @@ pub struct Ppu {
     line_sprites: Vec<SpriteData>,
     // Per-priority sprite indices for the current scanline (preserve OAM order)
     line_sprites_by_priority: [Vec<usize>; 4],
+    #[allow(dead_code)]
     sprite_tile_entry_counts: [u8; 256],
+    #[allow(dead_code)]
     sprite_tile_budget_remaining: i16,
+    #[allow(dead_code)]
     sprite_draw_disabled: bool,
     sprite_timeover_stop_x: u16, // when time-over triggers, tiles starting at >= stop_x are forbidden
 
@@ -458,6 +462,7 @@ impl Ppu {
         }
     }
     #[inline]
+    #[allow(dead_code)]
     fn fixed8_floor(val: i64) -> i32 {
         // Floor division by 256 for signed 8.8 fixed
         if val >= 0 {
@@ -3819,6 +3824,7 @@ impl Ppu {
         self.render_bg_mode5(x, y, 0, is_main)
     }
 
+    #[allow(dead_code)]
     fn apply_hires_enhancement(&self, color: u32) -> u32 {
         // 高解像度モード用の色調整（鮮明度向上）
         let r = ((color >> 16) & 0xFF) as u8;
@@ -3871,6 +3877,7 @@ impl Ppu {
     }
 
     // スキャンライン開始時のスプライト評価
+    #[allow(dead_code)]
     pub fn evaluate_sprites_for_scanline(&mut self, scanline: u16) {
         self.sprites_on_line_count = 0;
         self.sprite_overflow = false;
@@ -3950,6 +3957,7 @@ impl Ppu {
     }
 
     // スプライトステータス読み取り（デバッグ用）
+    #[allow(dead_code)]
     pub fn get_sprite_status(&self) -> u8 {
         let mut status = 0u8;
         if self.sprite_overflow {
@@ -5873,6 +5881,7 @@ impl Ppu {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn frame(&self) -> u64 {
         self.frame
     }
@@ -5896,11 +5905,13 @@ impl Ppu {
     }
 
     /// 現在のフレームバッファが全て黒（0x00FFFFFF=0）かどうか簡易判定
+    #[allow(dead_code)]
     pub fn framebuffer_is_all_black(&self) -> bool {
         self.framebuffer.iter().all(|&p| (p & 0x00FF_FFFF) == 0)
     }
 
     /// フレームバッファを指定色で塗りつぶす（強制フォールバック用）
+    #[allow(dead_code)]
     pub fn force_framebuffer_color(&mut self, color: u32) {
         // Fill both the present (front) and render (back) buffers so the forced color
         // remains visible even if the emulator overshoots a frame boundary and swaps.
@@ -5911,6 +5922,7 @@ impl Ppu {
     }
 
     /// デバッグ用: BG1 のタイルマップ／タイルベースアドレスを取得
+    #[allow(dead_code)]
     pub fn dbg_bg1_bases(&self) -> (u16, u16) {
         (self.bg1_tilemap_base, self.bg1_tile_base)
     }
@@ -6285,6 +6297,7 @@ impl Ppu {
     }
 
     // Consume time budget on first pixel of each 8px tile; disable OBJ for rest of line when exhausted
+    #[allow(dead_code)]
     fn update_obj_time_over_at_x(&mut self, x: u16) {
         // Time-over is evaluated per scanline in `prepare_line_obj_pipeline` above.
         // Keep this as a no-op for now (pixel-level gating is not implemented yet).
@@ -6869,10 +6882,7 @@ impl Ppu {
     fn get_main_bg_pixel(&mut self, x: u16, y: u16, enables: u8) -> (u32, u8, u8) {
         // Hot path: avoid per-pixel heap allocations.
 
-        let mut best_color: u32 = 0;
-        let mut best_pr: u8 = 0;
-        let mut best_id: u8 = 0;
-        let mut best_z: i16 = i16::MIN;
+        let mut best: Option<(u32, u8, u8, i16)> = None;
 
         // Keep ordering consistent with the previous max_by_key:
         // (z_rank_for_bg(layer, pr), layer_id)
@@ -6885,11 +6895,12 @@ impl Ppu {
                     let pr: u8 = $pr;
                     let id: u8 = $id;
                     let z = self.z_rank_for_bg(id, pr);
-                    if z > best_z || (z == best_z && id > best_id) {
-                        best_color = color;
-                        best_pr = pr;
-                        best_id = id;
-                        best_z = z;
+                    let replace = match best {
+                        None => true,
+                        Some((_, _, best_id, best_z)) => z > best_z || (z == best_z && id > best_id),
+                    };
+                    if replace {
+                        best = Some((color, pr, id, z));
                     }
                 }
             }};
@@ -7001,7 +7012,7 @@ impl Ppu {
             _ => {}
         }
 
-        if best_color != 0 {
+        if let Some((best_color, best_pr, best_id, _)) = best {
             (best_color, best_pr, best_id)
         } else {
             (0, 0, 0)
@@ -7077,10 +7088,7 @@ impl Ppu {
         // Hot path: avoid per-pixel heap allocations.
         let enables = self.sub_screen_designation;
 
-        let mut best_color: u32 = 0;
-        let mut best_pr: u8 = 0;
-        let mut best_id: u8 = 0;
-        let mut best_z: i16 = i16::MIN;
+        let mut best: Option<(u32, u8, u8, i16)> = None;
 
         // Keep ordering consistent with the previous max_by_key:
         // (z_rank_for_bg(layer, pr), layer_id)
@@ -7093,11 +7101,12 @@ impl Ppu {
                     let pr: u8 = $pr;
                     let id: u8 = $id;
                     let z = self.z_rank_for_bg(id, pr);
-                    if z > best_z || (z == best_z && id > best_id) {
-                        best_color = color;
-                        best_pr = pr;
-                        best_id = id;
-                        best_z = z;
+                    let replace = match best {
+                        None => true,
+                        Some((_, _, best_id, best_z)) => z > best_z || (z == best_z && id > best_id),
+                    };
+                    if replace {
+                        best = Some((color, pr, id, z));
                     }
                 }
             }};
@@ -7197,7 +7206,7 @@ impl Ppu {
             _ => {}
         }
 
-        if best_color != 0 {
+        if let Some((best_color, best_pr, best_id, _)) = best {
             (best_color, best_pr, best_id)
         } else {
             (0, 0, 0)
@@ -7205,6 +7214,7 @@ impl Ppu {
     }
 
     // サブスクリーン用スプライト描画（簡易版）
+    #[allow(dead_code)]
     fn get_sub_sprite_pixel(&self, x: u16, y: u16) -> (u32, u8) {
         let enabled = (self.sub_screen_designation & 0x10) != 0;
         self.get_sprite_pixel_common(x, y, enabled, false)
@@ -7496,6 +7506,7 @@ impl Ppu {
     }
 
     /// Count non-zero color entries in CGRAM (each color is 2 bytes)
+    #[allow(dead_code)]
     pub fn count_nonzero_colors(&self) -> usize {
         self.cgram
             .chunks_exact(2)
@@ -7532,6 +7543,7 @@ impl Ppu {
     }
 
     /// Write a 15-bit RGB color to CGRAM at the given color index
+    #[allow(dead_code)]
     pub fn write_cgram_color(&mut self, color_index: u8, rgb15: u16) {
         let offset = (color_index as usize) * 2;
         if offset + 1 < self.cgram.len() {
@@ -7541,6 +7553,7 @@ impl Ppu {
     }
 
     /// Write tilemap entry directly to VRAM (bypassing timing checks)
+    #[allow(dead_code)]
     pub fn write_vram_word(&mut self, word_addr: u16, low_byte: u8, high_byte: u8) {
         // VRAM is 32KB words; wrap addresses the way hardware mirrors the 15-bit address.
         let addr = (word_addr as usize) & 0x7FFF; // 15-bit

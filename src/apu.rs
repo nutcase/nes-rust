@@ -313,6 +313,7 @@ impl Apu {
     ///
     /// MDMAなどでS-CPUが止まっていても、実機ではAPUは独立して動作し続けるため、
     /// エミュレータ側でも「経過時間」ぶんだけSPC700/DSPを進める必要がある。
+    #[allow(dead_code)]
     pub fn step_master_cycles(&mut self, master_cycles: u64) {
         if master_cycles == 0 {
             return;
@@ -754,6 +755,7 @@ impl Apu {
     }
 
     // 旧ハンドシェイクAPI互換ダミー
+    #[allow(dead_code)]
     pub fn set_handshake_enabled(&mut self, _enabled: bool) {}
     pub fn handshake_state_str(&self) -> &'static str {
         match self.boot_state {
@@ -810,6 +812,7 @@ impl Apu {
     }
 
     /// 転送完了後にSPCプログラムを実行状態へ進める。
+    #[allow(dead_code)]
     fn finish_upload_and_start(&mut self) {
         // 実機IPL同様、完了時のACKは 0 を返す
         self.finish_upload_and_start_with_ack(0);

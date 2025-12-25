@@ -355,6 +355,7 @@ impl Sa1 {
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn is_ccdma_terminated(&self) -> bool {
         // Bit 7 of CCDMA control ($2231) is the DMA enable bit, not terminate
         // When bit 7 is set, CC-DMA should be enabled, not terminated
@@ -362,6 +363,7 @@ impl Sa1 {
         false // Never consider CC-DMA as "terminated" based on bit 7
     }
 
+    #[allow(dead_code)]
     pub(crate) fn reset_ccdma_state(&mut self) {
         self.registers.ccdma_pending = false;
         self.registers.ccdma_buffer_ready = false;
@@ -371,6 +373,7 @@ impl Sa1 {
         self.registers.brf_tile_offset = 0;
     }
 
+    #[allow(dead_code)]
     fn maybe_queue_ccdma(&mut self, reason: &str) {
         if !self.ccdma_enabled() {
             return;

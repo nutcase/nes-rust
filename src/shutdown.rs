@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);

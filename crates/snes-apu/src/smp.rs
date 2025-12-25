@@ -1268,7 +1268,6 @@ impl Smp {
                     0xfe => self.bne_y_dec(),
                     0xff => self.sleep_stop(),
 
-                    _ => panic!("Invalid opcode")
                 }
             } else {
                 self.cycles(2);

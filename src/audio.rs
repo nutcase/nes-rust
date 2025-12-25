@@ -67,7 +67,7 @@ pub struct SnesAudioSource {
 }
 
 impl SnesAudioSource {
-    pub fn new(ring: Arc<Mutex<AudioRing>>, sample_rate: u32, chunk_frames: usize) -> Self {
+    fn new(ring: Arc<Mutex<AudioRing>>, sample_rate: u32, chunk_frames: usize) -> Self {
         let channels = 2; // Stereo
 
         Self {

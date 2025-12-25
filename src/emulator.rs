@@ -199,6 +199,7 @@ impl PerformanceStats {
 
 const SCREEN_WIDTH: usize = 256;
 const SCREEN_HEIGHT: usize = 224;
+#[allow(dead_code)]
 const MASTER_CLOCK_NTSC: f64 = 21_477_272.0;
 // 実機は CPU:PPU=6:4（=3:2）。
 // ここでは「master clock からの分周」を使って CPUサイクル→PPUドット数へ変換する。
@@ -233,8 +234,10 @@ pub struct Emulator {
     audio_system: AudioSystem,
     present_every_auto: u64,
     // NMI handling
+    #[allow(dead_code)]
     nmi_triggered_this_flag: bool,
     debugger: Debugger,
+    #[allow(dead_code)]
     rom_title: String,
     black_screen_streak: u32,
     black_screen_reported: bool,
@@ -244,6 +247,7 @@ pub struct Emulator {
     srm_autosave_every: Option<u64>,
     srm_last_autosave_frame: u64,
     boot_fallback_applied: bool,
+    #[allow(dead_code)]
     palette_fallback_applied: bool,
 }
 
@@ -2362,6 +2366,7 @@ impl Emulator {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_nmi(&mut self) {
         self.cpu.trigger_nmi(&mut self.bus);
     }
@@ -3536,6 +3541,7 @@ impl Emulator {
     }
 
     /// Dump用: 現在の WRAM スナップショットを返す（ヘッドレス終了後などに利用）
+    #[allow(dead_code)]
     pub fn wram(&self) -> &[u8] {
         self.bus.wram()
     }
