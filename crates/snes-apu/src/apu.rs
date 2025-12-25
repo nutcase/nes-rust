@@ -167,6 +167,35 @@ impl Apu {
                 0xf4 ... 0xf7 => {
                     let idx = (address - 0xf4) as usize;
                     let v = self.cpu_to_apu_ports[idx];
+                    if std::env::var_os("TRACE_SFS_APU_F4_READ").is_some() {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static CNT: AtomicU32 = AtomicU32::new(0);
+                        let (pc, a, x, y, psw) = self
+                            .smp
+                            .as_ref()
+                            .map(|s| (s.reg_pc, s.reg_a, s.reg_x, s.reg_y, s.get_psw()))
+                            .unwrap_or((0, 0, 0, 0, 0));
+                        // Skip IPL-only noise so we can see post-upload port reads.
+                        if pc < 0xFFC0 {
+                            let n = CNT.fetch_add(1, Ordering::Relaxed);
+                            if n < 512 {
+                                println!(
+                                    "[SFS][SMP][F{:X}R] pc={:04X} A={:02X} X={:02X} Y={:02X} psw={:02X} -> {:02X} in=[{:02X} {:02X} {:02X} {:02X}]",
+                                    4 + idx,
+                                    pc,
+                                    a,
+                                    x,
+                                    y,
+                                    psw,
+                                    v,
+                                    self.cpu_to_apu_ports[0],
+                                    self.cpu_to_apu_ports[1],
+                                    self.cpu_to_apu_ports[2],
+                                    self.cpu_to_apu_ports[3]
+                                );
+                            }
+                        }
+                    }
                     if std::env::var_os("TRACE_BURNIN_APU_F4F7_READS").is_some() {
                         use std::sync::atomic::{AtomicU32, Ordering};
                         static CNT: AtomicU32 = AtomicU32::new(0);
@@ -193,6 +222,16 @@ impl Apu {
             self.ipl_rom[(address - 0xffc0) as usize]
         } else {
             self.ram[address as usize]
+        }
+    }
+
+    /// Debug-only peek: read RAM/IPL without side effects (no timers/ports).
+    pub(crate) fn peek_u8(&self, address: u16) -> u8 {
+        let address = address as usize & 0xFFFF;
+        if address >= 0xFFC0 && self.is_ipl_rom_enabled {
+            self.ipl_rom[address - 0xFFC0]
+        } else {
+            self.ram[address]
         }
     }
 
@@ -252,6 +291,22 @@ impl Apu {
                     let idx = (address - 0xf4) as usize;
                     let prev = self.apu_to_cpu_ports[idx];
                     self.apu_to_cpu_ports[idx] = value;
+                    if std::env::var_os("TRACE_BURNIN_APU_F4_WRITES").is_some()
+                        && address == 0x00f4
+                        && prev != value
+                    {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static CNT: AtomicU32 = AtomicU32::new(0);
+                        let n = CNT.fetch_add(1, Ordering::Relaxed);
+                        if n < 512 {
+                            let pc = self.smp.as_ref().map(|s| s.reg_pc).unwrap_or(0);
+                            let psw = self.smp.as_ref().map(|s| s.get_psw()).unwrap_or(0);
+                            println!(
+                                "[SMP][F4W] pc={:04X} psw={:02X} {:02X}->{:02X}",
+                                pc, psw, prev, value
+                            );
+                        }
+                    }
                     if std::env::var_os("TRACE_BURNIN_APU_F5_WRITES").is_some()
                         && address == 0x00f5
                         && prev != value
@@ -320,6 +375,38 @@ impl Apu {
                 _ => () // Do nothing
             }
         } else {
+            if std::env::var_os("TRACE_SFS_APU_VAR81").is_some()
+                && (address == 0x0081 || address == 0x0181)
+            {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static CNT: AtomicU32 = AtomicU32::new(0);
+                let n = CNT.fetch_add(1, Ordering::Relaxed);
+                if n < 256 {
+                    let pc = self.smp.as_ref().map(|s| s.reg_pc).unwrap_or(0);
+                    let psw = self.smp.as_ref().map(|s| s.get_psw()).unwrap_or(0);
+                    let prev = self.ram[address as usize];
+                    println!(
+                        "[SFS][SMP][VAR81] pc={:04X} psw={:02X} ${:04X} {:02X}->{:02X}",
+                        pc, psw, address, prev, value
+                    );
+                }
+            }
+            if std::env::var_os("TRACE_SFS_APU_VAR14").is_some()
+                && (address == 0x0014 || address == 0x0114)
+            {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static CNT: AtomicU32 = AtomicU32::new(0);
+                let n = CNT.fetch_add(1, Ordering::Relaxed);
+                if n < 256 {
+                    let pc = self.smp.as_ref().map(|s| s.reg_pc).unwrap_or(0);
+                    let psw = self.smp.as_ref().map(|s| s.get_psw()).unwrap_or(0);
+                    let prev = self.ram[address as usize];
+                    println!(
+                        "[SFS][SMP][VAR14] pc={:04X} psw={:02X} ${:04X} {:02X}->{:02X}",
+                        pc, psw, address, prev, value
+                    );
+                }
+            }
             if std::env::var_os("TRACE_BURNIN_APU_VAR2A").is_some()
                 && (address == 0x002A || address == 0x012A)
             {

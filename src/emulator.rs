@@ -215,7 +215,13 @@ pub struct Emulator {
     pending_stall_master_cycles: u64,
     // CPU->PPU 変換時の端数（master cycles を PPU_CLOCK_DIVIDER で割った余り; 0..PPU_CLOCK_DIVIDER-1）
     ppu_cycle_accum: u8,
-    last_frame_time: Instant,
+    // APU step batching: pending CPU cycles to apply to the APU.
+    apu_cycle_debt: u32,
+    // master->CPU conversion remainder for APU batching (0..CPU_CLOCK_DIVIDER-1)
+    apu_master_cycle_accum: u8,
+    apu_step_batch: u32,
+    apu_step_force: u32,
+    next_frame_time: Instant,
     target_frame_duration: Duration,
     rom_checksum: u32,
     frame_count: u64,
@@ -225,10 +231,13 @@ pub struct Emulator {
     adaptive_timing: bool,
     performance_stats: PerformanceStats,
     audio_system: AudioSystem,
+    present_every_auto: u64,
     // NMI handling
     nmi_triggered_this_flag: bool,
     debugger: Debugger,
     rom_title: String,
+    black_screen_streak: u32,
+    black_screen_reported: bool,
     headless: bool,
     headless_max_frames: u64,
     srm_path: Option<PathBuf>,
@@ -266,12 +275,6 @@ impl Emulator {
         if (crate::debug_flags::mapper() || crate::debug_flags::boot_verbose()) && !quiet {
             println!("Mapper: {:?}", cartridge.header.mapper_type);
         }
-        // DQ3専用: INIDISP への DMA/HDMA 書き込みを無視して強制ブランクを防ぐ
-        if cartridge.header.mapper_type == MapperType::DragonQuest3 {
-            let ppu = bus.get_ppu_mut();
-            ppu.set_block_inidisp(true);
-            ppu.set_force_display_override(true);
-        }
         let mut cpu = Cpu::new();
 
         // SNESのリセットベクターは0x00FFFCにある
@@ -307,29 +310,6 @@ impl Emulator {
 
         // Initialize stack area to prevent 0xFFFF values
         cpu.init_stack(&mut bus);
-
-        // DQ3: S-CPU Iフラグを最初からクリアしてSA-1 IRQを受けやすくする
-        {
-            let rom_title_up = display_title.to_ascii_uppercase();
-            let dq3_title = rom_title_up.contains("DRAGON QUEST III")
-                || rom_title_up.contains("DRAGONQUEST3")
-                || rom_title_up.contains("DRAGON QUEST3")
-                || rom_title_up.contains("DRAGONQUEST III");
-            if dq3_title {
-                let mut p = cpu.p;
-                p.remove(crate::cpu::StatusFlags::IRQ_DISABLE);
-                cpu.p = p;
-                cpu.core.state_mut().p = p;
-                if std::env::var_os("TRACE_DQ3_VECTORS").is_some() {
-                    let irq = bus.read_u16(0xFFEE);
-                    let nmi = bus.read_u16(0xFFEA);
-                    println!(
-                        "[DQ3] Vectors reset=0x{:04X} nmi=0x{:04X} irq=0x{:04X}",
-                        reset_vector, nmi, irq
-                    );
-                }
-            }
-        }
 
         // --- Optional override via env: FORCE_MAPPER=lorom|hirom|exhirom ---
         if let Ok(val) = std::env::var("FORCE_MAPPER") {
@@ -397,8 +377,11 @@ impl Emulator {
                 candidates.push(MapperType::ExHiRom);
             }
 
-            // Skip auto-correct for known special mappers
-            if matches!(current_mapper, MapperType::DragonQuest3) {
+            // Skip auto-correct for special mappers (non Lo/Hi/ExHiROM)
+            if !matches!(
+                current_mapper,
+                MapperType::LoRom | MapperType::HiRom | MapperType::ExHiRom
+            ) {
                 if !quiet {
                     println!(
                         "Mapper auto-correct skipped for special mapper: {:?}",
@@ -564,25 +547,6 @@ impl Emulator {
             asys
         };
 
-        // Mapper-specific compat: enable enhanced APU handshake by default for DQ3
-        if matches!(
-            bus.get_mapper_type(),
-            crate::cartridge::MapperType::DragonQuest3
-        ) {
-            let auto = std::env::var("APU_HANDSHAKE_AUTO")
-                .map(|v| v != "0" && v.to_lowercase() != "false")
-                .unwrap_or(true);
-            let forced = crate::debug_flags::apu_handshake_plus();
-            if auto || forced {
-                bus.with_apu_mut(|apu| {
-                    apu.set_handshake_enabled(true);
-                });
-                if !quiet {
-                    println!("APU: enhanced handshake shim enabled (mapper=DragonQuest3)");
-                }
-            }
-        }
-
         // Enable multitap via env (MULTITAP=1)
         let multitap = std::env::var("MULTITAP")
             .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -610,11 +574,21 @@ impl Emulator {
         let disable_skip_env = std::env::var("DISABLE_FRAME_SKIP")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
-        let max_frame_skip = std::env::var("MAX_FRAME_SKIP")
+        let max_frame_skip: u8 = std::env::var("MAX_FRAME_SKIP")
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .map(|v| v.min(10))
             .unwrap_or(2);
+        let apu_step_batch: u32 = std::env::var("APU_STEP_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(8);
+        let apu_step_force: u32 = std::env::var("APU_STEP_FORCE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2048);
         Ok(Emulator {
             cpu,
             bus,
@@ -623,7 +597,11 @@ impl Emulator {
             master_cycles: 0,
             pending_stall_master_cycles: 0,
             ppu_cycle_accum: 0,
-            last_frame_time: Instant::now(),
+            apu_cycle_debt: 0,
+            apu_master_cycle_accum: 0,
+            apu_step_batch,
+            apu_step_force,
+            next_frame_time: Instant::now() + target_frame_duration,
             target_frame_duration,
             rom_checksum,
             frame_count: 0,
@@ -632,9 +610,12 @@ impl Emulator {
             adaptive_timing: adaptive_timing_env && !disable_skip_env,
             performance_stats: PerformanceStats::new(),
             audio_system,
+            present_every_auto: 2,
             nmi_triggered_this_flag: false,
             debugger: Debugger::new(),
             rom_title,
+            black_screen_streak: 0,
+            black_screen_reported: false,
             headless: headless_final,
             headless_max_frames,
             srm_path,
@@ -672,7 +653,6 @@ impl Emulator {
             }
         }
 
-        let is_dq3 = self.is_dq3_title();
         let headless_fast_render = std::env::var("HEADLESS_FAST_RENDER")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
@@ -683,6 +663,13 @@ impl Emulator {
         let headless_fast_render_from = self
             .headless_max_frames
             .saturating_sub(headless_fast_render_last.max(1));
+        let present_every_env: Option<u64> = std::env::var("PRESENT_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0);
+        let auto_present = std::env::var("AUTO_PRESENT")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
 
         if self.headless {
             if !quiet {
@@ -700,13 +687,6 @@ impl Emulator {
                         .get_ppu_mut()
                         .set_framebuffer_rendering_enabled(enable);
                 }
-                if is_dq3 && self.frame_count == 0 {
-                    self.fix_dragon_quest_initialization();
-                }
-                // DQ3専用: フレーム冒頭でも強制表示設定を適用（モード/マップ上書き）
-                if is_dq3 {
-                    self.maybe_force_display_dq3();
-                }
                 if std::env::var("MODE7_TEST")
                     .map(|v| v == "1" || v.to_lowercase() == "true")
                     .unwrap_or(false)
@@ -714,10 +694,6 @@ impl Emulator {
                     self.run_mode7_diag_frame();
                 } else {
                     self.run_frame();
-                }
-                // Headlessでもフレーム末に強制表示フォールバックを再適用し、ゲーム側が上書きしたモード/INIDISPを戻す
-                if is_dq3 {
-                    self.maybe_force_display_dq3();
                 }
                 // Headlessでもレンダーパイプを通し、フォールバック描画/テストパターンを反映させる。
                 // ただし HEADLESS_FAST_RENDER=1 の場合は、最後の数フレームのみ描画して高速化する。
@@ -731,23 +707,6 @@ impl Emulator {
                 }
                 // Periodic minimal palette injection to ensure visibility until game loads CGRAM
                 self.maybe_inject_min_palette_periodic();
-                // DQ3-specific: Inject palette if CGRAM is empty
-                self.maybe_inject_palette_fallback();
-                // DQ3-specific: Inject tilemap if BG3 tilemap is empty
-                self.maybe_inject_tilemap_fallback();
-                // DQ3: それでも画面が真っ黒ならフレームバッファを強制的に白で塗る最後の砦
-                // 確認・デバッグ用に DQ3_LAST_RESORT=0 で無効化できるようにする
-                let last_resort = std::env::var("DQ3_LAST_RESORT")
-                    .map(|v| v != "0" && v.to_lowercase() != "false")
-                    .unwrap_or(true);
-                if is_dq3 && last_resort && self.bus.get_ppu().framebuffer_is_all_black() {
-                    if !crate::debug_flags::quiet() {
-                        println!("[DQ3] framebuffer all black → applying last-resort white fill (disable via DQ3_LAST_RESORT=0)");
-                    }
-                    self.bus
-                        .get_ppu_mut()
-                        .force_framebuffer_color(0xFF_FF_FF_FF);
-                }
                 // Debug: periodically dump CPU PC/PB to identify headless stalls (HEADLESS_PC_DUMP=1)
                 if std::env::var_os("HEADLESS_PC_DUMP").is_some() && self.frame_count % 120 == 0 {
                     let cpu = self.cpu.core.state();
@@ -771,13 +730,6 @@ impl Emulator {
                         ppu.is_vblank(),
                         wram_flag
                     );
-                }
-                // Debug: headlessでもフレームバッファテストパターンを適用（DQ3_FB_TEST=1）
-                if std::env::var("DQ3_FB_TEST")
-                    .map(|v| v == "1" || v.to_lowercase() == "true")
-                    .unwrap_or(false)
-                {
-                    self.debug_fill_framebuffer();
                 }
                 let frame_time = frame_start.elapsed();
                 self.performance_stats.update(frame_time);
@@ -1173,16 +1125,9 @@ impl Emulator {
                 && self.frame_skip_count < self.max_frame_skip
                 && self.performance_stats.should_skip_frame(60.0);
 
-            // Dragon Quest III title screen fix: avoid frame skip only for DQ3 (others can skip if slow)
-            let force_render_for_title_screen = if is_dq3 {
-                std::env::var("DQ3_FORCE_RENDER")
-                    .map(|v| v == "1" || v.to_lowercase() == "true")
-                    .unwrap_or(true)
-            } else {
-                std::env::var("FORCE_RENDER_ALL")
-                    .map(|v| v == "1" || v.to_lowercase() == "true")
-                    .unwrap_or(false)
-            };
+            let force_render_for_title_screen = std::env::var("FORCE_RENDER_ALL")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false);
             let final_should_skip = should_skip_frame && !force_render_for_title_screen;
 
             if crate::debug_flags::render_verbose() {
@@ -1200,28 +1145,87 @@ impl Emulator {
             if final_should_skip {
                 self.frame_skip_count += 1;
                 self.performance_stats.dropped_frames += 1;
-                println!("🎬 SKIPPING FRAME: skip_count={}", self.frame_skip_count);
+                if crate::debug_flags::render_verbose() && !crate::debug_flags::quiet() {
+                    println!("🎬 SKIPPING FRAME: skip_count={}", self.frame_skip_count);
+                }
             } else {
                 self.frame_skip_count = 0;
             }
 
-            // Always run emulation logic
-            self.run_frame();
-
-            // Only render if not skipping frame
-            if !final_should_skip {
-                self.render();
+            // Present/render cadence control (screen update can be expensive).
+            let mut present_every = present_every_env.unwrap_or(2);
+            if present_every_env.is_none() && auto_present {
+                let fps = self.performance_stats.fps;
+                let current = self.present_every_auto;
+                let next = match current {
+                    2 => {
+                        if fps < 43.0 {
+                            3
+                        } else {
+                            2
+                        }
+                    }
+                    3 => {
+                        if fps < 33.0 {
+                            4
+                        } else if fps > 50.0 {
+                            2
+                        } else {
+                            3
+                        }
+                    }
+                    4 => {
+                        if fps > 40.0 {
+                            3
+                        } else {
+                            4
+                        }
+                    }
+                    _ => 2,
+                };
+                if next != current {
+                    self.present_every_auto = next;
+                    if !crate::debug_flags::quiet() {
+                        println!(
+                            "AUTO_PRESENT: fps={:.1} -> present_every={}",
+                            fps, self.present_every_auto
+                        );
+                    }
+                }
+                present_every = self.present_every_auto.max(1);
             }
 
+            let should_present = !final_should_skip
+                && (present_every == 1 || (self.frame_count % present_every == 0));
+
+            // Disable per-dot framebuffer rendering when we are not presenting to save time.
+            if self.bus.get_ppu().framebuffer_rendering_enabled() != should_present {
+                self.bus
+                    .get_ppu_mut()
+                    .set_framebuffer_rendering_enabled(should_present);
+            }
+
+            // Pump input/events early so auto-joypad reads see the current state.
             self.handle_input();
             self.handle_save_states();
             self.handle_debugger_input();
 
+            // Always run emulation logic
+            self.run_frame();
+
+            // Only render/present when scheduled
+            if should_present {
+                self.render();
+            }
+
             let frame_time = frame_start.elapsed();
             self.performance_stats.update(frame_time);
 
-            if !should_skip_frame {
-                self.sync_frame_rate();
+            if !self.headless {
+                // Keep audio playback stable even when frames are skipped.
+                if self.audio_system.is_enabled() || !should_skip_frame {
+                    self.sync_frame_rate();
+                }
             }
 
             self.frame_count += 1;
@@ -1242,18 +1246,8 @@ impl Emulator {
             self.maybe_auto_unblank();
             // Optional hard override: force unblank between configured frames regardless of heuristics
             self.maybe_force_unblank();
-            // DQ3専用: フレーム末で強制表示を維持（INIDISPを上書き）
-            self.maybe_force_display_dq3();
             // Periodic minimal palette injection in windowed mode too
             self.maybe_inject_min_palette_periodic();
-            // DQ3-specific: Inject palette if CGRAM is empty
-            self.maybe_inject_palette_fallback();
-            // DQ3-specific: Inject tilemap if BG3 tilemap is empty
-            self.maybe_inject_tilemap_fallback();
-            // DQ3-specific: set BW-RAM ready flag for S-CPU polling (hack)
-            if std::env::var_os("DQ3_BWRAM_READY_HACK").is_some() {
-                self.bus.dq3_bwram_set_ready();
-            }
 
             // Optional visual fallback: draw PPU test pattern if still nothing visible by a threshold
             if std::env::var("BOOT_TEST_PATTERN")
@@ -1300,31 +1294,7 @@ impl Emulator {
         let env_enabled = std::env::var("BOOT_FORCE_UNBLANK")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
-        let rom_up = self.rom_title.to_ascii_uppercase();
-        // Improved DQ3 detection: check for common Japanese title variants
-        let dq3_auto = rom_up.contains("DRAGON QUEST III")
-            || rom_up.contains("DRAGONQUEST3")
-            || rom_up.contains("DRAGON QUEST3")
-            || rom_up.contains("DRAGONQUEST III")
-            || rom_up.contains("DQ3")
-            || rom_up.contains("III")  // Japanese titles often contain just "III"
-            || self.is_dq3_title()
-            || matches!(self.bus.get_mapper_type(), crate::cartridge::MapperType::DragonQuest3);
-
-        static mut DQ3_DETECTED: bool = false;
-        unsafe {
-            if dq3_auto && !DQ3_DETECTED {
-                DQ3_DETECTED = true;
-                println!(
-                    "🎮 DQ3 detected: '{}' - auto-unblank enabled",
-                    self.rom_title
-                );
-            }
-        }
-
-        // NOTE: Avoid game-agnostic auto overrides by default.
-        // For non-DQ3 titles, enable explicitly via BOOT_FORCE_UNBLANK=1.
-        if !env_enabled && !dq3_auto {
+        if !env_enabled {
             return;
         }
 
@@ -1332,20 +1302,14 @@ impl Emulator {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
-        let (from, to) = if env_enabled {
-            let from: u64 = std::env::var("BOOT_FORCE_UNBLANK_FROM")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(50); // Start earlier (was 90)
-            let to: u64 = std::env::var("BOOT_FORCE_UNBLANK_TO")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000); // Extended range (was 600)
-            (from, to)
-        } else {
-            // DQ3/SMW auto mode: wider frame window to catch various boot patterns
-            (50, 1000)
-        };
+        let from: u64 = std::env::var("BOOT_FORCE_UNBLANK_FROM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50); // Start earlier (was 90)
+        let to: u64 = std::env::var("BOOT_FORCE_UNBLANK_TO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000); // Extended range (was 600)
 
         if self.frame_count < from || self.frame_count > to {
             return;
@@ -1368,7 +1332,7 @@ impl Emulator {
         }
 
         let ppu = self.bus.get_ppu_mut();
-        if crate::debug_flags::boot_verbose() || crate::debug_flags::compat() || dq3_auto {
+        if crate::debug_flags::boot_verbose() || crate::debug_flags::compat() {
             println!(
                 "🔆 FORCE-UNBLANK: frame={} (imp={} VRAM L/H={}/{} CGRAM={} OAM={})",
                 self.frame_count, imp, vwl, vwh, cg, oam
@@ -1408,155 +1372,6 @@ impl Emulator {
         }
     }
 
-    /// DQ3専用: CPUがINIDISP=0x80を書き戻してもフレーム終端で必ず表示ONにする
-    /// 環境変数 DQ3_FORCE_DISPLAY=1 で有効（デフォルト: 無効）
-    fn maybe_force_display_dq3(&mut self) {
-        // デフォルトで有効（DQ3は初期化中ずっとINIDISP=0x80をDMAで書き続けるため）。
-        // 明示的に無効化したい場合は DQ3_FORCE_DISPLAY=0 を指定する。
-        let enabled = std::env::var("DQ3_FORCE_DISPLAY")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(true);
-        if !enabled {
-            return;
-        }
-        if !self.is_dq3_title() {
-            return;
-        }
-        // フレーム終端で強制的に表示ON＋輝度最大に戻す
-        let ppu = self.bus.get_ppu_mut();
-        ppu.screen_display = 0x0F; // brightness=15, forced_blank=0
-        ppu.brightness = 0x0F;
-        // TMを最低限BG1オンにしておく
-        ppu.write(0x2C, 0x01);
-
-        // 簡易フォールバック描画: モード0 + BG1タイル/マップを安全な別領域に固定し、毎フレーム上書き
-        ppu.write(0x05, 0x00); // mode 0
-        ppu.write(0x07, 0x10); // BG1 map base = 0x1000 (bits2-7 store base/0x400)
-        ppu.write(0x0B, 0x02); // BG1 tile base = 0x2000 (0x02*0x1000)
-
-        // Build a simple 4bpp tile #1 (color index 1) at tile base 0x2000
-        let tile_base_words = 0x2000 / 2; // word address
-        for row in 0..8 {
-            let addr = tile_base_words + row;
-            ppu.write_vram_word(addr as u16, 0xFF, 0x00); // plane0=1s -> color index 1
-        }
-        // Fill BG1 tilemap 32x32 (1024 entries) at map base 0x1000 with tile #1, palette 0
-        let map_base_words = 0x1000 / 2;
-        for entry in 0..1024 {
-            ppu.write_vram_word((map_base_words + entry) as u16, 0x01, 0x00);
-        }
-
-        // パレット4色を毎フレーム固定で書き戻し（ゲーム側が0を入れていても視認できるようにする）
-        ppu.write(0x21, 0x00); // CGADD=0
-                               // Color0: black
-        ppu.write(0x22, 0x00);
-        ppu.write(0x22, 0x00);
-        // Color1: white
-        ppu.write(0x22, 0xFF);
-        ppu.write(0x22, 0x7F);
-        // Color2: blue
-        ppu.write(0x22, 0x00);
-        ppu.write(0x22, 0x7C);
-        // Color3: red
-        ppu.write(0x22, 0x1F);
-        ppu.write(0x22, 0x00);
-
-        // 初回フレームだけ適用確認ログを出す（QUIETでも表示）
-        if self.frame_count < 2 {
-            let (bg1_map, bg1_tile) = ppu.dbg_bg1_bases();
-            println!(
-                "[DQ3] force_display fallback applied (frame {}) [mode0 map=0x{:04X} tile=0x{:04X}]",
-                self.frame_count, bg1_map, bg1_tile
-            );
-            // 簡易ダンプでVRAMが埋まっているか確認
-            let v = ppu.get_vram();
-            let map_start = (map_base_words * 2) as usize;
-            let tile_start = (tile_base_words * 2) as usize;
-            let map_slice = &v[map_start..map_start + 32.min(v.len() - map_start)];
-            let tile_slice = &v[tile_start..tile_start + 16.min(v.len() - tile_start)];
-            println!(
-                "[DQ3] VRAM map[0..32] {:?}\n[DQ3] VRAM tile[0..16] {:?}",
-                map_slice, tile_slice
-            );
-        }
-
-        // レンダラ側が何らかの理由でBGを描けない場合に備え、フレームバッファを直接白で塗る緊急フォールバック
-        ppu.force_framebuffer_color(0xFFFFFFFF); // opaque white
-    }
-
-    /// DQ3初期化支援: 早期フレームでNMITIMENのIRQビットを強制ON（デフォルト: 有効）
-    /// 環境変数 DQ3_FORCE_IRQ_ENABLE=0 で無効化。DQ3_FORCE_IRQ_FRAMES=N で適用フレーム数を調整。
-    fn maybe_force_irq_enable_dq3(&mut self, frame_count: u32) {
-        if !self.is_dq3_title() {
-            return;
-        }
-        let enabled = std::env::var("DQ3_FORCE_IRQ_ENABLE")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(true);
-        if !enabled {
-            return;
-        }
-        let limit: u32 = std::env::var("DQ3_FORCE_IRQ_FRAMES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(180);
-        if frame_count > limit {
-            return;
-        }
-        // $4200 bit5/4: V/H timer IRQ enable
-        let current = self.bus.nmitimen();
-        let desired = current | 0x30;
-        if desired != current {
-            self.bus.write_u8(0x4200, desired);
-            if std::env::var_os("DEBUG_DQ3_IRQ").is_some()
-                || (!crate::debug_flags::quiet() && frame_count <= 4)
-            {
-                println!(
-                    "[DQ3] Auto-enable IRQ at frame {}: NMITIMEN 0x{:02X} -> 0x{:02X}",
-                    frame_count, current, desired
-                );
-            }
-        }
-    }
-
-    /// Debug: fill framebuffer directly with a simple pattern to verify render path.
-    fn debug_fill_framebuffer(&mut self) {
-        if std::env::var("DQ3_FB_TEST")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false)
-        {
-            let fb = self.bus.get_ppu_mut().get_framebuffer_mut();
-            let w: usize = SCREEN_WIDTH;
-            let h: usize = SCREEN_HEIGHT;
-            for y in 0..h {
-                for x in 0..w {
-                    let idx = y * w + x;
-                    if idx >= fb.len() {
-                        break;
-                    }
-                    // simple gradient pattern
-                    let r = ((x ^ y) & 0xFF) as u32;
-                    let g = ((x + y) & 0xFF) as u32;
-                    let b = ((x.wrapping_mul(3) ^ y.wrapping_mul(5)) & 0xFF) as u32;
-                    fb[idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
-                }
-            }
-            // 一度だけパターン適用後の非ブラック数を出力
-            static mut FBTEST_LOGGED: bool = false;
-            unsafe {
-                if !FBTEST_LOGGED {
-                    FBTEST_LOGGED = true;
-                    let non_black = fb.iter().filter(|&&px| px != 0xFF000000).count();
-                    println!(
-                        "DQ3_FB_TEST: painted pattern -> non_black_pixels={} len={}",
-                        non_black,
-                        fb.len()
-                    );
-                }
-            }
-        }
-    }
-
     fn save_sram_if_dirty(&mut self) {
         let no_sram_save = std::env::var("NO_SRAM_SAVE")
             .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -1578,19 +1393,6 @@ impl Emulator {
                 }
             }
         }
-    }
-
-    #[inline]
-    fn is_dq3_title(&self) -> bool {
-        let up = self.rom_title.to_ascii_uppercase();
-        up.contains("DRAGON QUEST III")
-            || up.contains("DRAGONQUEST3")
-            || up.contains("DRAGON QUEST3")
-            || up.contains("DRAGONQUEST III")
-            || matches!(
-                self.bus.get_mapper_type(),
-                crate::cartridge::MapperType::DragonQuest3
-            )
     }
 
     fn maybe_autosave_sram(&mut self) {
@@ -1684,7 +1486,7 @@ impl Emulator {
         }
 
         // Also require that the game touched OAM a bit (sprites prepped), but keep this lenient
-        // Keep permissive: allow unblank even if framebuffer is still black (DQ3 boots with late CGRAM)
+        // Keep permissive: allow unblank even if framebuffer is still black
         if oam == 0 && non_black_pixels == 0 && self.frame_count < third {
             return;
         }
@@ -1725,141 +1527,6 @@ impl Emulator {
             ppu_mut.write(0x22, 0x03);
         }
         self.boot_fallback_applied = true;
-    }
-
-    /// Inject minimal palette if CGRAM is empty (DQ3 fallback)
-    fn maybe_inject_palette_fallback(&mut self) {
-        if self.palette_fallback_applied {
-            return; // Already applied once
-        }
-
-        let dq3_auto = self.is_dq3_title()
-            || matches!(
-                self.bus.get_mapper_type(),
-                crate::cartridge::MapperType::DragonQuest3
-            );
-        if !dq3_auto {
-            return; // Only for DQ3
-        }
-
-        // Check if we should inject palette (only check at frames 150-500)
-        if self.frame_count < 150 || self.frame_count > 500 {
-            return;
-        }
-
-        // Count non-zero CGRAM entries
-        let ppu = self.bus.get_ppu();
-        let cgram_colors = ppu.count_nonzero_colors();
-
-        if cgram_colors > 10 {
-            if !crate::debug_flags::quiet() {
-                println!(
-                    "ℹ️  CGRAM has {} non-zero colors, skipping palette injection",
-                    cgram_colors
-                );
-            }
-            self.palette_fallback_applied = true; // Mark as checked
-            return; // CGRAM has data, don't inject
-        }
-
-        if !crate::debug_flags::quiet() {
-            println!(
-                "⚠️  CGRAM is empty at frame {}, injecting minimal palette",
-                self.frame_count
-            );
-        }
-
-        let ppu_mut = self.bus.get_ppu_mut();
-
-        // Inject a basic 16-color palette directly (bypassing timing checks)
-        // SNES RGB15 format: 0bbbbbgg gggrrrrr (5 bits per channel)
-
-        ppu_mut.write_cgram_color(0, 0x0000); // Black
-        ppu_mut.write_cgram_color(1, 0x7FFF); // White
-        ppu_mut.write_cgram_color(2, 0x001F); // Red
-        ppu_mut.write_cgram_color(3, 0x03E0); // Green
-        ppu_mut.write_cgram_color(4, 0x7C00); // Blue
-        ppu_mut.write_cgram_color(5, 0x03FF); // Yellow (Red + Green)
-        ppu_mut.write_cgram_color(6, 0x7FE0); // Cyan (Green + Blue)
-        ppu_mut.write_cgram_color(7, 0x7C1F); // Magenta (Red + Blue)
-
-        // Colors 8-15: Shades of gray
-        for i in 0..8 {
-            let intensity = (i * 4) as u16; // 0, 4, 8, 12, 16, 20, 24, 28
-            let gray = (intensity << 0) | (intensity << 5) | (intensity << 10);
-            ppu_mut.write_cgram_color(8 + i, gray);
-        }
-
-        if !crate::debug_flags::quiet() {
-            println!("✅ Injected 16-color minimal palette");
-
-            // Verify the palette was written
-            let ppu = self.bus.get_ppu();
-            println!("   Verifying CGRAM:");
-            for i in 0..4 {
-                let colors = ppu.dump_cgram_head(16);
-                if i < colors.len() {
-                    println!("   Color {}: 0x{:04X}", i, colors[i]);
-                }
-            }
-        }
-
-        self.palette_fallback_applied = true;
-    }
-
-    /// Inject test tilemap if BG3 tilemap is empty
-    fn maybe_inject_tilemap_fallback(&mut self) {
-        static mut TILEMAP_INJECTED: bool = false;
-
-        unsafe {
-            if TILEMAP_INJECTED {
-                return;
-            }
-        }
-
-        let dq3_auto = self.is_dq3_title();
-        if !dq3_auto {
-            return;
-        }
-
-        // Check from frame 150 to 500
-        if self.frame_count < 150 || self.frame_count > 500 {
-            return;
-        }
-
-        // EXPERIMENTAL: Inject tilemap if BG3 tilemap is empty
-        let main_tm = self.bus.get_ppu().get_main_screen_designation();
-        if (main_tm & 0x04) != 0 {
-            // BG3 enabled
-            let (_, map_base, _, _) = self.bus.get_ppu().get_bg_config(3);
-            let (map_nonzero, _) = self.bus.get_ppu().analyze_vram_region(map_base, 64);
-
-            if map_nonzero == 0 {
-                if !crate::debug_flags::quiet() {
-                    println!(
-                        "⚠️  BG3 tilemap @ 0x{:04X} is empty at frame {}, injecting test pattern",
-                        map_base, self.frame_count
-                    );
-                }
-
-                // Write simple tilemap pattern: tile IDs 0-15 repeating
-                let ppu_mut = self.bus.get_ppu_mut();
-                for i in 0..512 {
-                    let tile_id = (i % 16) as u8;
-                    let word_addr = map_base + i;
-                    // Write tile ID (low byte) and attributes (palette 0 for fallback visibility)
-                    ppu_mut.write_vram_word(word_addr, tile_id, 0x00);
-                }
-
-                if !crate::debug_flags::quiet() {
-                    println!("✅ Injected test tilemap (512 entries)");
-                }
-
-                unsafe {
-                    TILEMAP_INJECTED = true;
-                }
-            }
-        }
     }
 
     fn run_frame(&mut self) {
@@ -1913,8 +1580,6 @@ impl Emulator {
                 (self.cpu.p.bits() & 0x04) != 0
             );
         }
-        let dq3_auto = self.is_dq3_title();
-
         // Debug: S-CPU P/Iフラグを冒頭で確認
         if std::env::var_os("DEBUG_CPU_FLAGS").is_some() && frame_count <= 8 {
             println!(
@@ -1926,16 +1591,6 @@ impl Emulator {
                 (self.cpu.p.bits() & 0x04) != 0
             );
         }
-
-        // DQ3自動モード: 初期フレームでIRQ許可にしてSA-1からのIRQを通す
-        if dq3_auto && frame_count <= 120 {
-            let mut p = self.cpu.p;
-            p.remove(crate::cpu::StatusFlags::IRQ_DISABLE);
-            self.cpu.p = p;
-            self.cpu.core.state_mut().p = p;
-        }
-        // DQ3自動モード: 早期フレームでNMITIMENのIRQビット(タイマー)を立ててIRQラインを起こしやすくする
-        self.maybe_force_irq_enable_dq3(frame_count);
 
         // Debug hack: force clear I-flag on early frames if requested (env FORCE_CLI_FRAMES=N)
         if let Some(n) = std::env::var("FORCE_CLI_FRAMES")
@@ -1956,109 +1611,10 @@ impl Emulator {
             }
         }
 
-        // SA-1 initialization support: Delay NMI until SA-1 is properly initialized
-        // This prevents S-CPU from being stuck in NMI handler loop before SA-1 setup
-        unsafe {
-            static mut NMI_DELAY_UNTIL: u32 = 0;
-            if frame_count == 1 && dq3_auto && self.bus.is_sa1_active() {
-                // Optional: force-start SA-1 for DQ3 if requested
-                if crate::debug_flags::dq3_force_sa1_boot() {
-                    self.bus.force_sa1_boot();
-                }
-
-                NMI_DELAY_UNTIL = std::env::var("SA1_NMI_DELAY_FRAMES")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1); // Default: delay NMI for 1 frame (short as possible)
-                let delay_frames = NMI_DELAY_UNTIL;
-                if delay_frames > 0 && !crate::debug_flags::quiet() {
-                    println!("ℹ️  SA-1 NMI delay: Disabling NMI for first {} frames to allow SA-1 initialization", delay_frames);
-                }
-                self.bus.sa1_nmi_delay_active = delay_frames > 0;
-
-                // Force disable NMI at start by directly clearing PPU NMI enable
-                self.bus.get_ppu_mut().nmi_enabled = false;
-                if std::env::var_os("DEBUG_SA1_SCHEDULER").is_some() {
-                    println!("SA-1 NMI delay: Forced PPU NMI disable at frame 1");
-                }
-            }
-
-            if frame_count <= NMI_DELAY_UNTIL && dq3_auto && self.bus.is_sa1_active() {
-                // Continuously suppress NMI and IRQ during delay period
-                self.bus.get_ppu_mut().nmi_enabled = false;
-                self.bus.get_ppu_mut().nmi_flag = false;
-                self.bus.force_disable_irq();
-
-                if frame_count % 20 == 0 && std::env::var_os("DEBUG_SA1_SCHEDULER").is_some() {
-                    let pc = self.cpu.pc;
-                    let pb = self.cpu.pb;
-                    let p_flags = self.cpu.p.bits();
-                    let i_flag = (p_flags & 0x04) != 0;
-                    let delay_limit = NMI_DELAY_UNTIL;
-                    println!(
-                        "SA-1 NMI delay: frame {} / {}, S-CPU PC=${:02X}:{:04X} P=0x{:02X} I={}",
-                        frame_count, delay_limit, pb, pc, p_flags, i_flag
-                    );
-                }
-
-                // Log PC transitions for first few frames
-                if frame_count <= 5 && std::env::var_os("TRACE_DQ3_BOOT").is_some() {
-                    static mut LAST_PC: u32 = 0;
-                    let current_pc = ((self.cpu.pb as u32) << 16) | (self.cpu.pc as u32);
-                    if current_pc != LAST_PC {
-                        println!("S-CPU PC: ${:02X}:{:04X}", self.cpu.pb, self.cpu.pc);
-                        LAST_PC = current_pc;
-                    }
-                }
-                // Clear any pending NMI flag by reading $4210
-                let _ = self.bus.read_u8(0x4210);
-            } else if frame_count == NMI_DELAY_UNTIL + 1 && NMI_DELAY_UNTIL > 0 {
-                self.bus.sa1_nmi_delay_active = false;
-                let pc = self.cpu.pc;
-                let pb = self.cpu.pb;
-                if !crate::debug_flags::quiet() {
-                    println!("ℹ️  SA-1 NMI delay ended at frame {}, NMI now allowed, S-CPU PC=${:02X}:{:04X}",
-                        frame_count, pb, pc);
-                }
-            }
-        }
-
-        unsafe {
-            // Legacy Dragon Quest III initialization hack - DISABLED BY DEFAULT
-            // This hack is now replaced by improved SA-1 emulation.
-            // To re-enable the old hack behavior, set DQ3_HACK=1 environment variable.
-            static mut DQ3_HACK_ON: i32 = -1; // -1: unset, 0: off, 1: on
-            if DQ3_HACK_ON < 0 {
-                if frame_count <= 1 && !crate::debug_flags::quiet() {
-                    println!("ROM title detected: '{}'", self.rom_title);
-                }
-                DQ3_HACK_ON = match std::env::var("DQ3_HACK") {
-                    Ok(v) if v == "1" || v.to_lowercase() == "true" => 1,
-                    Ok(v) if v == "0" || v.to_lowercase() == "false" => 0,
-                    _ => 0, // Default: OFF (changed from auto-detect to always off)
-                };
-                if DQ3_HACK_ON == 1 {
-                    println!("⚠️  Legacy DQ3_HACK enabled via environment variable");
-                    println!("   This is deprecated - relying on SA-1 improvements instead");
-                }
-            }
-            if DQ3_HACK_ON == 1 {
-                if frame_count == 2
-                    || frame_count == 5
-                    || frame_count == 10
-                    || frame_count == 20
-                    || frame_count % 50 == 0
-                {
-                    println!("=== DRAGON QUEST III FIX AT FRAME {} ===", frame_count);
-                    self.fix_dragon_quest_initialization();
-                }
-            }
-
-            // Debug: Show frame progress every 5 frames
-            if frame_count % 5 == 0 && frame_count > 2 {
-                if crate::debug_flags::render_verbose() {
-                    println!("Frame progress: {}/10", frame_count);
-                }
+        // Debug: Show frame progress every 5 frames
+        if frame_count % 5 == 0 && frame_count > 2 {
+            if crate::debug_flags::render_verbose() {
+                println!("Frame progress: {}/10", frame_count);
             }
         }
 
@@ -2066,11 +1622,10 @@ impl Emulator {
         let mut loop_iterations = 0u64;
         // ループ検出の許容回数を環境変数で調整できるようにする。
         // ・初期フレーム(<=3): 5,000,000（VBlank待ちなどで多少重くても落とさない）
-        // ・重いトレース有効時: 50,000,000 まで許容（WATCH_PC/TRACE_4210/TRACE_4218/TRACE_BRANCH など）
+        // ・重いトレース有効時: 50,000,000 まで許容（WATCH_PC/TRACE_4210/TRACE_BRANCH など）
         // ・通常: 1,000,000
         // LOOP_GUARD_MAX を指定するとその値を上書きする（デバッグ用）。
         let tracing_heavy = std::env::var_os("TRACE_4210").is_some()
-            || std::env::var_os("TRACE_4218").is_some()
             || std::env::var_os("WATCH_PC").is_some()
             || std::env::var_os("WATCH_PC_FLOW").is_some()
             || std::env::var_os("TRACE_BRANCH").is_some();
@@ -2131,25 +1686,6 @@ impl Emulator {
         let smw_force_bbaa = std::env::var("SMW_FORCE_BBAA")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
-
-        // DQ3 debug/hack toggles (cache env reads to avoid per-instruction overhead).
-        let dq3_force_vector = dq3_auto
-            && std::env::var("DQ3_FORCE_VECTOR")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false);
-        let dq3_force_vector_always = dq3_auto
-            && std::env::var("DQ3_FORCE_VECTOR_ALWAYS")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false);
-        let dq3_force_vector_use_nmi = (dq3_force_vector || dq3_force_vector_always)
-            && std::env::var("DQ3_FORCE_VECTOR_MODE")
-                .map(|v| v.to_lowercase() == "nmi")
-                .unwrap_or(false);
-
-        // Optional: dump SA-1/S-CPU state for early frames (DQ3調査用)
-        if dq3_auto {
-            self.maybe_trace_sa1_state(frame_count);
-        }
 
         while self.master_cycles - start_cycles < cycles_per_frame {
             loop_iterations += 1;
@@ -2280,7 +1816,7 @@ impl Emulator {
                 }
             }
 
-            // Optional: per-frame PC trace for coarse progress (DQ3 boot調査用)
+            // Optional: per-frame PC trace for coarse progress
             if trace_pc_frame {
                 static mut LAST_LOGGED_FRAME: u32 = 0;
                 // Avoid spamming: log once per frame at loop top
@@ -2345,19 +1881,6 @@ impl Emulator {
                 return; // 一時停止中
             }
 
-            // DQ3: IRQ/NMIベクタ強制ジャンプ（デバッグハック）
-            if dq3_force_vector {
-                self.maybe_force_vector_dq3(frame_count);
-            }
-
-            // DQ3: フレーム内でSEIが再設定されても常にIRQを許可し続ける
-            if dq3_auto {
-                let mut p = self.cpu.p;
-                p.remove(crate::cpu::StatusFlags::IRQ_DISABLE);
-                self.cpu.p = p;
-                self.cpu.core.state_mut().p = p;
-            }
-
             // SMW (LoROM) bootstrap guard: seed 7E:BBAA with 0xBBAA to escape the early self-check loop.
             if smw_force_bbaa {
                 let addr = 0x00BBAAusize;
@@ -2366,21 +1889,6 @@ impl Emulator {
                     self.bus.write_u8(bank + addr as u32, 0xAA);
                     self.bus.write_u8(bank + addr as u32 + 1, 0xBB);
                 }
-            }
-            // DQ3: 常時IRQベクタへジャンプさせる強制モード（フレーム内毎回）
-            if dq3_force_vector_always {
-                let vec_addr = if dq3_force_vector_use_nmi {
-                    self.bus.read_u16(0xFFEA)
-                } else {
-                    self.bus.read_u16(0xFFEE)
-                };
-                self.cpu.pb = 0x00;
-                self.cpu.pc = vec_addr;
-                self.cpu.core.state_mut().waiting_for_irq = false;
-                let mut p = self.cpu.p;
-                p.remove(crate::cpu::StatusFlags::IRQ_DISABLE);
-                self.cpu.p = p;
-                self.cpu.core.state_mut().p = p;
             }
 
             // Use batch execution for better performance (デバッグモードでない場合)
@@ -2498,17 +2006,25 @@ impl Emulator {
             if perf_verbose {
                 // Measure PPU rendering time
                 let ppu_start = Instant::now();
-                self.step_ppu(ppu_cycles);
+                self.step_ppu(ppu_cycles, true);
                 let ppu_time = ppu_start.elapsed();
                 self.performance_stats.add_ppu_time(ppu_time);
             } else {
-                self.step_ppu(ppu_cycles);
+                self.step_ppu(ppu_cycles, true);
             }
 
             // APU も更新
             let apu_cycles = cpu_cycles; // APUはCPUと同じクロック
             if !self.bus.is_fake_apu() {
-                self.bus.with_apu_mut(|apu| apu.step(apu_cycles));
+                self.apu_cycle_debt = self
+                    .apu_cycle_debt
+                    .saturating_add(apu_cycles as u32);
+                if self.apu_cycle_debt >= self.apu_step_batch {
+                    self.step_apu_debt(false);
+                }
+                if self.apu_cycle_debt >= self.apu_step_force {
+                    self.step_apu_debt(true);
+                }
             }
 
             // NMI/IRQ は CPU 側の poll_nmi/service_nmi/service_irq で処理する。
@@ -2525,6 +2041,16 @@ impl Emulator {
 
         // Frame完了時に主要レジスタのサマリを出力（デバッグ用）
         self.maybe_dump_register_summary(frame_count);
+
+        // Flush any remaining APU cycles at end-of-frame to keep audio in sync.
+        self.step_apu_debt(true);
+
+        if self.audio_system.is_enabled() && !self.bus.is_fake_apu() {
+            let audio_system = &mut self.audio_system;
+            self.bus.with_apu_mut(|apu| {
+                audio_system.mix_frame_from_apu(apu);
+            });
+        }
     }
 
     /// Advance emulated time without executing any S-CPU instructions.
@@ -2556,65 +2082,50 @@ impl Emulator {
         self.ppu_cycle_accum = (master_with_rem % PPU_CLOCK_DIVIDER) as u8;
         while ppu_cycles > 0 {
             let chunk = ppu_cycles.min(u16::MAX as u64) as u16;
-            self.step_ppu(chunk);
+            self.step_ppu(chunk, false);
             ppu_cycles -= chunk as u64;
         }
 
         // Step APU for the same elapsed master time.
         if !self.bus.is_fake_apu() {
-            self.bus
-                .with_apu_mut(|apu| apu.step_master_cycles(master_cycles));
+            let total = master_cycles.saturating_add(self.apu_master_cycle_accum as u64);
+            let apu_cpu_cycles = (total / CPU_CLOCK_DIVIDER) as u32;
+            self.apu_master_cycle_accum = (total % CPU_CLOCK_DIVIDER) as u8;
+            self.apu_cycle_debt = self.apu_cycle_debt.saturating_add(apu_cpu_cycles);
+            if self.apu_cycle_debt >= self.apu_step_batch {
+                self.step_apu_debt(false);
+            }
+            if self.apu_cycle_debt >= self.apu_step_force {
+                self.step_apu_debt(true);
+            }
         }
 
         self.master_cycles = self.master_cycles.saturating_add(master_cycles);
     }
 
-    /// DQ3専用デバッグ: S-CPUがIRQ/NMIで進まない場合にベクタへ強制ジャンプ
-    fn maybe_force_vector_dq3(&mut self, frame: u32) {
-        if !self.is_dq3_title() {
+    fn step_apu_debt(&mut self, _force: bool) {
+        if self.bus.is_fake_apu() {
+            self.apu_cycle_debt = 0;
             return;
         }
-        let enabled = std::env::var("DQ3_FORCE_VECTOR")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-        if !enabled {
+        let debt = self.apu_cycle_debt;
+        if debt == 0 {
             return;
         }
-        let stuck_pc = ((self.cpu.pb as u32) << 16) | self.cpu.pc as u32;
-        let is_stuck = stuck_pc == 0xFF0007 || stuck_pc == 0x00FFA4;
-        let every: u32 = std::env::var("DQ3_FORCE_VECTOR_EVERY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-        if !is_stuck && (frame % every != 0) {
-            return;
-        }
-        let use_nmi = std::env::var("DQ3_FORCE_VECTOR_MODE")
-            .map(|v| v.to_lowercase() == "nmi")
-            .unwrap_or(false);
-        let vec_addr = if use_nmi {
-            self.bus.read_u16(0xFFEA)
-        } else {
-            self.bus.read_u16(0xFFEE)
-        };
-        self.cpu.pb = 0x00;
-        self.cpu.pc = vec_addr;
-        let mut p = self.cpu.p;
-        p.remove(crate::cpu::StatusFlags::IRQ_DISABLE);
-        self.cpu.p = p;
-        self.cpu.core.state_mut().p = p;
-        self.cpu.core.state_mut().waiting_for_irq = false;
-        let kind = if use_nmi { "NMI" } else { "IRQ" };
-        static mut LOG_COUNT: u32 = 0;
-        unsafe {
-            if LOG_COUNT < 6 {
-                println!(
-                    "⚡ DQ3_FORCE_VECTOR: forced {} vector -> 00:{:04X} (frame={}, PC was {:02X}:{:04X})",
-                    kind, vec_addr, frame, stuck_pc >> 16, stuck_pc & 0xFFFF
-                );
-                LOG_COUNT += 1;
+
+        let step_fn = |apu: &mut crate::apu::Apu| {
+            let mut remaining = debt;
+            while remaining > 0 {
+                let chunk = remaining.min(u8::MAX as u32) as u8;
+                apu.step(chunk);
+                remaining -= chunk as u32;
             }
-        }
+        };
+
+        // Always step APU when we have debt; this keeps handshakes progressing reliably.
+        // The audio thread will opportunistically try_lock instead of blocking the emulator.
+        self.bus.with_apu_mut(step_fn);
+        self.apu_cycle_debt = 0;
     }
 
     /// 主要PPUレジスタの変遷を出力（回帰検出用）
@@ -2666,7 +2177,7 @@ impl Emulator {
         );
         println!("  BG mode:    {}", ppu.get_bg_mode());
 
-        // BG3 configuration (active layer for DQ3)
+        // BG3 configuration
         let main_tm = ppu.get_main_screen_designation();
         if (main_tm & 0x04) != 0 {
             // BG3 enabled
@@ -2751,52 +2262,7 @@ impl Emulator {
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     }
 
-    /// DQ3調査用: 早期フレームにSA-1/S-CPU/PPUの簡易状態をログ
-    fn maybe_trace_sa1_state(&mut self, frame: u32) {
-        let enabled = std::env::var("TRACE_SA1_STATE")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-        if !enabled && frame > 16 {
-            return;
-        }
-        let sa1 = self.bus.sa1();
-        let sfr = sa1.registers.sfr;
-        let ctrl = sa1.registers.control;
-        let cie = sa1.registers.cie;
-        let sie = sa1.registers.sie;
-        let ien = sa1.registers.interrupt_enable;
-        let scnt = sa1.registers.scnt;
-        let pend = sa1.registers.interrupt_pending;
-        let wai = sa1.cpu.core.state.waiting_for_irq;
-        let stp = sa1.cpu.core.state.stopped;
-        let sa1_pc = sa1.cpu.pc;
-        let sa1_pb = sa1.cpu.pb;
-        let ppu = self.bus.get_ppu();
-        let inidisp = ppu.screen_display;
-        let tm = ppu.get_main_screen_designation();
-        println!(
-            "[TRACE_SA1] frame={} SCPU PC={:02X}:{:04X} P=0x{:02X} INIDISP=0x{:02X} TM=0x{:02X} | SA1 PB={:02X} PC={:04X} CTRL=0x{:02X} CIE=0x{:02X} SIE=0x{:02X} IEN=0x{:02X} SCNT=0x{:02X} PEND=0x{:02X} SFR=0x{:02X} WAI={} STP={}",
-            frame,
-            self.cpu.pb,
-            self.cpu.pc,
-            self.cpu.p.bits(),
-            inidisp,
-            tm,
-            sa1_pb,
-            sa1_pc,
-            ctrl,
-            cie,
-            sie,
-            ien,
-            scnt,
-            pend,
-            sfr,
-            wai,
-            stp
-        );
-    }
-
-    fn step_ppu(&mut self, cycles: u16) {
+    fn step_ppu(&mut self, cycles: u16, apply_dram_refresh: bool) {
         // Step in bounded slices so we don't miss per-scanline events when a single call
         // advances across HBlank and/or multiple scanlines (e.g., during MDMA stalls).
         //
@@ -2861,6 +2327,14 @@ impl Emulator {
 
             // スキャンライン変更時はタイマを進める
             if old_scanline != new_scanline {
+                // DRAM refresh stalls the S-CPU for ~40 master cycles every scanline.
+                // Model this as extra time that advances PPU/APU without CPU execution.
+                if apply_dram_refresh {
+                    const DRAM_REFRESH_MASTER_CYCLES: u64 = 40;
+                    self.pending_stall_master_cycles = self
+                        .pending_stall_master_cycles
+                        .saturating_add(DRAM_REFRESH_MASTER_CYCLES);
+                }
                 self.bus.tick_timers();
                 // JOYBUSYの更新
                 self.bus.on_scanline_advance();
@@ -2872,6 +2346,17 @@ impl Emulator {
                 let vblank_start = self.bus.get_ppu().get_visible_height().saturating_add(1);
                 if old_scanline < vblank_start && new_scanline >= vblank_start {
                     self.bus.on_vblank_start();
+                    if std::env::var_os("TRACE_VBLANK_PC").is_some() {
+                        let pc = self.cpu.get_pc();
+                        println!(
+                            "[TRACE_VBLANK_PC] frame={} PC={:02X}:{:04X} sl={} cyc={}",
+                            self.bus.get_ppu().get_frame(),
+                            (pc >> 16) as u8,
+                            (pc & 0xFFFF) as u16,
+                            new_scanline,
+                            self.bus.get_ppu().get_cycle()
+                        );
+                    }
                 }
             }
         }
@@ -2891,211 +2376,77 @@ impl Emulator {
             println!("🎬 EMULATOR RENDER[{}]: Starting render function", rdc);
         }
 
-        // Debug: optionally paint framebuffer directly to verify render path
-        self.debug_fill_framebuffer();
-
-        // DQ3フォース表示: レンダ直前にBG/VRAM/パレットを上書きして必ず何か映るようにする
-        if std::env::var("DQ3_FORCE_DISPLAY")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false)
-            && self.is_dq3_title()
-        {
-            let ppu = self.bus.get_ppu_mut();
-            // Mode0, BG1 map/tile base 0
-            ppu.write(0x05, 0x00);
-            ppu.write(0x07, 0x00);
-            ppu.write(0x0B, 0x00);
-            // TM: BG1 only
-            ppu.write(0x2C, 0x01);
-            // INIDISP brightness max
-            ppu.screen_display = 0x0F;
-            ppu.brightness = 0x0F;
-            // Minimal palette (same as fallback palette)
-            if ppu.count_nonzero_colors() < 8 {
-                let colors = [
-                    0x0000u16, 0x7FFF, 0x001F, 0x03E0, 0x7C00, 0x03FF, 0x7FE0, 0x7C1F,
-                ];
-                for (i, &c) in colors.iter().enumerate() {
-                    ppu.write_cgram_color(i as u8, c);
-                }
-            }
-            // Solid tile #1 and full map
-            for i in 0..16 {
-                ppu.write_vram_word(i, 0xFF, 0xFF);
-            }
-            for entry in 0..1024 {
-                ppu.write_vram_word(entry as u16, 0x01, 0x00);
-            }
-        }
-
         let ppu = self.bus.get_ppu();
         let ppu_framebuffer = ppu.get_framebuffer();
 
-        // Forced blank: INIDISP bit7
-        let forced_blank = (ppu.screen_display & 0x80) != 0;
-        let brightness = ppu.brightness;
-
         if crate::debug_flags::render_verbose() && rdc <= 5 {
             println!(
-                "🎬 EMULATOR RENDER[{}]: forced_blank={}, brightness={}",
-                rdc, forced_blank, brightness
+                "🎬 COPYING FRAMEBUFFER: {} pixels from PPU to emulator",
+                ppu_framebuffer.len()
             );
-        }
-
-        // Dragon Quest III title screen fix: Never fill with black, always copy framebuffer
-        // if forced_blank && brightness == 0 {
-        //     println!("🎬 FILLING BLACK: forced_blank={}, brightness=0", forced_blank);
-        //     self.frame_buffer.fill(0xFF000000);
-        // } else {
-        {
-            let mut force_display = crate::debug_flags::force_display();
-            // DQ3 は起動直後に強制ブランキングを多用するため、デバッグ時は常時強制表示
-            if self.is_dq3_title() {
-                force_display = true;
-            }
-
-            if force_display {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static FORCE_DISPLAY_WARNED: AtomicBool = AtomicBool::new(false);
-                if !FORCE_DISPLAY_WARNED.swap(true, Ordering::Relaxed) {
-                    println!(
-                        "⚠️ FORCE_DISPLAY=1: rendering even while PPU keeps the screen blank. Disable this env var to see authentic output."
-                    );
-                }
-            }
-
-            let effective_blank = (forced_blank || brightness == 0) && !force_display;
-
-            if crate::debug_flags::render_verbose() && rdc <= 5 {
+            if !ppu_framebuffer.is_empty() {
                 println!(
-                    "🎬 EMULATOR RENDER[{}]: forced_blank={} brightness={} force_display={} effective_blank={}",
-                    rdc, forced_blank, brightness, force_display, effective_blank
+                    "🎬 FIRST PIXELS: [0]=0x{:08X}, [1]=0x{:08X}, [256]=0x{:08X}",
+                    ppu_framebuffer[0],
+                    if ppu_framebuffer.len() > 1 {
+                        ppu_framebuffer[1]
+                    } else {
+                        0
+                    },
+                    if ppu_framebuffer.len() > 256 {
+                        ppu_framebuffer[256]
+                    } else {
+                        0
+                    }
                 );
             }
-
-            if effective_blank {
-                if crate::debug_flags::render_verbose() && rdc <= 5 {
-                    println!("🎬 FILLING BLACK (blanked by PPU)");
-                }
-                self.frame_buffer.fill(0xFF000000);
-            } else {
-                if crate::debug_flags::render_verbose() && rdc <= 5 {
-                    println!(
-                        "🎬 COPYING FRAMEBUFFER: {} pixels from PPU to emulator",
-                        ppu_framebuffer.len()
-                    );
-                    if !ppu_framebuffer.is_empty() {
-                        println!(
-                            "🎬 FIRST PIXELS: [0]=0x{:08X}, [1]=0x{:08X}, [256]=0x{:08X}",
-                            ppu_framebuffer[0],
-                            if ppu_framebuffer.len() > 1 {
-                                ppu_framebuffer[1]
-                            } else {
-                                0
-                            },
-                            if ppu_framebuffer.len() > 256 {
-                                ppu_framebuffer[256]
-                            } else {
-                                0
-                            }
-                        );
+            let ppu_non_black = ppu_framebuffer
+                .iter()
+                .filter(|&&px| px != 0x00000000 && px != 0xFF000000 && (px & 0x00FFFFFF) != 0)
+                .count();
+            let white_pixels = ppu_framebuffer
+                .iter()
+                .filter(|&&px| px == 0xFFFFFFFF || (px & 0x00FFFFFF) == 0x00FFFFFF)
+                .count();
+            let start = 3320.min(ppu_framebuffer.len());
+            let end = 3350.min(ppu_framebuffer.len());
+            let actual_sample: Vec<u32> = ppu_framebuffer[start..end].iter().cloned().collect();
+            println!(
+                "🎨 PPU FRAMEBUFFER[{}]: Non-black pixels: {}/{}, White pixels: {}",
+                rdc,
+                ppu_non_black,
+                ppu_framebuffer.len(),
+                white_pixels
+            );
+            println!(
+                "   🔍 PPU Sample around pos 3328: {:?}",
+                &actual_sample[..10.min(actual_sample.len())]
+            );
+            if !ppu_framebuffer.is_empty() {
+                println!(
+                    "🎨 PPU SAMPLE[{}]: [0]=0x{:08X}, [128]=0x{:08X}, [256]=0x{:08X}",
+                    rdc,
+                    ppu_framebuffer[0],
+                    if ppu_framebuffer.len() > 128 {
+                        ppu_framebuffer[128]
+                    } else {
+                        0
+                    },
+                    if ppu_framebuffer.len() > 256 {
+                        ppu_framebuffer[256]
+                    } else {
+                        0
                     }
-                    let ppu_non_black = ppu_framebuffer
-                        .iter()
-                        .filter(|&&px| {
-                            px != 0x00000000 && px != 0xFF000000 && (px & 0x00FFFFFF) != 0
-                        })
-                        .count();
-                    let white_pixels = ppu_framebuffer
-                        .iter()
-                        .filter(|&&px| px == 0xFFFFFFFF || (px & 0x00FFFFFF) == 0x00FFFFFF)
-                        .count();
-                    let start = 3320.min(ppu_framebuffer.len());
-                    let end = 3350.min(ppu_framebuffer.len());
-                    let actual_sample: Vec<u32> =
-                        ppu_framebuffer[start..end].iter().cloned().collect();
-                    println!(
-                        "🎨 PPU FRAMEBUFFER[{}]: Non-black pixels: {}/{}, White pixels: {}",
-                        rdc,
-                        ppu_non_black,
-                        ppu_framebuffer.len(),
-                        white_pixels
-                    );
-                    println!(
-                        "   🔍 PPU Sample around pos 3328: {:?}",
-                        &actual_sample[..10.min(actual_sample.len())]
-                    );
-                    if !ppu_framebuffer.is_empty() {
-                        println!(
-                            "🎨 PPU SAMPLE[{}]: [0]=0x{:08X}, [128]=0x{:08X}, [256]=0x{:08X}",
-                            rdc,
-                            ppu_framebuffer[0],
-                            if ppu_framebuffer.len() > 128 {
-                                ppu_framebuffer[128]
-                            } else {
-                                0
-                            },
-                            if ppu_framebuffer.len() > 256 {
-                                ppu_framebuffer[256]
-                            } else {
-                                0
-                            }
-                        );
-                    }
-                }
-
-                let len = self.frame_buffer.len().min(ppu_framebuffer.len());
-                if len > 0 {
-                    self.frame_buffer[..len].copy_from_slice(&ppu_framebuffer[..len]);
-                }
-                if len < self.frame_buffer.len() {
-                    self.frame_buffer[len..].fill(0xFF000000);
-                }
-
-                // Debug: override final framebuffer at the very end to verify render path
-                if std::env::var("DQ3_FB_TEST")
-                    .map(|v| v == "1" || v.to_lowercase() == "true")
-                    .unwrap_or(false)
-                {
-                    let w: usize = SCREEN_WIDTH;
-                    let h: usize = SCREEN_HEIGHT;
-                    for y in 0..h {
-                        for x in 0..w {
-                            let idx = y * w + x;
-                            if idx >= self.frame_buffer.len() {
-                                break;
-                            }
-                            let r = ((x ^ y) & 0xFF) as u32;
-                            let g = ((x + y) & 0xFF) as u32;
-                            let b = ((x.wrapping_mul(3) ^ y.wrapping_mul(5)) & 0xFF) as u32;
-                            self.frame_buffer[idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
-                        }
-                    }
-                } else if self.is_dq3_title() {
-                    // DQ3フォールバック: 一切の描画が無ければシンプルなグラデで埋めて可視化
-                    let non_black = self
-                        .frame_buffer
-                        .iter()
-                        .filter(|&&px| px != 0xFF000000 && px != 0x00000000)
-                        .count();
-                    if non_black == 0 {
-                        let w: usize = SCREEN_WIDTH;
-                        let h: usize = SCREEN_HEIGHT;
-                        for y in 0..h {
-                            for x in 0..w {
-                                let idx = y * w + x;
-                                if idx >= self.frame_buffer.len() {
-                                    break;
-                                }
-                                let r = (x as u32 * 3) & 0xFF;
-                                let g = (y as u32 * 3) & 0xFF;
-                                let b = ((x ^ y) as u32) & 0xFF;
-                                self.frame_buffer[idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
-                            }
-                        }
-                    }
-                }
+                );
             }
+        }
+
+        let len = self.frame_buffer.len().min(ppu_framebuffer.len());
+        if len > 0 {
+            self.frame_buffer[..len].copy_from_slice(&ppu_framebuffer[..len]);
+        }
+        if len < self.frame_buffer.len() {
+            self.frame_buffer[len..].fill(0xFF000000);
         }
 
         // ROM title overlay removed for clean display
@@ -3135,6 +2486,39 @@ impl Emulator {
                     rdc
                 );
             }
+        }
+
+        self.maybe_log_black_screen();
+    }
+
+    fn maybe_log_black_screen(&mut self) {
+        let enabled = std::env::var("DEBUG_BLACK_SCREEN")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let threshold = std::env::var("DEBUG_BLACK_SCREEN_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(60);
+        let all_black = self
+            .frame_buffer
+            .iter()
+            .all(|&px| px == 0xFF000000 || px == 0x00000000);
+        if all_black {
+            self.black_screen_streak = self.black_screen_streak.saturating_add(1);
+            if !self.black_screen_reported && self.black_screen_streak >= threshold {
+                self.black_screen_reported = true;
+                println!(
+                    "[BLACK_SCREEN] frame={} streak={} (threshold={})",
+                    self.frame_count, self.black_screen_streak, threshold
+                );
+                self.bus.get_ppu().debug_ppu_state();
+            }
+        } else {
+            self.black_screen_streak = 0;
+            self.black_screen_reported = false;
         }
     }
 
@@ -3272,6 +2656,10 @@ impl Emulator {
             return;
         }
 
+        if let Some(w) = &mut self.window {
+            let _ = w.update();
+        }
+
         // キーボード入力を KeyStates に変換
         if let Some(w) = &self.window {
             key_states.up = w.is_key_down(Key::Up);
@@ -3284,8 +2672,10 @@ impl Emulator {
             key_states.x = w.is_key_down(Key::S);
             key_states.l = w.is_key_down(Key::Q);
             key_states.r = w.is_key_down(Key::W);
-            key_states.start = w.is_key_down(Key::Enter);
-            key_states.select = w.is_key_down(Key::RightShift);
+            key_states.start = w.is_key_down(Key::Enter)
+                || w.is_key_down(Key::NumPadEnter)
+                || w.is_key_down(Key::Space);
+            key_states.select = w.is_key_down(Key::LeftShift) || w.is_key_down(Key::RightShift);
         }
 
         // 入力システムに渡す
@@ -3326,28 +2716,10 @@ impl Emulator {
             return;
         }
         let mask = crate::input::scripted_input_mask_for_frame(self.frame_count);
-        let input_port = std::env::var("INPUT_PORT")
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(1);
-        match input_port {
-            2 => self
-                .bus
-                .get_input_system_mut()
-                .controller2
-                .set_buttons(mask),
-            _ => self
-                .bus
-                .get_input_system_mut()
-                .controller1
-                .set_buttons(mask),
-        }
-        if std::env::var_os("INPUT_MIRROR_P1_TO_P2").is_some() {
-            self.bus
-                .get_input_system_mut()
-                .controller2
-                .set_buttons(mask);
-        }
+        self.bus
+            .get_input_system_mut()
+            .controller1
+            .set_buttons(mask);
     }
 
     fn maybe_quit_on_cpu_test_result(&mut self) {
@@ -3422,11 +2794,15 @@ impl Emulator {
     }
 
     fn sync_frame_rate(&mut self) {
-        let elapsed = self.last_frame_time.elapsed();
-        if elapsed < self.target_frame_duration {
-            std::thread::sleep(self.target_frame_duration - elapsed);
+        let now = Instant::now();
+        if now < self.next_frame_time {
+            std::thread::sleep(self.next_frame_time - now);
         }
-        self.last_frame_time = Instant::now();
+        let now = Instant::now();
+        self.next_frame_time += self.target_frame_duration;
+        if now > self.next_frame_time {
+            self.next_frame_time = now + self.target_frame_duration;
+        }
     }
 
     fn maybe_dump_framebuffer_at(&mut self) {
@@ -3545,6 +2921,83 @@ impl Emulator {
                 eprintln!("DUMP_MEM_AT: failed to write BW-RAM: {}", e);
                 ok = false;
             }
+        }
+        if std::env::var_os("DUMP_MEM_APU_STATE").is_some() {
+            let mut apu_dump = String::new();
+            self.bus.with_apu_mut(|apu| {
+                let (smp_pc, smp_psw, smp_a, smp_x, smp_y, smp_sp, smp_stopped) =
+                    if let Some(smp) = apu.inner.smp.as_ref() {
+                        (
+                            smp.reg_pc,
+                            smp.get_psw(),
+                            smp.reg_a,
+                            smp.reg_x,
+                            smp.reg_y,
+                            smp.reg_sp,
+                            smp.is_stopped() as u8,
+                        )
+                    } else {
+                        (0, 0, 0, 0, 0, 0, 1)
+                    };
+                let mut code = [0u8; 16];
+                if smp_stopped == 0 {
+                    for (i, b) in code.iter_mut().enumerate() {
+                        *b = apu
+                            .inner
+                            .read_u8(smp_pc.wrapping_add(i as u16) as u32);
+                    }
+                }
+                let _ = std::fmt::Write::write_fmt(
+                    &mut apu_dump,
+                    format_args!(
+                        "apu_cycles={}\nboot_state={}\nport_latch=[{:02X} {:02X} {:02X} {:02X}]\ninner_ports=[{:02X} {:02X} {:02X} {:02X}]\nsmp_pc={:04X} psw={:02X} A={:02X} X={:02X} Y={:02X} SP={:02X} stopped={}\ncode={:02X?}\n",
+                        apu.total_smp_cycles,
+                        apu.handshake_state_str(),
+                        apu.port_latch[0],
+                        apu.port_latch[1],
+                        apu.port_latch[2],
+                        apu.port_latch[3],
+                        apu.inner.cpu_read_port(0),
+                        apu.inner.cpu_read_port(1),
+                        apu.inner.cpu_read_port(2),
+                        apu.inner.cpu_read_port(3),
+                        smp_pc,
+                        smp_psw,
+                        smp_a,
+                        smp_x,
+                        smp_y,
+                        smp_sp,
+                        smp_stopped,
+                        code
+                    ),
+                );
+            });
+            let apu_path = format!("{}_apu.txt", cfg.prefix);
+            if let Err(e) = std::fs::write(&apu_path, apu_dump) {
+                eprintln!("DUMP_MEM_AT: failed to write APU state: {}", e);
+                ok = false;
+            }
+        }
+        // Always dump S-CPU core state when DUMP_MEM_AT is active (debug aid).
+        let cpu_path = format!("{}_cpu.txt", cfg.prefix);
+        let cpu_dump = format!(
+            "pc={:02X}:{:04X}\nA={:04X} X={:04X} Y={:04X} SP={:04X}\nDB={:02X} DP={:04X}\nP={:02X} emu={} M8={} X8={}\n",
+            self.cpu.pb,
+            self.cpu.pc,
+            self.cpu.a,
+            self.cpu.x,
+            self.cpu.y,
+            self.cpu.sp,
+            self.cpu.db,
+            self.cpu.dp,
+            self.cpu.p.bits(),
+            self.cpu.emulation_mode,
+            self.cpu.p.contains(crate::cpu::StatusFlags::MEMORY_8BIT),
+            self.cpu.p.contains(crate::cpu::StatusFlags::INDEX_8BIT),
+        );
+        if let Err(e) = std::fs::write(&cpu_path, cpu_dump) {
+            eprintln!("DUMP_MEM_AT: failed to write CPU state: {}", e);
+            ok = false;
         }
         if ok && !crate::debug_flags::quiet() {
             println!("DUMP_MEM_AT: wrote {}_*", cfg.prefix);
@@ -4080,74 +3533,6 @@ impl Emulator {
     pub fn get_save_info(&self, filename: &str) -> Result<SaveInfo, String> {
         let save_state = SaveState::load_from_file(filename)?;
         Ok(save_state.get_save_info())
-    }
-
-    // Dragon Quest III initialization loop fix - HELP GAME INITIALIZE
-    /// Dragon Quest III initialization workaround
-    ///
-    /// This is a legacy compatibility hack that should only be enabled when absolutely necessary.
-    /// Use DQ3_FORCE_HACK=1 environment variable to enable.
-    ///
-    /// The proper fix is to improve SA-1 emulation, memory mapping, and IRQ handling.
-    fn fix_dragon_quest_initialization(&mut self) {
-        // Check if the invasive hack is explicitly enabled
-        let force_hack = std::env::var("DQ3_FORCE_HACK")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-
-        if !force_hack {
-            // Only print once
-            static mut WARNED: bool = false;
-            unsafe {
-                if !WARNED {
-                    WARNED = true;
-                    if crate::debug_flags::boot_verbose() {
-                        println!(
-                            "ℹ️  DQ3 initialization hack disabled (use DQ3_FORCE_HACK=1 to enable)"
-                        );
-                        println!("   Relying on improved SA-1 emulation and auto-unblank instead");
-                    }
-                }
-            }
-            return;
-        }
-
-        println!("⚠️  ======================================");
-        println!("⚠️  DQ3 FORCE HACK ENABLED");
-        println!("⚠️  ======================================");
-        println!("   This is a legacy workaround - please report if still needed!");
-
-        // Minimal intervention: only fix if actually stuck in a loop
-        let pc = self.cpu.pc;
-        let pb = self.cpu.pb;
-        let full_pc = ((pb as u32) << 16) | (pc as u32);
-
-        // Check if CPU is stuck in known problematic locations
-        let is_stuck = (full_pc == 0x00FFA4) || (full_pc == 0x0080C4) || (full_pc == 0x00FFA0);
-
-        if !is_stuck {
-            static mut WARNED_NOT_STUCK: bool = false;
-            unsafe {
-                if !WARNED_NOT_STUCK {
-                    WARNED_NOT_STUCK = true;
-                    println!(
-                        "   CPU not stuck (PC=${:02X}:{:04X}), skipping hack",
-                        pb, pc
-                    );
-                }
-            }
-            return;
-        }
-
-        println!("   Detected stuck loop at PC=${:02X}:{:04X}", pb, pc);
-        println!("   Attempting minimal intervention...");
-
-        // Minimal fix: just clear NMI temporarily
-        self.bus.write_u8(0x4200, 0x00); // NMITIMEN: Disable all interrupts
-
-        println!("   Disabled NMI to break initialization loop");
-        println!("   Relying on auto-unblank and SA-1 improvements for display");
-        println!("⚠️  ======================================\n");
     }
 
     /// Dump用: 現在の WRAM スナップショットを返す（ヘッドレス終了後などに利用）

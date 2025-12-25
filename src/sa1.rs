@@ -194,8 +194,6 @@ pub struct Sa1 {
     pub(crate) boot_pb: u8,
     pub(crate) pending_reset: bool,
     pub(crate) ipl_ran: bool,
-    /// One-shot flag: assert S-CPU IRQ line once after boot (DQ3 IPL replacement)
-    pub(crate) boot_irq_once: bool,
     h_timer_accum: u32,
     v_timer_accum: u32,
 }
@@ -218,7 +216,6 @@ impl Sa1 {
             boot_pb: 0x00,
             pending_reset: false,
             ipl_ran: false,
-            boot_irq_once: false,
             h_timer_accum: 0,
             v_timer_accum: 0,
         }
@@ -237,7 +234,6 @@ impl Sa1 {
         self.boot_pb = 0;
         self.pending_reset = false;
         self.ipl_ran = false;
-        self.boot_irq_once = false;
         self.h_timer_accum = 0;
         self.v_timer_accum = 0;
     }
@@ -262,7 +258,6 @@ impl Sa1 {
             self.boot_vector_applied = true;
             self.pending_reset = false;
             self.ipl_ran = true;
-            self.boot_irq_once = false;
         } else if !self.boot_vector_applied && self.registers.reset_vector != 0 {
             self.cpu.pc = self.registers.reset_vector;
             // Use the boot program bank detected/overridden by the mapper.

@@ -845,16 +845,6 @@ impl Cpu {
             }
         }
 
-        if crate::debug_flags::debug_dq3_loop()
-            && state_before.pb == 0xC0
-            && (0x04C5..=0x04D0).contains(&state_before.pc)
-        {
-            println!(
-                "[dq3-loop] PC={:02X}:{:04X} A=0x{:04X} X=0x{:04X} P=0x{:02X}",
-                state_before.pb, state_before.pc, state_before.a, state_before.x, state_before.p
-            );
-        }
-
         if crate::debug_flags::trace() && self.debug_instruction_count <= 500 {
             println!(
                 "TRACE[{}]: {:02X}:{:04X} opcode=0x{:02X} A=0x{:04X} X=0x{:04X} Y=0x{:04X} SP=0x{:04X} P=0x{:02X} emu={}",
@@ -1738,15 +1728,31 @@ impl Cpu {
     }
 
     fn compare(&mut self, reg: u16, value: u16) {
-        let result = reg.wrapping_sub(value);
-        self.p.set(StatusFlags::CARRY, reg >= value);
-        self.update_zero_negative_flags(result);
+        if self.p.contains(StatusFlags::MEMORY_8BIT) || self.emulation_mode {
+            let r = (reg & 0x00FF) as u8;
+            let v = (value & 0x00FF) as u8;
+            let result = r.wrapping_sub(v) as u16;
+            self.p.set(StatusFlags::CARRY, r >= v);
+            self.update_zero_negative_flags(result);
+        } else {
+            let result = reg.wrapping_sub(value);
+            self.p.set(StatusFlags::CARRY, reg >= value);
+            self.update_zero_negative_flags(result);
+        }
     }
 
     fn compare_index(&mut self, reg: u16, value: u16) {
-        let result = reg.wrapping_sub(value);
-        self.p.set(StatusFlags::CARRY, reg >= value);
-        self.update_zero_negative_flags_index(result);
+        if self.p.contains(StatusFlags::INDEX_8BIT) || self.emulation_mode {
+            let r = (reg & 0x00FF) as u8;
+            let v = (value & 0x00FF) as u8;
+            let result = r.wrapping_sub(v) as u16;
+            self.p.set(StatusFlags::CARRY, r >= v);
+            self.update_zero_negative_flags_index(result);
+        } else {
+            let result = reg.wrapping_sub(value);
+            self.p.set(StatusFlags::CARRY, reg >= value);
+            self.update_zero_negative_flags_index(result);
+        }
     }
 
     fn branch_if(&mut self, bus: &mut crate::bus::Bus, condition: bool) -> u8 {
@@ -2796,7 +2802,12 @@ impl Cpu {
 
     // INC instructions
     fn inc_accumulator(&mut self) -> u8 {
-        self.a = self.a.wrapping_add(1);
+        if self.is_memory_16bit() {
+            self.a = self.a.wrapping_add(1);
+        } else {
+            let lo = (self.a as u8).wrapping_add(1);
+            self.a = (self.a & 0xFF00) | (lo as u16);
+        }
         self.update_zero_negative_flags(self.a);
         2
     }
@@ -2896,7 +2907,12 @@ impl Cpu {
 
     // DEC instructions
     fn dec_accumulator(&mut self) -> u8 {
-        self.a = self.a.wrapping_sub(1);
+        if self.is_memory_16bit() {
+            self.a = self.a.wrapping_sub(1);
+        } else {
+            let lo = (self.a as u8).wrapping_sub(1);
+            self.a = (self.a & 0xFF00) | (lo as u16);
+        }
         self.update_zero_negative_flags(self.a);
         2
     }

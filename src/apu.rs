@@ -23,6 +23,9 @@ enum BootState {
 pub struct Apu {
     pub(crate) inner: Box<SpcApu>,
     sample_rate: u32,
+    // Reusable audio scratch buffers to avoid per-frame allocations.
+    audio_left: Vec<i16>,
+    audio_right: Vec<i16>,
     // Fractional SPC700 cycles accumulator (scaled from S-CPU cycles).
     cycle_accum: f64,
     cycle_scale: f64,
@@ -37,6 +40,8 @@ pub struct Apu {
     apu_to_cpu_ports: [u8; 4],
     // CPU->APU方向の直近値（SMP側が$F4-$F7で読む値）
     pub(crate) port_latch: [u8; 4],
+    // CPU->APU 書き込みの遅延適用キュー（APU側の同期遅延を近似）
+    pending_port_writes: Vec<(u8, u8)>,
     boot_state: BootState,
     boot_hle_enabled: bool,
     fast_upload: bool,
@@ -47,6 +52,7 @@ pub struct Apu {
     expected_index: u8,
     block_active: bool,
     pending_idx: Option<u8>,
+    pending_cmd: Option<u8>,
     data_ready: bool,
     upload_done_count: u64,
     upload_bytes: u64,
@@ -83,8 +89,8 @@ impl Apu {
     pub fn new() -> Self {
         let inner = SpcApu::new(); // comes with default IPL
         let boot_hle_enabled = std::env::var("APU_BOOT_HLE")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(false); // デフォルト: HLE無効（実IPLで正確さ優先）
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false); // デフォルト: 実IPL（正確性優先）。必要なら APU_BOOT_HLE=1 でHLE有効化。
                                // 正確さ優先: デフォルトではフルサイズ転送を行う。
                                // 速さが欲しい場合のみ APU_FAST_UPLOAD=1 を明示する。
         let fast_upload = std::env::var("APU_FAST_UPLOAD")
@@ -122,6 +128,8 @@ impl Apu {
         let mut apu = Self {
             inner,
             sample_rate: 32000,
+            audio_left: Vec::new(),
+            audio_right: Vec::new(),
             cycle_accum: 0.0,
             cycle_scale,
             total_smp_cycles: 0,
@@ -130,6 +138,7 @@ impl Apu {
             trace_last_out_ports: [0; 4],
             apu_to_cpu_ports: [0; 4],
             port_latch: [0; 4],
+            pending_port_writes: Vec::new(),
             boot_state: if skip_boot || !boot_hle_enabled {
                 BootState::Running
             } else {
@@ -144,6 +153,7 @@ impl Apu {
             expected_index: 0,
             block_active: false,
             pending_idx: None,
+            pending_cmd: None,
             data_ready: false,
             upload_done_count: 0,
             upload_bytes: 0,
@@ -184,6 +194,8 @@ impl Apu {
 
     pub fn reset(&mut self) {
         self.inner.reset();
+        self.audio_left.clear();
+        self.audio_right.clear();
         self.fast_upload = std::env::var("APU_FAST_UPLOAD")
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(false);
@@ -224,10 +236,12 @@ impl Apu {
             self.trace_last_out_ports[p] = self.inner.cpu_read_port(p as u8);
         }
         self.port_latch = [0; 4];
+        self.pending_port_writes.clear();
         self.upload_addr = 0x0200;
         self.expected_index = 0;
         self.block_active = false;
         self.pending_idx = None;
+        self.pending_cmd = None;
         self.data_ready = false;
         self.upload_done_count = 0;
         self.upload_bytes = 0;
@@ -269,6 +283,10 @@ impl Apu {
         let run = self.cycle_accum.floor() as i32;
         self.cycle_accum -= run as f64;
 
+        // CPU->APU ポート書き込みはSMP実行前に反映する。
+        // （CPU書き込みがAPU側ループに即時見えるほうが実機に近い）
+        self.flush_pending_port_writes();
+
         if run > 0 {
             self.total_smp_cycles = self.total_smp_cycles.saturating_add(run as u64);
             if let Some(smp) = self.inner.smp.as_mut() {
@@ -288,6 +306,7 @@ impl Apu {
 
         self.maybe_trace_apu_control();
         self.maybe_trace_out_ports();
+        self.maybe_trace_smp_pc();
     }
 
     /// Master clock に合わせてSPC700を回す（S-CPU が停止している期間の進行用）。
@@ -307,6 +326,9 @@ impl Apu {
         let run = self.cycle_accum.floor() as i32;
         self.cycle_accum -= run as f64;
 
+        // CPU停止中でもポート更新は先に反映しておく
+        self.flush_pending_port_writes();
+
         if run > 0 {
             self.total_smp_cycles = self.total_smp_cycles.saturating_add(run as u64);
             if let Some(smp) = self.inner.smp.as_mut() {
@@ -325,6 +347,7 @@ impl Apu {
 
         self.maybe_trace_apu_control();
         self.maybe_trace_out_ports();
+        self.maybe_trace_smp_pc();
     }
 
     fn maybe_trace_apu_control(&mut self) {
@@ -368,6 +391,29 @@ impl Apu {
             );
         }
         self.trace_last_out_ports[1] = cur;
+    }
+
+    fn maybe_trace_smp_pc(&mut self) {
+        if std::env::var_os("TRACE_APU_SMP_PC").is_none() {
+            return;
+        }
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CNT: AtomicU32 = AtomicU32::new(0);
+        let n = CNT.fetch_add(1, Ordering::Relaxed);
+        if n < 256 {
+            if let Some(smp) = self.inner.smp.as_ref() {
+                println!(
+                    "[APU-SMP] apu_cycles={} pc={:04X} stopped={} ports=[{:02X} {:02X} {:02X} {:02X}]",
+                    self.total_smp_cycles,
+                    smp.reg_pc,
+                    smp.is_stopped() as u8,
+                    self.inner.cpu_read_port(0),
+                    self.inner.cpu_read_port(1),
+                    self.inner.cpu_read_port(2),
+                    self.inner.cpu_read_port(3)
+                );
+            }
+        }
     }
 
     /// CPU側ポート読み出し ($2140-$2143)
@@ -454,8 +500,19 @@ impl Apu {
     pub fn write_port(&mut self, port: u8, value: u8) {
         let p = (port & 0x03) as usize;
         self.port_latch[p] = value;
-        // CPU->APU ラッチへ反映（SMP側が $F4-$F7 で読む）
-        self.inner.cpu_write_port(p as u8, value);
+        // 通常動作: CPU書き込みを即時反映してAPU側に見せる（実機挙動に近い）
+        // HLE/特殊モード時のみ遅延キューで扱う。
+        let immediate = !self.boot_hle_enabled
+            && !self.smw_apu_echo
+            && !self.smw_apu_hle_handshake
+            && !self.smw_apu_port_echo_strict
+            && !self.fake_upload;
+        if immediate {
+            self.inner.cpu_write_port(p as u8, value);
+        } else {
+            // CPU->APU ラッチはAPU実行後に反映（同期遅延の近似）
+            self.pending_port_writes.push((p as u8, value));
+        }
 
         // 簡易HLE: 転送を省略して即稼働させる
         if self.fake_upload && self.boot_state != BootState::Running {
@@ -507,6 +564,7 @@ impl Apu {
                     self.block_active = false;
                     self.zero_write_seen = false;
                     self.pending_idx = None;
+                    self.pending_cmd = None;
                     self.data_ready = false;
                     self.upload_bytes = 0;
                     self.last_upload_idx = 0;
@@ -533,13 +591,23 @@ impl Apu {
                 // port0/port1 の書き込み順は ROM により異なる（8bit書き込み / 16bit書き込み）。
                 // 実機IPLは port0 の変化をトリガに port1 を読み取るため、ここでは
                 // 「port0(idx) と port1(data) の両方が揃ったタイミング」で1バイトを確定する。
+                let handle_command = |cmd: u8, port1: u8, this: &mut Self| {
+                    this.pending_cmd = None;
+                    this.pending_idx = None;
+                    this.data_ready = false;
+                    this.expected_index = 0;
+                    // コマンドはACKをエコー
+                    this.apu_to_cpu_ports[0] = cmd;
+                    this.boot_port0_echo = cmd;
+                    if port1 == 0 {
+                        // Start program; ACK must echo the command value the CPU wrote.
+                        this.finish_upload_and_start_with_ack(cmd);
+                    }
+                };
+
                 match p {
                     0 => {
                         let idx = value;
-                        // Always echo APUIO0 back (handshake ACK)
-                        self.apu_to_cpu_ports[0] = idx;
-                        self.boot_port0_echo = idx;
-
                         // SPC700 IPL protocol:
                         // - Data byte: APUIO0 must equal expected_index (starts at 0 for each block)
                         // - Command: APUIO0 != expected_index; APUIO1==0 means "start program at APUIO2/3",
@@ -557,15 +625,15 @@ impl Apu {
                                 self.upload_bytes = self.upload_bytes.saturating_add(1);
                                 self.last_upload_idx = idx;
                                 self.expected_index = self.expected_index.wrapping_add(1);
+                                // ACKはデータ書き込み後に返す
+                                self.apu_to_cpu_ports[0] = idx;
+                                self.boot_port0_echo = idx;
                             }
                         } else {
-                            // Command / state sync
-                            self.pending_idx = None;
-                            self.data_ready = false;
-                            self.expected_index = 0;
-                            if self.last_port1 == 0 {
-                                // Start program; ACK must echo the command value the CPU wrote.
-                                self.finish_upload_and_start_with_ack(idx);
+                            // Command / state sync (port1が揃ってから確定)
+                            self.pending_cmd = Some(idx);
+                            if self.data_ready {
+                                handle_command(idx, self.last_port1, self);
                                 return;
                             }
                         }
@@ -573,7 +641,6 @@ impl Apu {
                     }
                     1 => {
                         self.last_port1 = value;
-                        self.apu_to_cpu_ports[1] = value;
                         self.data_ready = true;
                         if let Some(idx) = self.pending_idx {
                             // port0 が先に来たケース: ここで確定
@@ -585,19 +652,27 @@ impl Apu {
                                 self.upload_bytes = self.upload_bytes.saturating_add(1);
                                 self.last_upload_idx = idx;
                                 self.expected_index = self.expected_index.wrapping_add(1);
+                                // ACKはデータ書き込み後に返す
+                                self.apu_to_cpu_ports[0] = idx;
+                                self.boot_port0_echo = idx;
+                                return;
                             }
+                        }
+                        if let Some(cmd) = self.pending_cmd {
+                            handle_command(cmd, value, self);
                         }
                         return;
                     }
                     _ => {
-                        self.apu_to_cpu_ports[p] = value;
                         return;
                     }
                 }
             }
             BootState::Running => {
-                // 稼働後は表側キャッシュだけ更新（HLE継続時もキャッシュを維持）
-                self.apu_to_cpu_ports[p] = value;
+                // 稼働後はCPU->APU書き込みをそのまま渡すのみ。キャッシュ更新はHLE/SMW用途のみ。
+                if self.smw_apu_echo || self.smw_apu_hle_handshake || self.smw_apu_port_echo_strict {
+                    self.apu_to_cpu_ports[p] = value;
+                }
 
                 // SMW HLE 継続モード: 0,0 が2回続いたら即 start (upload_done) とみなす
                 if self.smw_apu_hle_handshake && p == 0 {
@@ -646,10 +721,15 @@ impl Apu {
         let to_read = need.min(avail);
 
         if to_read > 0 {
-            let mut left = vec![0i16; to_read as usize];
-            let mut right = vec![0i16; to_read as usize];
-            dsp.output_buffer.read(&mut left, &mut right, to_read);
-            for i in 0..(to_read as usize) {
+            let read_len = to_read as usize;
+            if self.audio_left.len() < read_len {
+                self.audio_left.resize(read_len, 0);
+                self.audio_right.resize(read_len, 0);
+            }
+            let left = &mut self.audio_left[..read_len];
+            let right = &mut self.audio_right[..read_len];
+            dsp.output_buffer.read(left, right, to_read);
+            for i in 0..read_len {
                 samples[i] = (left[i], right[i]);
             }
         }
@@ -703,6 +783,8 @@ impl Apu {
             offset += 1;
         }
         if let Some(smp) = self.inner.smp.as_mut() {
+            // Ensure the SPC core is not left in STOP/SLEEP from the IPL path.
+            smp.reset();
             smp.reg_pc = start_pc;
         }
         // IPL を無効化
@@ -757,6 +839,8 @@ impl Apu {
         self.inner.write_u8(0x00F1, 0x00);
         // ジャンプ先をセット（IPLがジャンプする直前の初期レジスタ状態に寄せる）
         if let Some(smp) = self.inner.smp.as_mut() {
+            // Clear STOP/SLEEP and reset core timing before jumping to uploaded code.
+            smp.reset();
             let pc = if self.upload_addr == 0 {
                 0x0200
             } else {
@@ -777,6 +861,15 @@ impl Apu {
         // 初期ACKはそのままにして、以後は実値を返す
         for i in 0..4 {
             self.apu_to_cpu_ports[i] = self.inner.cpu_read_port(i as u8);
+        }
+    }
+
+    fn flush_pending_port_writes(&mut self) {
+        if self.pending_port_writes.is_empty() {
+            return;
+        }
+        for (p, value) in self.pending_port_writes.drain(..) {
+            self.inner.cpu_write_port(p, value);
         }
     }
 }

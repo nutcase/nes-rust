@@ -279,6 +279,8 @@ impl DmaController {
                         0x02 => {
                             self.channels[channel].src_address =
                                 (self.channels[channel].src_address & 0xFFFF00) | value as u32;
+                            self.channels[channel].hdma_table_addr =
+                                self.channels[channel].src_address;
                             self.channels[channel].configured = true;
                             self.channels[channel].cfg_src = true;
                             if debug_flags::dma_reg() {
@@ -289,6 +291,8 @@ impl DmaController {
                             self.channels[channel].src_address =
                                 (self.channels[channel].src_address & 0xFF00FF)
                                     | ((value as u32) << 8);
+                            self.channels[channel].hdma_table_addr =
+                                self.channels[channel].src_address;
                             self.channels[channel].configured = true;
                             self.channels[channel].cfg_src = true;
                             if debug_flags::dma_reg() {
@@ -304,7 +308,7 @@ impl DmaController {
                             // If HDMA is using A2A, update only the bank portion for subsequent table reads.
                             let low = self.channels[channel].hdma_table_addr & 0x0000_FFFF;
                             self.channels[channel].hdma_table_addr =
-                                (self.channels[channel].src_address & 0xFF00_0000) | low;
+                                (self.channels[channel].src_address & 0x00FF_0000) | low;
                             if debug_flags::dma_reg() {
                                 println!("DMA ch{} src.bank=0x{:02X}", channel, value);
                             }
@@ -388,8 +392,6 @@ impl DmaController {
                         _ => {}
                     }
 
-                    // HDMAテーブルアドレスはsrc_addressと同じ
-                    self.channels[channel].hdma_table_addr = self.channels[channel].src_address;
                 }
             }
             _ => {}
@@ -462,8 +464,14 @@ impl DmaController {
                 }
             }
 
-            // HDMA転送実行
-            self.perform_hdma_transfer(i, bus);
+            // HDMA転送実行（repeat=1は毎ライン、repeat=0は最初の1回のみ）
+            let do_transfer = self.channels[i].hdma_repeat_flag || self.channels[i].hdma_do_transfer;
+            if do_transfer {
+                self.perform_hdma_transfer(i, bus);
+                if !self.channels[i].hdma_repeat_flag {
+                    self.channels[i].hdma_do_transfer = false;
+                }
+            }
 
             // ライン カウンターをデクリメント
             self.channels[i].hdma_line_counter =
@@ -486,50 +494,19 @@ impl DmaController {
 
         self.channels[channel].hdma_line_counter = line_count & 0x7F;
         self.channels[channel].hdma_repeat_flag = (line_count & 0x80) != 0;
+        self.channels[channel].hdma_do_transfer = true;
 
         // テーブルアドレスを進める
         self.channels[channel].hdma_table_addr = table_addr + 1;
-
-        // 転送単位に応じてデータサイズ（1/2/4）
-        let data_size = match self.channels[channel].get_transfer_unit() {
-            0 | 2 | 6 => 1,
-            1 | 3 | 7 => 2,
-            4 | 5 => 4,
-            _ => 1,
-        } as usize;
 
         // 間接アドレスモード: 行頭で 16bit アドレスを取得
         if self.channels[channel].hdma_indirect {
             let lo = bus.read_u8(self.channels[channel].hdma_table_addr) as u32;
             let hi = bus.read_u8(self.channels[channel].hdma_table_addr + 1) as u32;
-            // バンクは src_address のバンクを使用
-            let bank = (self.channels[channel].src_address & 0xFF0000) as u32;
+            // バンクは DASB ($43x7) を使用
+            let bank = (self.channels[channel].dasb as u32) << 16;
             self.channels[channel].hdma_indirect_addr = bank | (hi << 8) | lo;
             self.channels[channel].hdma_table_addr += 2;
-        }
-
-        // 行頭でラッチ更新
-        if !self.channels[channel].hdma_repeat_flag {
-            // 新規データを取得してラッチ
-            for i in 0..data_size.min(4) {
-                let byte = if self.channels[channel].hdma_indirect {
-                    bus.read_u8(self.channels[channel].hdma_indirect_addr + i as u32)
-                } else {
-                    bus.read_u8(self.channels[channel].hdma_table_addr + i as u32)
-                };
-                self.channels[channel].hdma_latched[i] = byte;
-            }
-            self.channels[channel].hdma_latched_len = data_size as u8;
-            if self.channels[channel].hdma_indirect {
-                self.channels[channel].hdma_indirect_addr += data_size as u32;
-            } else {
-                self.channels[channel].hdma_table_addr += data_size as u32;
-            }
-        } else {
-            // リピートの場合、以前のラッチをそのまま使用（初回は 0 にならないように data_size をセット）
-            if self.channels[channel].hdma_latched_len == 0 {
-                self.channels[channel].hdma_latched_len = data_size as u8;
-            }
         }
 
         true
@@ -543,15 +520,28 @@ impl DmaController {
         const ENABLE_DMA_REG_LOG: bool = false;
         let count = Self::hdma_transfer_len(unit) as usize;
 
-        // 転送データは、repeat=1 ならラッチ値、repeat=0 なら最新ラッチ（既に load で更新済）
+        let (src_addr, indirect) = if self.channels[channel].hdma_indirect {
+            (self.channels[channel].hdma_indirect_addr, true)
+        } else {
+            (self.channels[channel].hdma_table_addr, false)
+        };
+
         for i in 0..count {
-            let b = self.channels[channel].hdma_latched[i.min(3)];
+            let b = bus.read_u8(src_addr + i as u32);
             // Bバス宛先をモードに応じて決定
             let dest_off = Self::hdma_dest_offset(unit, dest_base, i as u8);
             let dest_addr = 0x2100u32 + dest_off as u32;
             if dest_off <= 0x33 || (dest_off >= 0x40 && dest_off <= 0x43) {
                 bus.write_u8(dest_addr, b);
             }
+        }
+
+        if indirect {
+            self.channels[channel].hdma_indirect_addr =
+                self.channels[channel].hdma_indirect_addr.wrapping_add(count as u32);
+        } else {
+            self.channels[channel].hdma_table_addr =
+                self.channels[channel].hdma_table_addr.wrapping_add(count as u32);
         }
     }
 }

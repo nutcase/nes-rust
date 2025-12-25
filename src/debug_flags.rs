@@ -305,11 +305,6 @@ pub fn trace_dma_addr() -> bool {
     *ON.get_or_init(|| env_present("TRACE_DMA_ADDR"))
 }
 
-pub fn trace_dq3_sp_mem() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_present("TRACE_DQ3_SP_MEM"))
-}
-
 pub fn trace_handshake() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_present("TRACE_HANDSHAKE"))
@@ -330,17 +325,12 @@ pub fn trace_wai() -> bool {
     *ON.get_or_init(|| env_present("TRACE_WAI"))
 }
 
-pub fn debug_dq3_loop() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_present("DEBUG_DQ3_LOOP"))
-}
-
 pub fn watch_pc_flow() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_present("WATCH_PC_FLOW"))
 }
 
-// Trace long jumps/returns (JSL/RTL) for DQ3 investigation
+// Trace long jumps/returns (JSL/RTL) for debugging
 pub fn trace_jsl() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("TRACE_JSL", false))
@@ -539,6 +529,23 @@ pub fn watch_addr_write() -> Option<u32> {
     .clone()
 }
 
+// Watch a single S-CPU read address (env WATCH_ADDR_R)
+pub fn watch_addr_read() -> Option<u32> {
+    static VAL: OnceLock<Option<u32>> = OnceLock::new();
+    VAL.get_or_init(|| {
+        std::env::var("WATCH_ADDR_R").ok().and_then(|s| {
+            if let Some((b, a)) = s.split_once(':') {
+                let bank = u8::from_str_radix(b, 16).ok()?;
+                let addr = u16::from_str_radix(a, 16).ok()?;
+                Some(((bank as u32) << 16) | addr as u32)
+            } else {
+                u32::from_str_radix(&s, 16).ok()
+            }
+        })
+    })
+    .clone()
+}
+
 // WATCH_WRAM_W: watch WRAM writes (7E/7F banks) with simple logging
 pub fn watch_wram_write() -> Option<u32> {
     static VAL: OnceLock<Option<u32>> = OnceLock::new();
@@ -596,36 +603,6 @@ pub fn sa1_force_irq_each_frame() -> bool {
 pub fn sa1_force_irq_once() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("SA1_FORCE_IRQ_ONCE", false))
-}
-
-// Force SA-1 to start executing (DQ3 workaround)
-pub fn dq3_force_sa1_boot() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_flag("DQ3_FORCE_SA1_BOOT", false))
-}
-
-// DQ3専用: SA-1を任意のエントリに飛ばす簡易ハック
-pub fn dq3_sa1_hack() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_flag("DQ3_SA1_HACK", false))
-}
-
-// DQ3専用: SA-1 内蔵IPLを最小限スタブする
-pub fn dq3_sa1_ipl_stub() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_flag("DQ3_SA1_IPL_STUB", false))
-}
-
-// DQ3デバッグ: SA-1のBRKをNOPに差し替えて実行継続を試す
-pub fn dq3_sa1_brk_to_nop() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_flag("DQ3_SA1_BRK_TO_NOP", false))
-}
-
-// DQ3デバッグ: SA-1→S-CPU ハンドシェイクを強制 (初期IRQ/NMI要求)
-pub fn dq3_sa1_handshake_stub() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_flag("DQ3_SA1_HANDSHAKE_STUB", false))
 }
 
 // SA-1待機ループ観察用: 特定PCでレジスタダンプ
@@ -744,7 +721,7 @@ pub fn debug_force_tm() -> Option<u8> {
     *VAL.get_or_init(|| env_u8_opt("DEBUG_FORCE_TM"))
 }
 
-// Ignore CPU writes to INIDISP (keep HDMA/MDMA). Debug aid for DQ3.
+// Ignore CPU writes to INIDISP (keep HDMA/MDMA). Debug aid.
 pub fn ignore_inidisp_cpu() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("IGNORE_INIDISP_CPU", false))
@@ -1010,12 +987,6 @@ pub fn debug_render_dot() -> bool {
 pub fn debug_suspicious_tile() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("DEBUG_SUSPICIOUS_TILE", false))
-}
-
-// Log DQ3-specific bank access patterns
-pub fn debug_dq3_bank() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_flag("DEBUG_DQ3_BANK", false))
 }
 
 // Log stack reads during initialization

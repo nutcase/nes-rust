@@ -815,12 +815,6 @@ fn push_u8_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T, value: u8) {
             state.pb, state.pc, state.sp, addr, value
         );
     }
-    if std::env::var_os("DQ3_SP_GUARD").is_some() && state.sp >= 0x0200 {
-        println!(
-            "DQ3_SP_GUARD push8: SP={:04X} addr={:04X} PB={:02X} PC={:04X} val={:02X}",
-            state.sp, addr, state.pb, state.pc, value
-        );
-    }
     bus.write_u8(addr, value);
     state.sp = if state.emulation_mode {
         0x0100 | ((state.sp.wrapping_sub(1)) & 0xFF)
@@ -1732,20 +1726,6 @@ fn jsl_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
     let target = addr_lo | (addr_hi << 8) | (addr_bank << 16);
     state.pc = state.pc.wrapping_add(3);
 
-    // Guard: warn if jumping to non-C0..FF banks (likely corrupt for DQ3)
-    if std::env::var_os("TRACE_DQ3_STACK_SP").is_some() && (addr_bank & 0x80) == 0 {
-        println!(
-            "DQ3GUARD JSL suspicious target bank={:02X} from PB={:02X} PC={:04X} SP={:04X} op=[{:02X} {:02X} {:02X}]",
-            addr_bank as u8,
-            state.pb,
-            state.pc.wrapping_sub(3),
-            state.sp,
-            addr_lo as u8,
-            addr_hi as u8,
-            addr_bank as u8
-        );
-    }
-
     if std::env::var_os("TRACE_PB_CALLS").is_some() || crate::debug_flags::trace_jsl() {
         let op0 = addr_lo as u8;
         let op1 = addr_hi as u8;
@@ -1806,13 +1786,6 @@ fn rtl_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
             state.pb, state.pc, state.sp, pb, pch, pcl
         );
 
-        // Guard: panic if return bank is not in upper range (C0-FF) to catch corruption
-        if std::env::var_os("DQ3_RTL_GUARD").is_some() && (pb & 0xC0) != 0xC0 {
-            panic!(
-                "DQ3_RTL_GUARD trip: PB={:02X} PC={:04X} SP={:04X} ret={:02X}:{:02X}{:02X}",
-                state.pb, state.pc, state.sp, pb, pch, pcl
-            );
-        }
     }
 
     let (addr, pb) = if state.emulation_mode {
@@ -1964,46 +1937,6 @@ pub fn execute_instruction_generic<T: CpuBus>(
         }
     }
 
-    // Debug hook: log stack top when hitting C0:2774 (DQ3 return corruption investigation)
-    if std::env::var_os("TRACE_DQ3_STACK_SP").is_some() && state.pb == 0xC0 && state.pc == 0x2774 {
-        // Where did we come from? Log previous PC (current pc is already advanced by fetch)
-        let prev_pc = state.pc.wrapping_sub(1);
-        println!(
-            "DQ3STACK enter C0:2774 from PC={:02X}:{:04X}",
-            state.pb, prev_pc
-        );
-        let sp = state.sp;
-        let sp_addr = if state.emulation_mode {
-            0x0100u32 | (sp as u32)
-        } else {
-            sp as u32
-        };
-        let pcl = bus.read_u8(sp_addr.wrapping_add(1));
-        let pch = bus.read_u8(sp_addr.wrapping_add(2));
-        let pb = bus.read_u8(sp_addr.wrapping_add(3));
-        println!(
-            "DQ3STACK PC=C0:2774 SP={:04X} ret={:02X}:{:02X}{:02X}",
-            sp, pb, pch, pcl
-        );
-        // 直前の呼び出し元を推測するため、スタック下にも少し触る
-        let pcl2 = bus.read_u8(sp_addr.wrapping_add(4));
-        let pch2 = bus.read_u8(sp_addr.wrapping_add(5));
-        let pb2 = bus.read_u8(sp_addr.wrapping_add(6));
-        println!(
-            "DQ3STACK caller+1 peek: ret2={:02X}:{:02X}{:02X}",
-            pb2, pch2, pcl2
-        );
-
-        // さらにその下も参考情報として出力
-        let pcl3 = bus.read_u8(sp_addr.wrapping_add(7));
-        let pch3 = bus.read_u8(sp_addr.wrapping_add(8));
-        let pb3 = bus.read_u8(sp_addr.wrapping_add(9));
-        println!(
-            "DQ3STACK caller+2 peek: ret3={:02X}:{:02X}{:02X}",
-            pb3, pch3, pcl3
-        );
-    }
-
     match opcode {
         // Interrupt instructions - Essential for proper CPU operation
         0x00 => {
@@ -2020,7 +1953,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
                 );
             }
             if state.brk_is_nop {
-                // Treat BRK as NOP (DQ3 debug hack)
+                // Treat BRK as NOP (debug)
                 add_cycles(state, 2);
                 2
             } else {
@@ -2102,7 +2035,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
             7
         }
 
-        // Critical instructions used by DQ3 SA-1 code
+        // Additional instructions needed by SA-1 test cases
         0x20 => jsr_generic(state, bus), // JSR absolute
         0x22 => jsl_generic(state, bus), // JSL long
         0x60 => rts_generic(state, bus), // RTS
@@ -2534,7 +2467,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
             total_cycles
         }
 
-        // Load/Store Instructions - Essential for DQ3 SA-1
+        // Load/Store instructions - extended coverage
         0x25 => {
             // AND direct page
             let (addr, penalty) = read_direct_address_generic(state, bus);
@@ -3732,18 +3665,10 @@ pub fn execute_instruction_generic<T: CpuBus>(
             } else {
                 state.a
             };
-            if std::env::var_os("TRACE_SP_CHANGE").is_some()
-                || std::env::var_os("DQ3_SP_GUARD").is_some()
-            {
+            if std::env::var_os("TRACE_SP_CHANGE").is_some() {
                 println!(
                     "SP CHANGE TCS PB={:02X} PC={:04X} {:04X}->{:04X}",
                     state.pb, state.pc, old_sp, state.sp
-                );
-            }
-            if std::env::var_os("DQ3_SP_GUARD").is_some() && state.sp >= 0x0200 {
-                println!(
-                    "DQ3_SP_GUARD TCS: new SP={:04X} PB={:02X} PC={:04X}",
-                    state.sp, state.pb, state.pc
                 );
             }
             add_cycles(state, 2);
@@ -4333,7 +4258,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
             total_cycles
         }
 
-        // Additional critical instructions used by DQ3 SA-1
+        // Additional instruction coverage
         0xD8 => {
             // CLD - Clear Decimal Mode Flag
             state.p.remove(StatusFlags::DECIMAL);
@@ -4442,7 +4367,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
             base_cycles
         }
 
-        // Second batch of critical instructions used by DQ3 SA-1
+        // Second batch of instruction coverage
         0xB3 => {
             // LDA stack relative indirect indexed (sr,S),Y
             let (addr, penalty) = read_stack_relative_indirect_y_generic(state, bus);
@@ -4517,8 +4442,8 @@ pub fn execute_instruction_generic<T: CpuBus>(
             add_cycles(state, 2);
             2
         }
-        // Third batch of critical instructions used by DQ3 SA-1
-        // Fourth batch: Critical instructions found in DQ3 SA-1 execution
+        // Third batch of instruction coverage
+        // Fourth batch: additional instruction coverage
         0xB6 => {
             // LDX direct page,Y
             let (addr, penalty) = read_direct_y_address_generic(state, bus);
@@ -4704,7 +4629,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
             6
         }
 
-        // Fifth batch: More critical instructions found in DQ3 SA-1 execution
+        // Fifth batch: more instruction coverage
         0x0C => {
             // TSB absolute - Test and Set Bits
             let addr = read_absolute_address_generic(state, bus);
@@ -5188,18 +5113,10 @@ pub fn execute_instruction_generic<T: CpuBus>(
             } else {
                 state.sp = state.x;
             }
-            if std::env::var_os("TRACE_SP_CHANGE").is_some()
-                || std::env::var_os("DQ3_SP_GUARD").is_some()
-            {
+            if std::env::var_os("TRACE_SP_CHANGE").is_some() {
                 println!(
                     "SP CHANGE TXS PB={:02X} PC={:04X} {:04X}->{:04X}",
                     state.pb, state.pc, old_sp, state.sp
-                );
-            }
-            if std::env::var_os("DQ3_SP_GUARD").is_some() && state.sp >= 0x0200 {
-                println!(
-                    "DQ3_SP_GUARD TXS: new SP={:04X} PB={:02X} PC={:04X}",
-                    state.sp, state.pb, state.pc
                 );
             }
             add_cycles(state, 2);
@@ -5214,7 +5131,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
             2
         }
 
-        // Missing opcodes frequently encountered in DQ3 SA-1 code
+        // Missing opcodes used by some test/edge cases
         0x99 => {
             // STA absolute,Y
             let (addr, penalty) = read_absolute_y_address_generic(state, bus);
@@ -5625,7 +5542,7 @@ pub fn execute_instruction_generic<T: CpuBus>(
             total_cycles
         }
 
-        // Critical instructions for DQ3 SA-1 BW-RAM communication
+        // Additional instructions for BW-RAM communication cases
         0x64 => {
             // STZ direct page
             let (addr, penalty) = read_direct_address_generic(state, bus);
@@ -6037,6 +5954,20 @@ pub fn execute_instruction_generic<T: CpuBus>(
 
 pub fn service_nmi<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
     let before = state.cycles;
+    if std::env::var_os("TRACE_NMI_TAKE").is_some() {
+        println!(
+            "[TRACE_NMI_TAKE] at {:02X}:{:04X} A={:04X} X={:04X} Y={:04X} SP={:04X} D={:04X} DB={:02X} P={:02X}",
+            state.pb,
+            state.pc,
+            state.a,
+            state.x,
+            state.y,
+            state.sp,
+            state.dp,
+            state.db,
+            state.p.bits()
+        );
+    }
     if state.emulation_mode {
         // Emulation mode: PCH, PCL, then status (bit5 forced 1, B cleared)
         push_u8_generic(state, bus, (state.pc >> 8) as u8);
@@ -6062,7 +5993,7 @@ pub fn service_nmi<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
     bus.acknowledge_nmi();
 
     let consumed = state.cycles.wrapping_sub(before) as u8;
-    let target = 7u8;
+    let target = if state.emulation_mode { 7u8 } else { 8u8 };
     if consumed < target {
         add_cycles(state, target - consumed);
         target
@@ -6106,7 +6037,7 @@ pub fn service_irq<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
     }
 
     let consumed = state.cycles.wrapping_sub(before) as u8;
-    let target = 7u8;
+    let target = if state.emulation_mode { 7u8 } else { 8u8 };
     if consumed < target {
         add_cycles(state, target - consumed);
         target

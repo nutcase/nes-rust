@@ -83,10 +83,6 @@ pub struct Ppu {
     vram: Vec<u8>,
     cgram: Vec<u8>,
     oam: Vec<u8>,
-    // DQ3専用: INIDISP への DMA/HDMA を無視するフラグ
-    dq3_block_inidisp: bool,
-    /// 強制ブランクを無視して描画するデバッグ／DQ3用のオーバーライド
-    force_display_override: bool,
 
     pub scanline: u16,
     // Current dot within the scanline (0..=340 approx). This is our dot counter.
@@ -218,6 +214,16 @@ pub struct Ppu {
     // Headless高速化用: PPUのピクセル合成（フレームバッファ書き込み）を無効化できる。
     // 画面出力が不要なフレームをスキップし、最終フレームだけ描画する用途を想定。
     framebuffer_rendering_enabled: bool,
+    // Per-line render cache (reduces per-pixel bit tests)
+    line_main_enables: u8,
+    line_sub_enables: u8,
+    line_main_has_bg: bool,
+    line_main_has_obj: bool,
+    line_sub_has_bg: bool,
+    line_sub_has_obj: bool,
+    line_hires_out: bool,
+    line_color_math_enabled: bool,
+    line_need_subscreen: bool,
 
     // SETINI ($2133)
     setini: u8,
@@ -279,6 +285,8 @@ pub struct Ppu {
 
     // Dot-level OBJ pipeline state (per visible scanline)
     line_sprites: Vec<SpriteData>,
+    // Per-priority sprite indices for the current scanline (preserve OAM order)
+    line_sprites_by_priority: [Vec<usize>; 4],
     sprite_tile_entry_counts: [u8; 256],
     sprite_tile_budget_remaining: i16,
     sprite_draw_disabled: bool,
@@ -406,7 +414,7 @@ impl Ppu {
 
     #[inline]
     fn force_display_active(&self) -> bool {
-        self.force_display_override || crate::debug_flags::force_display()
+        crate::debug_flags::force_display()
     }
 
     // --- Coarse NTSC timing helpers ---
@@ -481,12 +489,14 @@ impl Ppu {
 
     #[inline]
     fn write_m7hofs(&mut self, value: u8) {
+        // $210D also maps to M7HOFS and uses the Mode 7 latch (not BG scroll latch).
         let combined = self.mode7_combine(value);
         self.mode7_hofs = Self::sign_extend13(combined);
     }
 
     #[inline]
     fn write_m7vofs(&mut self, value: u8) {
+        // $210E also maps to M7VOFS and uses the Mode 7 latch (not BG scroll latch).
         let combined = self.mode7_combine(value);
         self.mode7_vofs = Self::sign_extend13(combined);
     }
@@ -585,13 +595,10 @@ impl Ppu {
     }
 
     pub fn new() -> Self {
-        Self {
+        let mut ppu = Self {
             vram: vec![0; 0x10000],
             cgram: vec![0; 0x200],
             oam: vec![0; 0x220],
-
-            dq3_block_inidisp: false,
-            force_display_override: false,
 
             scanline: 0,
             cycle: 0,
@@ -702,6 +709,15 @@ impl Ppu {
             render_framebuffer: vec![0; 256 * 224],
             render_subscreen_buffer: vec![0; 256 * 224],
             framebuffer_rendering_enabled: true,
+            line_main_enables: 0,
+            line_sub_enables: 0,
+            line_main_has_bg: false,
+            line_main_has_obj: false,
+            line_sub_has_bg: false,
+            line_sub_has_obj: false,
+            line_hires_out: false,
+            line_color_math_enabled: false,
+            line_need_subscreen: false,
 
             setini: 0,
             pseudo_hires: false,
@@ -748,6 +764,7 @@ impl Ppu {
             obj_time_over_lines: 0,
             oam_eval_base: 0,
             line_sprites: Vec::new(),
+            line_sprites_by_priority: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             sprite_tile_entry_counts: [0; 256],
             sprite_tile_budget_remaining: 0,
             sprite_draw_disabled: false,
@@ -818,7 +835,9 @@ impl Ppu {
             burnin_vram_trace_armed: false,
             burnin_vram_trace_cnt_2118: 0,
             burnin_vram_trace_cnt_2119: 0,
-        }
+        };
+        ppu.update_line_render_state();
+        ppu
     }
 
     pub fn step(&mut self, cycles: u16) {
@@ -854,6 +873,7 @@ impl Ppu {
             if x == 0 {
                 // Commit latched regs at the beginning of each scanline
                 self.commit_latched_display_regs();
+                self.update_line_render_state();
                 // Visible height depends on display regs (e.g., overscan) latched at line start.
                 vis_last = self.get_visible_height();
                 vblank_start = vis_last.saturating_add(1);
@@ -1099,17 +1119,37 @@ impl Ppu {
             }
         }
 
+        // Fast path: forced blank yields black without per-pixel composition.
+        if (self.screen_display & 0x80) != 0
+            && !self.force_display_active()
+            && std::env::var_os("FORCE_NO_BLANK").is_none()
+        {
+            let pixel_offset = y * 256 + x;
+            if pixel_offset < self.render_framebuffer.len() {
+                self.render_framebuffer[pixel_offset] = 0xFF000000;
+            }
+            if pixel_offset < self.render_subscreen_buffer.len() {
+                self.render_subscreen_buffer[pixel_offset] = 0;
+            }
+            return;
+        }
+
         // Use existing per-pixel composition with color math and windows.
         let (mut main_color, mut main_layer_id) =
-            self.render_main_screen_pixel_with_layer(x as u16, y as u16);
+            self.render_main_screen_pixel_with_layer_cached(x as u16, y as u16);
         let main_transparent = main_color == 0;
         // If main pixel is transparent, treat as backdrop for color math decisions
         if main_color == 0 {
             main_color = self.cgram_to_rgb(0);
             main_layer_id = 5; // Backdrop layer id
         }
-        let (sub_color, sub_layer_id, sub_transparent) =
-            self.render_sub_screen_pixel_with_layer(x as u16, y as u16);
+        let hires_out = self.line_hires_out;
+        let need_subscreen = self.line_need_subscreen;
+        let (sub_color, sub_layer_id, sub_transparent) = if need_subscreen {
+            self.render_sub_screen_pixel_with_layer_cached(x as u16, y as u16)
+        } else {
+            (0, 5, true)
+        };
 
         if let Some(cfg) = trace_sample_dot_config() {
             if self.frame == cfg.frame && (x as u16) == cfg.x && (y as u16) == cfg.y {
@@ -1160,23 +1200,32 @@ impl Ppu {
                 );
             }
         }
-        let hires_out = self.pseudo_hires || matches!(self.bg_mode, 5 | 6);
         let final_color = if hires_out {
-            let even_mix = self.apply_color_math_screens(
-                main_color,
-                sub_color,
-                main_layer_id,
-                x as u16,
-                sub_transparent,
-            );
-            let odd_mix = self.apply_color_math_screens(
-                sub_color,
-                main_color,
-                sub_layer_id,
-                x as u16,
-                main_transparent,
-            );
+            let even_mix = if self.line_color_math_enabled {
+                self.apply_color_math_screens(
+                    main_color,
+                    sub_color,
+                    main_layer_id,
+                    x as u16,
+                    sub_transparent,
+                )
+            } else {
+                main_color
+            };
+            let odd_mix = if self.line_color_math_enabled {
+                self.apply_color_math_screens(
+                    sub_color,
+                    main_color,
+                    sub_layer_id,
+                    x as u16,
+                    main_transparent,
+                )
+            } else {
+                sub_color
+            };
             Self::average_rgb(even_mix, odd_mix)
+        } else if !self.line_color_math_enabled {
+            main_color
         } else {
             self.apply_color_math_screens(
                 main_color,
@@ -1192,7 +1241,7 @@ impl Ppu {
         if pixel_offset < self.render_framebuffer.len() {
             self.render_framebuffer[pixel_offset] = final_brightness_color;
         }
-        if pixel_offset < self.render_subscreen_buffer.len() {
+        if need_subscreen && pixel_offset < self.render_subscreen_buffer.len() {
             self.render_subscreen_buffer[pixel_offset] = sub_color;
         }
     }
@@ -1224,8 +1273,8 @@ impl Ppu {
 
     fn exit_vblank(&mut self) {
         self.v_blank = false;
-        // VBlankが終わったらRDNMIフラグも必ず下げる
-        self.nmi_flag = false;
+        // RDNMIフラグ(bit7)は読み出しでクリアされるため、
+        // VBlank終了時には下げない（未読なら次フレームまで保持する）。
         self.nmi_latched = false;
         self.rdnmi_read_in_vblank = false;
         // STAT77 flags are reset at end of VBlank.
@@ -1575,6 +1624,13 @@ impl Ppu {
 
     // Tick and apply deferred control effects (called each dot)
     fn tick_deferred_ctrl_effects(&mut self) {
+        if self.vmain_effect_pending.is_none()
+            && self.cgadd_effect_pending.is_none()
+            && self.vmain_data_gap_ticks == 0
+            && self.oam_data_gap_ticks == 0
+        {
+            return;
+        }
         if self.vmain_effect_pending.is_some() {
             if self.vmain_effect_ticks > 0 {
                 self.vmain_effect_ticks -= 1;
@@ -1851,69 +1907,12 @@ impl Ppu {
             }
         }
 
-        // Dragon Quest III Data Analysis: Check if game has loaded graphics data
-        if x == 0 && y == 1 {
-            if crate::debug_flags::boot_verbose() {
-                static mut DATA_ANALYSIS_DONE: bool = false;
-                unsafe {
-                    if !DATA_ANALYSIS_DONE {
-                        DATA_ANALYSIS_DONE = true;
-                        // Check CGRAM for color data
-                        let mut non_black_colors = 0;
-                        let mut sample_colors = Vec::new();
-                        for i in 1..16 {
-                            let addr = i * 2;
-                            if addr + 1 < self.cgram.len() {
-                                let color = ((self.cgram[addr + 1] as u16) << 8)
-                                    | (self.cgram[addr] as u16);
-                                if color != 0 {
-                                    non_black_colors += 1;
-                                    if sample_colors.len() < 5 {
-                                        sample_colors.push(format!("#{}: 0x{:04X}", i, color));
-                                    }
-                                }
-                            }
-                        }
-                        println!(
-                            "🎨 DQ3 CGRAM ANALYSIS: {} non-black colors out of 15",
-                            non_black_colors
-                        );
-                        if !sample_colors.is_empty() {
-                            println!("   Sample colors: {}", sample_colors.join(", "));
-                        }
-                        // Check VRAM for tile data
-                        let mut non_zero_vram = 0;
-                        for i in (0..std::cmp::min(0x1000, self.vram.len())).step_by(4) {
-                            if self.vram[i] != 0 {
-                                non_zero_vram += 1;
-                            }
-                        }
-                        println!(
-                            "🗂️ DQ3 VRAM ANALYSIS: {} non-zero bytes in first 0x1000 bytes",
-                            non_zero_vram
-                        );
-                        // Check BG settings
-                        println!(
-                            "🖼️ DQ3 BG SETTINGS: mode={}, tile16=[{},{},{},{}]",
-                            self.bg_mode,
-                            self.bg_tile_16[0],
-                            self.bg_tile_16[1],
-                            self.bg_tile_16[2],
-                            self.bg_tile_16[3]
-                        );
-                        println!("   BG bases: tilemap=[0x{:04X}, 0x{:04X}, 0x{:04X}, 0x{:04X}], tile=[0x{:04X}, 0x{:04X}, 0x{:04X}, 0x{:04X}]",
-                                self.bg1_tilemap_base, self.bg2_tilemap_base, self.bg3_tilemap_base, self.bg4_tilemap_base,
-                                self.bg1_tile_base, self.bg2_tile_base, self.bg3_tile_base, self.bg4_tile_base);
-                    }
-                }
-            }
-        }
-
         // BGとスプライトの情報を取得 - Use main BG pixel function for proper graphics
-        let (bg_color, bg_priority, bg_id) = self.get_main_bg_pixel(x, y);
+        let enables = self.effective_main_screen_designation();
+        let (bg_color, bg_priority, bg_id) = self.get_main_bg_pixel(x, y, enables);
         let (sprite_color, sprite_priority) = self.get_sprite_pixel(x, y);
 
-        // Emergency test pattern removed - now showing actual DQ3 graphics
+        // Emergency test pattern removed - show actual graphics
 
         // Debug pixel color generation (first few pixels only)
         if crate::debug_flags::boot_verbose() {
@@ -2189,19 +2188,25 @@ impl Ppu {
         if !enabled {
             return (0, 0);
         }
+        if self.line_sprites.is_empty() {
+            return (0, 0);
+        }
         if self.should_mask_sprite(x, is_main) {
             return (0, 0);
         }
         let x_i16 = x as i16;
         let y_u8 = y as u8;
         let sprites = &self.line_sprites;
+        let sprites_by_pri = &self.line_sprites_by_priority;
 
         // 優先度順に描画（高優先度から低優先度へ）
         for priority in (0..4).rev() {
-            for sprite in sprites {
-                if sprite.priority != priority {
-                    continue;
-                }
+            let bucket = &sprites_by_pri[priority as usize];
+            if bucket.is_empty() {
+                continue;
+            }
+            for &idx in bucket {
+                let sprite = &sprites[idx];
                 let (sprite_width, sprite_height) = self.get_sprite_pixel_size(&sprite.size);
                 let sx = Self::sprite_x_signed(sprite.x);
                 let sy = sprite.y;
@@ -2416,7 +2421,7 @@ impl Ppu {
             }
             5 => {
                 // Mode 5: BG1は4bpp、BG2は2bpp（高解像度）
-                // Note: Some games (e.g., DQ3) also use BG3 in Mode 5
+                // Note: Some games also use BG3 in Mode 5
                 if self.effective_main_screen_designation() & 0x01 != 0
                     && !self.should_mask_bg(x, 0, true)
                 {
@@ -2615,7 +2620,7 @@ impl Ppu {
             }
             5 => {
                 // Mode 5: BG1は4bpp、BG2は2bpp（高解像度）
-                // Note: Some games (e.g., DQ3) also use BG3 in Mode 5
+                // Note: Some games also use BG3 in Mode 5
                 if self.effective_main_screen_designation() & 0x01 != 0
                     && !self.should_mask_bg(x, 0, true)
                 {
@@ -2664,10 +2669,11 @@ impl Ppu {
                     } else {
                         x as i32
                     };
+                    let screen_y = y.saturating_add(1);
                     let sy = if (self.m7sel & 0x02) != 0 {
-                        255 - (y as i32)
+                        255 - (screen_y as i32)
                     } else {
-                        y as i32
+                        screen_y as i32
                     };
                     let (wx, wy) = self.mode7_world_xy_int(sx, sy);
                     let repeat_off = (self.m7sel & 0x80) != 0;
@@ -4873,28 +4879,6 @@ impl Ppu {
                 let defer_update =
                     crate::debug_flags::strict_ppu_timing() && self.in_active_display();
 
-                // DQ3: optionally block DMA/HDMAによる強制ブランキング
-                if self.dq3_block_inidisp && self.write_ctx != 0 {
-                    return;
-                }
-
-                // Optional debug override: ignore forced blank/zero brightness when DQ3_FORCE_DISPLAY=1
-                if std::env::var("DQ3_FORCE_DISPLAY")
-                    .map(|v| v == "1" || v.to_lowercase() == "true")
-                    .unwrap_or(false)
-                {
-                    // Clear forced blank bit and clamp brightness to at least 1
-                    let mut forced = value & 0x0F;
-                    if forced == 0 {
-                        forced = 0x0F;
-                    }
-                    let mut patched = value & 0xF0; // keep high nibble for logging
-                    patched &= !0x80; // clear forced blank
-                    patched = (patched & 0xF0) | (forced & 0x0F);
-                    if patched != value {
-                        value = patched;
-                    }
-                }
                 // Optional: globally lock the display ON (for stubborn titles like SMW when APU upload is stubbed)
                 if std::env::var("FORCE_INIDISP_ON")
                     .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -5160,6 +5144,7 @@ impl Ppu {
                         );
                     }
                 }
+                self.update_line_render_state();
             }
             0x06 => {
                 self.bg_mosaic = value;
@@ -5243,14 +5228,14 @@ impl Ppu {
                 }
             }
             0x0D => {
-                self.write_bghofs(0, value);
-                // $210D also maps to M7HOFS (Mode 7)
+                // $210D also maps to M7HOFS (Mode 7); uses the Mode 7 latch (shared with $211B-$2120).
                 self.write_m7hofs(value);
+                self.write_bghofs(0, value);
             }
             0x0E => {
-                self.write_bgvofs(0, value);
-                // $210E also maps to M7VOFS (Mode 7)
+                // $210E also maps to M7VOFS (Mode 7); uses the Mode 7 latch (shared with $211B-$2120).
                 self.write_m7vofs(value);
+                self.write_bgvofs(0, value);
             }
             0x0F => {
                 self.write_bghofs(1, value);
@@ -5710,6 +5695,7 @@ impl Ppu {
                     if value != 0 {
                         self.main_screen_designation_last_nonzero = value;
                     }
+                    self.update_line_render_state();
                 }
                 if crate::debug_flags::trace_ppu_tm() {
                     use std::sync::atomic::{AtomicU32, Ordering};
@@ -5757,6 +5743,7 @@ impl Ppu {
                     self.latched_ts = Some(value);
                 } else {
                     self.sub_screen_designation = value;
+                    self.update_line_render_state();
                 }
             }
             0x2E => {
@@ -5830,6 +5817,7 @@ impl Ppu {
                 } else {
                     self.cgwsel = value;
                     self.color_math_control = value; // legacy
+                    self.update_line_render_state();
                 }
             }
             0x31 => {
@@ -5839,6 +5827,7 @@ impl Ppu {
                 } else {
                     self.cgadsub = value;
                     self.color_math_designation = value; // legacy: lower 6 bits as layer mask
+                    self.update_line_render_state();
                 }
             }
             0x32 => {
@@ -5883,6 +5872,7 @@ impl Ppu {
                     self.overscan = (value & 0x04) != 0;
                     self.obj_interlace = (value & 0x02) != 0;
                     self.interlace = (value & 0x01) != 0;
+                    self.update_line_render_state();
                 }
             }
 
@@ -5989,16 +5979,6 @@ impl Ppu {
         self.render_framebuffer.fill(color);
         self.subscreen_buffer.fill(color);
         self.render_subscreen_buffer.fill(color);
-    }
-
-    /// DQ3デバッグ用: INIDISP への DMA/HDMA 書き込みを無視するかを設定
-    pub fn set_block_inidisp(&mut self, on: bool) {
-        self.dq3_block_inidisp = on;
-    }
-
-    /// 強制ブランク無視フラグ（DQ3用）を設定
-    pub fn set_force_display_override(&mut self, on: bool) {
-        self.force_display_override = on;
     }
 
     /// デバッグ用: BG1 のタイルマップ／タイルベースアドレスを取得
@@ -6216,6 +6196,9 @@ impl Ppu {
     // Build per-line OBJ pipeline: pick first 32 overlapping sprites and precompute tile starts
     fn prepare_line_obj_pipeline(&mut self, scanline: u16) {
         self.line_sprites.clear();
+        for bucket in &mut self.line_sprites_by_priority {
+            bucket.clear();
+        }
         self.sprite_overflow = false;
         self.sprite_time_over = false;
         // We currently do not emulate the partial-tile fetch artifact precisely; keep rendering ungated.
@@ -6307,6 +6290,7 @@ impl Ppu {
             }
 
             if count_seen < 32 {
+                let idx = self.line_sprites.len();
                 self.line_sprites.push(SpriteData {
                     x,
                     y,
@@ -6317,6 +6301,9 @@ impl Ppu {
                     flip_y,
                     size,
                 });
+                if (priority as usize) < self.line_sprites_by_priority.len() {
+                    self.line_sprites_by_priority[priority as usize].push(idx);
+                }
                 count_seen = count_seen.saturating_add(1);
             }
             // Do not break early; keep scanning to detect overflow realistcally
@@ -6377,6 +6364,10 @@ impl Ppu {
 
     // Precompute per-x window masks for BG/OBJ and color window (dot gating)
     fn prepare_line_window_luts(&mut self) {
+        if self.tmw_mask == 0 && self.tsw_mask == 0 && self.window_color_mask == 0 {
+            self.line_window_prepared = false;
+            return;
+        }
         self.line_window_prepared = true;
         for x in 0..256u16 {
             // Color window
@@ -6505,6 +6496,23 @@ impl Ppu {
             self.mode2_opt_hscroll_lut[1][col] = bg2_h;
             self.mode2_opt_vscroll_lut[1][col] = bg2_v;
         }
+    }
+
+    #[inline]
+    fn update_line_render_state(&mut self) {
+        let main = self.effective_main_screen_designation();
+        let sub = self.sub_screen_designation;
+        self.line_main_enables = main;
+        self.line_sub_enables = sub;
+        self.line_main_has_bg = (main & 0x0F) != 0;
+        self.line_main_has_obj = (main & 0x10) != 0;
+        self.line_sub_has_bg = (sub & 0x0F) != 0;
+        self.line_sub_has_obj = (sub & 0x10) != 0;
+        self.line_hires_out = self.pseudo_hires || matches!(self.bg_mode, 5 | 6);
+        let color_mask = self.cgadsub & 0x3F;
+        let use_sub_src = (self.cgwsel & 0x02) != 0;
+        self.line_color_math_enabled = (self.cgwsel & 0xF0) != 0 || color_mask != 0;
+        self.line_need_subscreen = self.line_hires_out || (use_sub_src && color_mask != 0);
     }
 
     // Read a tilemap entry word for BG1..BG4 at the given (tile_x, tile_y).
@@ -6801,9 +6809,9 @@ impl Ppu {
     fn mode7_world_xy_int(&self, sx: i32, sy: i32) -> (i32, i32) {
         // Promote to i64 to avoid overflow in affine products.
         //
-        // SNESdev / Super Famicom Wiki:
-        //   [X]   [A B] [SX + M7HOFS - CX] + [CX]
-        //   [Y] = [C D] [SY + M7VOFS - CY] + [CY]
+        // Mode 7 affine (SNESdev):
+        //   [X]   [A B] [SX + HOFS - CX] + [CX]
+        //   [Y] = [C D] [SY + VOFS - CY]   [CY]
         //
         // A..D are signed 8.8 fixed; SX/SY, HOFS/VOFS, CX/CY are signed integers.
         let a = self.mode7_matrix_a as i64;
@@ -6823,11 +6831,26 @@ impl Ppu {
         (x as i32, y as i32)
     }
 
-    // メインスクリーン描画（レイヤID付き）
-    fn render_main_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8) {
+    // メインスクリーン描画（レイヤID付き）共通処理
+    fn render_main_screen_pixel_with_layer_internal(
+        &mut self,
+        x: u16,
+        y: u16,
+        enables: u8,
+        has_bg: bool,
+        has_obj: bool,
+    ) -> (u32, u8) {
         // BGとスプライトの情報を取得
-        let (bg_color, bg_priority, bg_id) = self.get_main_bg_pixel(x, y);
-        let (sprite_color, sprite_priority) = self.get_sprite_pixel(x, y);
+        let (bg_color, bg_priority, bg_id) = if has_bg {
+            self.get_main_bg_pixel(x, y, enables)
+        } else {
+            (0, 0, 0)
+        };
+        let (sprite_color, sprite_priority) = if has_obj {
+            self.get_sprite_pixel_common(x, y, true, true)
+        } else {
+            (0, 0)
+        };
 
         // プライオリティベースの合成（レイヤIDも取得）
         let (final_color, layer_id) = self.composite_pixel_with_layer(
@@ -6894,10 +6917,28 @@ impl Ppu {
         (final_color, layer_id)
     }
 
-    // メインスクリーン用BGの最前面色とその優先度を取得
-    fn get_main_bg_pixel(&mut self, x: u16, y: u16) -> (u32, u8, u8) {
-        // Hot path: avoid per-pixel heap allocations.
+    // メインスクリーン描画（レイヤID付き）
+    fn render_main_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8) {
         let enables = self.effective_main_screen_designation();
+        let has_bg = (enables & 0x0F) != 0;
+        let has_obj = (enables & 0x10) != 0;
+        self.render_main_screen_pixel_with_layer_internal(x, y, enables, has_bg, has_obj)
+    }
+
+    // Render path for active scanlines using cached per-line enables.
+    fn render_main_screen_pixel_with_layer_cached(&mut self, x: u16, y: u16) -> (u32, u8) {
+        self.render_main_screen_pixel_with_layer_internal(
+            x,
+            y,
+            self.line_main_enables,
+            self.line_main_has_bg,
+            self.line_main_has_obj,
+        )
+    }
+
+    // メインスクリーン用BGの最前面色とその優先度を取得
+    fn get_main_bg_pixel(&mut self, x: u16, y: u16, enables: u8) -> (u32, u8, u8) {
+        // Hot path: avoid per-pixel heap allocations.
 
         let mut best_color: u32 = 0;
         let mut best_pr: u8 = 0;
@@ -7017,12 +7058,14 @@ impl Ppu {
                 }
             }
             7 => {
-                let (c, p, lid) = self.render_mode7_with_layer(x, y);
-                if c != 0 {
-                    let id = if self.extbg { lid } else { 0 };
-                    let en_bit = 1u8 << id;
-                    if (enables & en_bit) != 0 && !self.should_mask_bg(x, id, true) {
-                        consider!(c, p, id);
+                if (enables & 0x03) != 0 {
+                    let (c, p, lid) = self.render_mode7_with_layer(x, y);
+                    if c != 0 {
+                        let id = if self.extbg { lid } else { 0 };
+                        let en_bit = 1u8 << id;
+                        if (enables & en_bit) != 0 && !self.should_mask_bg(x, id, true) {
+                            consider!(c, p, id);
+                        }
                     }
                 }
             }
@@ -7039,26 +7082,12 @@ impl Ppu {
     // サブスクリーン描画
     #[allow(dead_code)]
     fn render_sub_screen_pixel(&mut self, x: u16, y: u16) -> u32 {
-        let (bg_color, bg_priority, bg_id) = self.get_sub_bg_pixel(x, y);
-        let (sprite_color, sprite_priority) = self.get_sub_sprite_pixel(x, y);
-
-        let (final_color, _lid) = self.composite_pixel_with_layer(
-            bg_color,
-            bg_priority,
-            bg_id,
-            sprite_color,
-            sprite_priority,
-        );
-
-        if final_color != 0 {
-            final_color
-        } else {
-            // When the entire sub-screen is transparent, real hardware uses the fixed
-            // color ($2132) instead of CGRAM color 0. This matters for color math
-            // tricks used by the official burn-in test suite (OBJTEST expects a white
-            // background via fixed color).
-            self.fixed_color_to_rgb()
-        }
+        let enables = self.sub_screen_designation;
+        let has_bg = (enables & 0x0F) != 0;
+        let has_obj = (enables & 0x10) != 0;
+        let (color, _lid, _transparent) =
+            self.render_sub_screen_pixel_with_layer_internal(x, y, has_bg, has_obj);
+        color
     }
 
     // サブスクリーン描画（レイヤID付き）
@@ -7066,9 +7095,23 @@ impl Ppu {
     // - color: 合成後のRGBA
     // - layer_id: 最前面レイヤ（0..4、5=backdrop）
     // - transparent: サブスクリーンが完全透明で、fixed color ($2132) をbackdropとして返した場合
-    fn render_sub_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8, bool) {
-        let (bg_color, bg_priority, bg_id) = self.get_sub_bg_pixel(x, y);
-        let (sprite_color, sprite_priority) = self.get_sub_sprite_pixel(x, y);
+    fn render_sub_screen_pixel_with_layer_internal(
+        &mut self,
+        x: u16,
+        y: u16,
+        has_bg: bool,
+        has_obj: bool,
+    ) -> (u32, u8, bool) {
+        if !has_bg && !has_obj {
+            // No sub-screen layers enabled -> fixed color backdrop.
+            return (self.fixed_color_to_rgb(), 5, true);
+        }
+        let (bg_color, bg_priority, bg_id) = if has_bg {
+            self.get_sub_bg_pixel(x, y)
+        } else {
+            (0, 0, 0)
+        };
+        let (sprite_color, sprite_priority) = self.get_sprite_pixel_common(x, y, has_obj, false);
         let (final_color, layer_id) = self.composite_pixel_with_layer(
             bg_color,
             bg_priority,
@@ -7082,6 +7125,22 @@ impl Ppu {
             // Sub-screen backdrop is the fixed color ($2132), not CGRAM[0].
             (self.fixed_color_to_rgb(), 5, true)
         }
+    }
+
+    fn render_sub_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8, bool) {
+        let enables = self.sub_screen_designation;
+        let has_bg = (enables & 0x0F) != 0;
+        let has_obj = (enables & 0x10) != 0;
+        self.render_sub_screen_pixel_with_layer_internal(x, y, has_bg, has_obj)
+    }
+
+    fn render_sub_screen_pixel_with_layer_cached(&mut self, x: u16, y: u16) -> (u32, u8, bool) {
+        self.render_sub_screen_pixel_with_layer_internal(
+            x,
+            y,
+            self.line_sub_has_bg,
+            self.line_sub_has_obj,
+        )
     }
 
     // サブスクリーン用BG描画（メインと同等のモード対応）
@@ -7195,12 +7254,14 @@ impl Ppu {
                 }
             }
             7 => {
-                let (c, p, lid) = self.render_mode7_with_layer(x, y);
-                if c != 0 {
-                    let id = if self.extbg { lid } else { 0 };
-                    let en_bit = 1u8 << id;
-                    if (enables & en_bit) != 0 && !self.should_mask_bg(x, id, false) {
-                        consider!(c, p, id);
+                if (enables & 0x03) != 0 {
+                    let (c, p, lid) = self.render_mode7_with_layer(x, y);
+                    if c != 0 {
+                        let id = if self.extbg { lid } else { 0 };
+                        let en_bit = 1u8 << id;
+                        if (enables & en_bit) != 0 && !self.should_mask_bg(x, id, false) {
+                            consider!(c, p, id);
+                        }
                     }
                 }
             }
@@ -7233,13 +7294,18 @@ impl Ppu {
         if (self.screen_display & 0x80) != 0 && !self.force_display_active() {
             return 0;
         }
+        // Fast path: no window regions and no color-math enabled
+        if (self.cgwsel & 0xF0) == 0 && (self.cgadsub & 0x3F) == 0 {
+            return main_color_in;
+        }
 
         // Color window W(x): 1=inside, 0=outside.
-        // If the color window is disabled by WOBJSEL, everything is "outside".
-        let win = if self.line_window_prepared {
-            self.color_window_lut.get(x as usize).copied().unwrap_or(0) != 0
-        } else if self.window_color_mask == 0 {
+        // If the color window is disabled (WOBJSEL upper nibble = 0), do not apply MM/SS.
+        let color_window_enabled = self.window_color_mask != 0;
+        let win = if !color_window_enabled {
             false
+        } else if self.line_window_prepared {
+            self.color_window_lut.get(x as usize).copied().unwrap_or(0) != 0
         } else {
             self.evaluate_window_mask(x, self.window_color_mask, self.color_window_logic)
         };
@@ -7259,7 +7325,7 @@ impl Ppu {
         // Apply main-screen black region *before* color math, but do not suppress color math.
         // (Real hardware still performs color math even when the main screen is replaced with black.)
         let mut main_color = main_color_in;
-        if region_hit(mm, win) && !self.force_display_active() {
+        if color_window_enabled && region_hit(mm, win) && !self.force_display_active() {
             if crate::debug_flags::render_metrics() {
                 if mm == 1 {
                     self.dbg_clip_outside = self.dbg_clip_outside.saturating_add(1);
@@ -7278,7 +7344,7 @@ impl Ppu {
 
         // Mask color math via the sub-screen transparent region.
         // When active, output the (possibly black-clipped) main screen color unchanged.
-        if region_hit(ss, win) && !self.force_display_active() {
+        if color_window_enabled && region_hit(ss, win) && !self.force_display_active() {
             return main_color;
         }
 

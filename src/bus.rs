@@ -4434,7 +4434,6 @@ impl Bus {
         // 参照の衝突を避けるため、必要値を先に取り出す
         let table_addr = { self.dma_controller.channels[channel].hdma_table_addr };
         let control = { self.dma_controller.channels[channel].control };
-        let dest_base = { self.dma_controller.channels[channel].dest_address };
 
         let line_info = self.read_u8(table_addr);
         if line_info == 0 {
@@ -4453,8 +4452,6 @@ impl Bus {
             line_count = 128;
         }
         let indirect = (control & 0x40) != 0; // bit6: indirect addressing
-        let unit = control & 0x07;
-        let len = Self::hdma_transfer_len(unit) as usize;
 
         // NOTE: HDMA tables live in the bank specified by A1Bn ($43x4) / src_address bank.
         // Indirect HDMA data blocks live in the bank specified by DASB ($43x7).
@@ -4481,27 +4478,6 @@ impl Bus {
             ch.hdma_table_addr = Bus::add16_in_bank(ch.hdma_table_addr, 2);
         }
 
-        // Latch data for this entry once; repeat entries reuse it on each line.
-        if len != 0 {
-            let src = if indirect {
-                self.dma_controller.channels[channel].hdma_indirect_addr
-            } else {
-                self.dma_controller.channels[channel].hdma_table_addr
-            };
-            let mut latched = [0u8; 4];
-            for i in 0..len.min(4) {
-                latched[i] = self.read_u8(Bus::add16_in_bank(src, i as u32));
-            }
-            let mut ch = &mut self.dma_controller.channels[channel];
-            ch.hdma_latched = latched;
-            ch.hdma_latched_len = len as u8;
-            if indirect {
-                ch.hdma_indirect_addr = Bus::add16_in_bank(src, len as u32);
-            } else {
-                ch.hdma_table_addr = Bus::add16_in_bank(src, len as u32);
-            }
-        }
-
         true
     }
 
@@ -4514,10 +4490,18 @@ impl Bus {
         let control = { self.dma_controller.channels[channel].control };
         let unit = control & 0x07;
         let len = Self::hdma_transfer_len(unit) as usize;
-        let bytes = self.dma_controller.channels[channel].hdma_latched;
+        let (src, indirect) = {
+            let ch = &self.dma_controller.channels[channel];
+            if ch.hdma_indirect {
+                (ch.hdma_indirect_addr, true)
+            } else {
+                (ch.hdma_table_addr, false)
+            }
+        };
 
         // 書き込み（PPU writable or APU I/O）
-        for (i, data) in bytes.iter().enumerate().take(len) {
+        for i in 0..len {
+            let data = self.read_u8(Bus::add16_in_bank(src, i as u32));
             let dest_off = Self::hdma_dest_offset(unit, dest_base, i as u8);
             let dest_addr = 0x2100u32 + dest_off as u32;
             if dest_off <= 0x33 || (0x40..=0x43).contains(&dest_off) {
@@ -4533,11 +4517,11 @@ impl Bus {
                             self.ppu.get_cycle(),
                             channel,
                             dest_off,
-                            *data
+                            data
                         );
                     }
                 }
-                self.write_u8(dest_addr, *data);
+                self.write_u8(dest_addr, data);
                 // Aggregate per-port stats for concise logs
                 match dest_off {
                     0x15..=0x19 => {
@@ -4558,6 +4542,15 @@ impl Bus {
                     }
                     _ => {}
                 }
+            }
+        }
+        // Advance source pointer after the transfer.
+        if len != 0 {
+            let ch = &mut self.dma_controller.channels[channel];
+            if indirect {
+                ch.hdma_indirect_addr = Bus::add16_in_bank(ch.hdma_indirect_addr, len as u32);
+            } else {
+                ch.hdma_table_addr = Bus::add16_in_bank(ch.hdma_table_addr, len as u32);
             }
         }
         self.ppu.end_hdma_context();

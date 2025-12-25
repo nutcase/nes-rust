@@ -39,7 +39,7 @@ impl SnesController {
             buttons: 0,
             auto_buttons: 0,
             // Power-on: no buttons pressed.
-            // SNES joypad bits are "1=Low=Pressed", so unpressed = 0.
+            // SNES joypad report bits are treated as "1=pressed" in most docs.
             // Some ROMs read $4016/$4017 before any strobe edge, so keep this sane.
             shift_register: 0x0000,
             latched_buttons: 0x0000,
@@ -48,7 +48,7 @@ impl SnesController {
     }
 
     /// SNES の $4016/$4017 および $4218-$421F の 16-bit 出力形式に変換した値を返す。
-    /// 1 = Low = 押下, 0 = High = 未押下
+    /// 1 = 押下, 0 = 未押下
     ///
     /// 注意: SNES の自動ジョイパッド読み取り/シリアル読み取りは MSB(Bボタン) から出力される。
     /// よって本関数は以下のビット配置で返す:
@@ -138,8 +138,8 @@ impl SnesController {
         } else {
             // シフトレジスタから1ビットずつ読み出し（MSBから: Bが最初）。
             let result = ((self.shift_register & 0x8000) != 0) as u8;
-            // 読み切った後は0を返す（High=未押下）
-            self.shift_register <<= 1;
+            // 読み切った後は1を返す（公式コントローラは1を返す）
+            self.shift_register = (self.shift_register << 1) | 1;
             result
         }
     }
@@ -148,7 +148,7 @@ impl SnesController {
         // ボタンの読み出し順序に合わせて並び替え
         // SNESの読み出し順序（MSB→LSB）:
         //   B, Y, Select, Start, Up, Down, Left, Right, A, X, L, R, 0, 0, 0, 0
-        // 実機出力に合わせ「1=Low=Pressed」に変換する
+        // 実機出力に合わせて並べた 1=Pressed のビット列
         self.latched_buttons = self.active_low_bits();
         self.shift_register = self.latched_buttons;
     }
@@ -295,19 +295,7 @@ impl InputSystem {
             buttons |= button::SELECT;
         }
 
-        // Keyboard → controller port mapping (default: port1).
-        // Some test ROMs (e.g. Super NES Service) use controller2 for navigation.
-        let input_port = std::env::var("INPUT_PORT")
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(1);
-        match input_port {
-            2 => self.controller2.set_buttons(buttons),
-            _ => self.controller1.set_buttons(buttons),
-        }
-        if std::env::var_os("INPUT_MIRROR_P1_TO_P2").is_some() {
-            self.controller2.set_buttons(buttons);
-        }
+        self.controller1.set_buttons(buttons);
     }
 
     pub fn set_multitap_enabled(&mut self, enabled: bool) {
