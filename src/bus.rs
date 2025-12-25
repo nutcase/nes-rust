@@ -346,7 +346,7 @@ impl Bus {
 
             joy_busy_counter: 0,
             // $4218-$421F (JOY1..4): power-on should read as "no buttons pressed".
-            // SNES joypad bits are "1=Low=Pressed", so default is 0x00.
+            // Bits are treated as 1=pressed, so default is 0x00.
             joy_data: [0x00; 8],
             // JOYBUSY はオートジョイパッド読み取り中だけ立つ。
             // 実機では約 3 本分のスキャンライン相当 (4224 master cycles) 継続する。
@@ -424,57 +424,7 @@ impl Bus {
         // Mirror WRIO bit7 to PPU latch enable.
         bus.ppu.set_wio_latch_enable(true);
 
-        // DQ3専用ブートハック: BW-RAM に SA-1 ROM 0C:6000-FFFF を展開して待機ループを回避
-        if bus.mapper_type == crate::cartridge::MapperType::DragonQuest3 {
-            // Fill BW-RAM with 0xFF to mimic power-on state
-            bus.sa1_bwram.fill(0xFF);
-            bus.copy_sa1_bwram_from_rom(0x0C, 0x6000, 0xA000);
-            // Set ready flag at 00:7DE2 (BWRAM) to 01 00 00 00
-            bus.dq3_bwram_set_ready();
-        }
-
         bus
-    }
-
-    // Helper: copy a chunk from SA-1 ROM bank into BW-RAM (for DQ3 bootstrap)
-    fn copy_sa1_bwram_from_rom(&mut self, bank: u8, offset: u16, len: usize) {
-        if self.sa1_bwram.is_empty() {
-            return;
-        }
-        let mut remaining = len.min(self.sa1_bwram.len());
-        let mut off = offset as usize;
-        let mut written = 0usize;
-        while remaining > 0 {
-            let phys = self.sa1_phys_addr(bank as u32, (off & 0xFFFF) as u16);
-            let byte = self.rom.get(phys % self.rom_size).copied().unwrap_or(0x00);
-            self.sa1_bwram[written] = byte;
-            written += 1;
-            off = off.wrapping_add(1);
-            remaining -= 1;
-        }
-        if std::env::var_os("TRACE_SA1_BOOT").is_some() {
-            println!(
-                "[SA1] BW-RAM filled from ROM bank {:02X} offset 0x{:04X} len=0x{:04X}",
-                bank, offset, len
-            );
-        }
-    }
-
-    pub fn dq3_bwram_set_ready(&mut self) {
-        if self.mapper_type != crate::cartridge::MapperType::DragonQuest3 {
-            return;
-        }
-        // BWRAM index for 00:7DE2 = 0x7DE2 -> block0 offset
-        let idx = 0x7DE2usize;
-        if idx + 4 <= self.sa1_bwram.len() {
-            self.sa1_bwram[idx] = 0x01;
-            self.sa1_bwram[idx + 1] = 0x00;
-            self.sa1_bwram[idx + 2] = 0x00;
-            self.sa1_bwram[idx + 3] = 0x00;
-            if std::env::var_os("TRACE_BWRAM_SYS").is_some() {
-                println!("BWRAM SYS W (hack) idx=0x{:05X} val=01 00 00 00", idx);
-            }
-        }
     }
 
     pub fn new_with_mapper(
@@ -550,7 +500,7 @@ impl Bus {
 
             joy_busy_counter: 0,
             // $4218-$421F (JOY1..4): power-on should read as "no buttons pressed".
-            // SNES joypad bits are "1=Low=Pressed", so default is 0x00.
+            // Bits are treated as 1=pressed, so default is 0x00.
             joy_data: [0x00; 8],
             joy_busy_scanlines: std::env::var("JOYBUSY_SCANLINES")
                 .ok()
@@ -622,22 +572,6 @@ impl Bus {
 
         // Mirror WRIO bit7 to PPU latch enable.
         bus.ppu.set_wio_latch_enable(true);
-
-        // DQ3 boot hack: seed WRAM 7F:002C with a sane stack pointer until SA-1 initializes it.
-        if mapper == crate::cartridge::MapperType::DragonQuest3 {
-            let idx = 0x1002C;
-            if idx + 1 < bus.wram.len() {
-                bus.wram[idx] = 0x32;
-                bus.wram[idx + 1] = 0x01;
-            }
-
-            // DQ3専用: SA-1内蔵IPLの初期化相当をエミュレート。
-            //  - BWRAMを0xFFでクリア（上で初期化済み）
-            //  - ROMバンク0Cの 0x6000-0xFFFF をBWRAMに展開
-            //  - ゲームが参照する「準備完了」フラグ(00:7DE2)をセット
-            bus.copy_sa1_bwram_from_rom(0x0C, 0x6000, 0xA000);
-            bus.dq3_bwram_set_ready();
-        }
 
         bus
     }
@@ -743,7 +677,7 @@ impl Bus {
             self.sa1.registers.reset_vector = 0x0000;
             self.sa1.registers.control = 0x20;
             // Signal “DMA complete / BW-RAM ready” and raise SA-1→S-CPU IRQ once,
-            // which matches the observable post-IPL state many games (DQ3含む) rely on.
+            // which matches the observable post-IPL state many games rely on.
             self.sa1.registers.sie |= Sa1::IRQ_LINE_BIT;
             self.sa1.registers.interrupt_enable = self.sa1.registers.sie;
             self.sa1.registers.interrupt_pending |= Sa1::IRQ_DMA_FLAG | Sa1::IRQ_LINE_BIT;
@@ -752,20 +686,6 @@ impl Bus {
             }
         }
 
-        // Note: do NOT auto-assert SA-1 IRQ/SIE here. Dragon Quest III expects the
-        // internal IPL to finish copying BW-RAM stubs before the first IRQ is raised.
-        // The old code forced an early IRQ, which jumped into uninitialized BW-RAM
-        // (vector 00:7222) and halted progress. If you need the legacy behavior for
-        // debugging, set DQ3_FAKE_IPL=1.
-        if self.mapper_type == crate::cartridge::MapperType::DragonQuest3
-            && std::env::var("DQ3_FAKE_IPL")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false)
-        {
-            self.sa1.registers.sie = Sa1::IRQ_LINE_BIT;
-            self.sa1.registers.interrupt_enable = self.sa1.registers.sie;
-            self.sa1.registers.interrupt_pending |= Sa1::IRQ_DMA_FLAG | Sa1::IRQ_LINE_BIT;
-        }
         // Immediately position SA-1 core at reset vector (avoid pending_reset wiping flags)
         self.sa1.cpu.emulation_mode = false;
         self.sa1.cpu.p = crate::cpu::StatusFlags::from_bits_truncate(0x34);
@@ -787,35 +707,6 @@ impl Bus {
         }
     }
 
-    /// Force-start SA-1 execution (DQ3-only debug helper).
-    pub fn force_sa1_boot(&mut self) {
-        if !self.is_sa1_active() {
-            return;
-        }
-        self.init_sa1_vectors_from_rom();
-        // Enable SA-1 IRQ handling and assert S-CPU->SA-1 IRQ request (SCNT bit5).
-        self.sa1.registers.control |= 0x01;
-        self.sa1.registers.scnt |= 0x20;
-        self.sa1.cpu.pb = 0x00;
-        self.sa1.cpu.pc = self.sa1.registers.reset_vector;
-        self.sa1.boot_vector_applied = true;
-        self.sa1.cpu.sync_core_from_cpu();
-        // Optional: force an SA-1 IRQ to S-CPU once, for debugging DQ3 stalls
-        if crate::debug_flags::sa1_force_irq_once() {
-            self.sa1.registers.interrupt_pending |= Sa1::IRQ_LINE_BIT;
-            println!("[debug] SA-1 forced IRQ once (IRQ_LINE_BIT)");
-        }
-        if std::env::var_os("TRACE_SA1_BOOT").is_some() {
-            println!(
-                "DQ3 force SA-1 boot: PB={:02X} PC={:04X} ctrl=0x{:02X} scnt=0x{:02X}",
-                self.sa1.cpu.pb,
-                self.sa1.cpu.pc,
-                self.sa1.registers.control,
-                self.sa1.registers.scnt
-            );
-        }
-    }
-
     /// Run the SA-1 core for a slice of time proportional to the S-CPU cycles just executed.
     /// We use a coarse 3:1 frequency ratio (SA-1 ~10.74MHz vs S-CPU 3.58MHz).
     pub fn run_sa1_scheduler(&mut self, cpu_cycles: u8) {
@@ -823,7 +714,7 @@ impl Bus {
             return;
         }
 
-        // Optional: dump SA-1 IRAM/BWRAM head once for debugging (DQ3調査)
+        // Optional: dump SA-1 IRAM/BWRAM head once for debugging
         if std::env::var_os("TRACE_SA1_MEM").is_some() {
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::OnceLock;
@@ -832,7 +723,7 @@ impl Bus {
             if !flag.swap(true, Ordering::SeqCst) {
                 let iram_head: Vec<u8> = self.sa1_iram.iter().take(64).copied().collect();
                 let bwram_head: Vec<u8> = self.sa1_bwram.iter().take(64).copied().collect();
-                // Also dump area around 00:7DE0 (DQ3 polls there)
+                // Also dump area around 00:7DE0
                 let bw_idx = 0x07DE0usize;
                 let bw_slice: Vec<u8> = self
                     .sa1_bwram
@@ -845,122 +736,6 @@ impl Bus {
                     "[SA1-MEM] IRAM[0..64]={:02X?}\n[SA1-MEM] BWRAM[0..64]={:02X?}\n[SA1-MEM] BWRAM[0x07DE0..]={:02X?}",
                     iram_head, bwram_head, bw_slice
                 );
-            }
-        }
-
-        // DQ3: 毎スライスでSA-1マスク/ラインを強制ON（CIE/SIE/CONTROL）
-        if self.mapper_type == crate::cartridge::MapperType::DragonQuest3 {
-            let force_ctrl = std::env::var("DQ3_FORCE_SA1_CTRL")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false);
-            if force_ctrl {
-                self.sa1.registers.control |= 0xF0; // IRQ/NMI select bits ON
-                self.sa1.registers.cie = 0xE0; // enable IRQ/NMI/TMR toward SA-1 core
-                self.sa1.registers.sie = 0xA0 | Sa1::IRQ_LINE_BIT; // enable IRQ + DMA flag toward S-CPU
-                self.sa1.registers.interrupt_enable = self.sa1.registers.sie;
-                // Wake SA-1 core if WAI/STP latched previously
-                self.sa1.cpu.core.state.waiting_for_irq = false;
-                self.sa1.cpu.core.state.stopped = false;
-                if std::env::var_os("TRACE_SA1_CTRL").is_some() {
-                    use std::sync::atomic::{AtomicU32, Ordering};
-                    static COUNT: AtomicU32 = AtomicU32::new(0);
-                    let n = COUNT.fetch_add(1, Ordering::Relaxed);
-                    if n < 16 {
-                        println!(
-                            "[SA1-CTRL] ctrl=0x{:02X} cie=0x{:02X} sie=0x{:02X} pending=0x{:02X} pb={:02X} pc={:04X} wai={} stp={} sfr=0x{:02X}",
-                            self.sa1.registers.control,
-                            self.sa1.registers.cie,
-                            self.sa1.registers.sie,
-                            self.sa1.registers.interrupt_pending,
-                            self.sa1.cpu.pb,
-                            self.sa1.cpu.pc,
-                            self.sa1.cpu.core.state.waiting_for_irq,
-                            self.sa1.cpu.core.state.stopped,
-                            self.sa1.registers.sfr,
-                        );
-                    }
-                }
-            }
-        }
-
-        // DQ3用: 簡易IPLスタブ。SA-1を強制的に起こし、S-CPUへIRQラインを立てる。
-        // 環境変数 DQ3_SA1_IPL_STUB=1 で一度だけ実行。
-        if std::env::var_os("DQ3_SA1_IPL_STUB").is_some() {
-            use std::sync::Once;
-            static STUB_ONCE: Once = Once::new();
-            STUB_ONCE.call_once(|| {
-                // Enable S-CPU IRQ mask for SA-1 line
-                self.sa1.registers.sie |= Sa1::IRQ_LINE_BIT;
-                self.sa1.registers.interrupt_enable = self.sa1.registers.sie;
-                // Assert IRQ pending toward S-CPU immediately
-                self.sa1.registers.interrupt_pending |= Sa1::IRQ_LINE_BIT;
-                // Clear WAI state so SA-1 core can run
-                self.sa1.cpu.core.state.waiting_for_irq = false;
-                self.sa1.cpu.core.state.stopped = false;
-                // Also raise main CPU IRQ line once
-                self.irq_pending = true;
-                println!("⚡ DQ3_SA1_IPL_STUB: forced SA-1 IRQ line to S-CPU (one-shot)");
-            });
-        }
-
-        // Optional debug hack: force SA-1 IRQ line each slice to escape WAI loops (DQ3)
-        if std::env::var_os("DQ3_SA1_IRQ_HACK").is_some() {
-            // Enable IRQ line in control/CIE/SIE
-            self.sa1.registers.control |= 0x80;
-            self.sa1.registers.cie |= 0x80;
-            self.sa1.registers.sie |= 0x80;
-            self.sa1.registers.interrupt_enable = self.sa1.registers.sie;
-            // Assert IRQ pending toward S-CPU and SA-1 CPU
-            self.sa1.registers.interrupt_pending |= Sa1::IRQ_LINE_BIT;
-            self.sa1.registers.interrupt_pending |= Sa1::IRQ_DMA_FLAG;
-            // Wake SA-1 core out of WAI/STP if set
-            self.sa1.cpu.core.state.waiting_for_irq = false;
-            self.sa1.cpu.core.state.stopped = false;
-            // 併せてS-CPU側IRQラインも立ててIRQを起こす（Iフラグが下りていれば即応）
-            self.irq_pending = true;
-            static DQ3_IRQ_HACK_LOG: OnceLock<AtomicU32> = OnceLock::new();
-            let n = DQ3_IRQ_HACK_LOG
-                .get_or_init(|| AtomicU32::new(0))
-                .fetch_add(1, Ordering::Relaxed);
-            if n < 8 {
-                println!("⚡ DQ3_SA1_IRQ_HACK: forcing SA-1 IRQ (count={})", n + 1);
-            }
-        }
-
-        // DQ3 IPL強化: SFR bit7（SA-1→S-CPU IRQライン）が立つまで SCNT をパルスし続ける
-        //   - bit7 を立てる（IRQ要求）
-        //   - 下位ニブルをインクリメントしてメッセージ変化を知らせる
-        //   - bit6/bit5 を常時1にして SNV/SIV 有効を強制
-        // 環境変数 DQ3_SA1_SCNT_PULSE=0 で無効化。デフォルト有効。
-        if self.mapper_type == crate::cartridge::MapperType::DragonQuest3 {
-            let pulse_enabled = std::env::var("DQ3_SA1_SCNT_PULSE")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false);
-            if pulse_enabled && !self.sa1.scpu_irq_asserted() {
-                // 低ニブルを回転させてメッセージ変化を伝える
-                let msg = (self.sa1.registers.scnt.wrapping_add(1)) & 0x0F;
-                // bit5=SIV enable, bit6=SNV enable を常時ON、bit7=IRQ要求
-                self.sa1.registers.scnt = 0xE0 | msg | 0x80;
-                // Set SCNT bit7 (message bit to S-CPU) and assert IRQ line pending
-                self.sa1.registers.sie |= Sa1::IRQ_LINE_BIT;
-                self.sa1.registers.interrupt_enable = self.sa1.registers.sie;
-                self.sa1.registers.interrupt_pending |= Sa1::IRQ_LINE_BIT;
-                // Also raise the S-CPU TIMEUP flag to make sure IRQ is noticed
-                self.irq_pending = true;
-                // Wake SA-1 core from WAI/STP
-                self.sa1.cpu.core.state.waiting_for_irq = false;
-                self.sa1.cpu.core.state.stopped = false;
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static PULSE_LOG: AtomicU32 = AtomicU32::new(0);
-                let n = PULSE_LOG.fetch_add(1, Ordering::Relaxed);
-                if n < 6 {
-                    println!(
-                        "⚡ DQ3_SA1_SCNT_PULSE: SCNT=0x{:02X} (msg={}, SNV/SIV toggle) count={}",
-                        self.sa1.registers.scnt,
-                        msg,
-                        n + 1
-                    );
-                }
             }
         }
 
@@ -1028,99 +803,6 @@ impl Bus {
 
             // Check if SA-1 is in WAI or STP state - if so, break early to avoid spinning
             if self.sa1.cpu.core.state.waiting_for_irq || self.sa1.cpu.core.state.stopped {
-                // DQ3 sometimes leaves SA-1 in WAI without the S-CPU asserting SCNT IRQ.
-                // For this mapper, gently poke the SA-1 IRQ line (CONTROL bit7) to wake it.
-                if self.mapper_type == crate::cartridge::MapperType::DragonQuest3 {
-                    // Option: ignore WAI and brute-force step a few instructions
-                    if std::env::var("DQ3_SA1_IGNORE_WAI")
-                        .map(|v| v == "1" || v.to_lowercase() == "true")
-                        .unwrap_or(false)
-                    {
-                        // If stuck exactly on WAI opcode, skip it by advancing PC
-                        let pc_full = ((self.sa1.cpu.pb as u32) << 16) | (self.sa1.cpu.pc as u32);
-                        let opcode = self.sa1_read_u8(pc_full);
-                        if opcode == 0xCB {
-                            self.sa1.cpu.pc = self.sa1.cpu.pc.wrapping_add(1);
-                            self.sa1.cpu.core.state.waiting_for_irq = false;
-                            self.sa1.cpu.core.state.stopped = false;
-                        }
-                        let mut skip_steps = 8u32;
-                        while skip_steps > 0 {
-                            let extra = unsafe {
-                                let bus_ptr = self as *mut Bus;
-                                let sa1_ptr = &mut self.sa1 as *mut Sa1;
-                                (*sa1_ptr).step(&mut *bus_ptr)
-                            } as i64;
-                            if extra <= 0 {
-                                break;
-                            }
-                            total_sa1_cycles = total_sa1_cycles.saturating_add(extra as u32);
-                            self.sa1_cycle_deficit -= extra * SA1_RATIO_DEN;
-                            steps += 1;
-                            skip_steps -= 1;
-                        }
-                        self.sa1.cpu.core.state.waiting_for_irq = false;
-                        self.sa1.cpu.core.state.stopped = false;
-                        continue;
-                    }
-                    self.sa1.registers.control |= 0x80;
-                    self.sa1.registers.cie = 0xE0; // force IRQ/NMI/TMR enable
-                    self.sa1.registers.sie = 0xA0 | Sa1::IRQ_LINE_BIT; // ensure S-CPU mask too
-                    self.sa1.registers.interrupt_enable = self.sa1.registers.sie;
-                    // Also assert an internal DMA-flag IRQ so poll_irq returns true.
-                    self.sa1.registers.interrupt_pending |= Sa1::IRQ_DMA_FLAG;
-                    // One-shot wake: force IRQ line if not already set
-                    if (self.sa1.registers.interrupt_pending & Sa1::IRQ_LINE_BIT) == 0 {
-                        self.sa1.registers.interrupt_pending |= Sa1::IRQ_LINE_BIT;
-                        if std::env::var_os("DEBUG_SA1_SCHEDULER").is_some() {
-                            println!(
-                                "[SA1] forced IRQ line while WAI at ${:02X}:{:04X}",
-                                self.sa1.cpu.pb, self.sa1.cpu.pc
-                            );
-                        }
-                    }
-                    // Optionally inject IRQ directly into SA-1 CPU core to break WAI
-                    let core_irq_enabled = std::env::var("DQ3_SA1_CORE_IRQ")
-                        .map(|v| v == "1" || v.to_lowercase() == "true")
-                        .unwrap_or(true);
-                    if core_irq_enabled {
-                        self.sa1.cpu.p.remove(crate::cpu::StatusFlags::IRQ_DISABLE);
-                        self.sa1
-                            .cpu
-                            .core
-                            .state_mut()
-                            .p
-                            .remove(crate::cpu::StatusFlags::IRQ_DISABLE);
-                        self.sa1.cpu.core.state.waiting_for_irq = false;
-                        self.sa1.cpu.core.state.stopped = false;
-                        // Force the adapter's poll_irq() to see a pending IRQ + SNV/SIV enable
-                        self.sa1.registers.control |= 0x90; // IRQ line + SNV select
-                        self.sa1.registers.cie = 0xE0; // force enable IRQ/NMI/TMR toward SA-1 core
-                        self.sa1.registers.sie = 0xA0 | Sa1::IRQ_LINE_BIT; // S-CPU mask fully on
-                        self.sa1.registers.interrupt_enable = self.sa1.registers.sie;
-                        self.sa1.registers.interrupt_pending |= Sa1::IRQ_LINE_BIT;
-                    }
-                    // After poking, try one extra step immediately to give SA-1 a chance to run.
-                    let extra = unsafe {
-                        let bus_ptr = self as *mut Bus;
-                        let sa1_ptr = &mut self.sa1 as *mut Sa1;
-                        (*sa1_ptr).step(&mut *bus_ptr)
-                    } as i64;
-                    if extra > 0 {
-                        total_sa1_cycles = total_sa1_cycles.saturating_add(extra as u32);
-                        self.sa1_cycle_deficit -= extra * SA1_RATIO_DEN;
-                        steps += 1;
-                        if wake_trace_left > 0 {
-                            println!(
-                                "[SA1-wake] PB={:02X} PC={:04X} cycles={} ctrl=0x{:02X} scnt=0x{:02X}",
-                                self.sa1.cpu.pb, self.sa1.cpu.pc, extra, self.sa1.registers.control,
-                                self.sa1.registers.scnt
-                            );
-                            wake_trace_left = wake_trace_left.saturating_sub(1);
-                        }
-                        continue;
-                    }
-                }
                 if std::env::var_os("DEBUG_SA1_SCHEDULER").is_some() {
                     println!(
                         "SA-1 scheduler: breaking at step {} (WAI={} STP={} PC=${:02X}:{:04X})",
@@ -1550,43 +1232,6 @@ impl Bus {
         }
     }
 
-    /// DQ3専用: SA-1 WAIループ地点(0C:CCB7)を NOP/BRA -2 に置き換え、永続WAIを回避
-    fn patch_sa1_wai_loop(&mut self) {
-        if self.mapper_type != crate::cartridge::MapperType::DragonQuest3 {
-            return;
-        }
-        // 対象アドレス
-        let bank = 0x0C;
-        let addr: u16 = 0xCCB7;
-
-        // まずIRAMに入っている場合だけ直接パッチ
-        let iram_idx = (addr as usize) & 0x7FF; // IRAMは0x0000-07FF
-        if iram_idx + 3 <= self.sa1_iram.len() {
-            let patch = [0xEA, 0x80, 0xFE]; // NOP; BRA -2
-            self.sa1_iram[iram_idx..iram_idx + 3].copy_from_slice(&patch);
-            if std::env::var_os("TRACE_SA1_BOOT").is_some() {
-                println!(
-                    "[SA1] Patched WAI loop in IRAM at 0C:{:04X} -> NOP/BRA",
-                    addr
-                );
-            }
-            return;
-        }
-
-        // IRAMに無い場合はBWRAMミラーへ（bank & 0x1Fでページ決定）
-        let idx = ((bank & 0x1F) as usize) * 0x10000 + (addr as usize);
-        if idx + 3 <= self.sa1_bwram.len() {
-            let patch = [0xEA, 0x80, 0xFE];
-            self.sa1_bwram[idx..idx + 3].copy_from_slice(&patch);
-            if std::env::var_os("TRACE_SA1_BOOT").is_some() {
-                println!(
-                    "[SA1] Patched WAI loop in BWRAM mirror at 0C:{:04X} (idx=0x{:05X})",
-                    addr, idx
-                );
-            }
-        }
-    }
-
     /// Minimal SA-1 IPL stub: JML to given bank:address. Fills IRAM with 0xFF first.
     fn write_sa1_ipl_stub(&mut self, target_addr: u16, target_bank: u8) {
         self.sa1_iram.fill(0xFF);
@@ -1677,13 +1322,6 @@ impl Bus {
     pub fn sa1_read_u8(&mut self, addr: u32) -> u8 {
         let bank = (addr >> 16) & 0xFF;
         let offset = (addr & 0xFFFF) as u16;
-        // DQ3: banks C0-DF should be treated as ROM mirrors, not BWRAM
-        if self.mapper_type == crate::cartridge::MapperType::DragonQuest3
-            && (0xC0..=0xDF).contains(&bank)
-        {
-            let phys = self.sa1_phys_addr(bank, offset);
-            return self.rom.get(phys % self.rom_size).copied().unwrap_or(0xFF);
-        }
         match bank {
             0x00..=0x3F | 0x80..=0xBF => {
                 // SA-1 I-RAM (2KB) mapped at 00:0000-07FF for SA-1 CPU
@@ -1694,13 +1332,6 @@ impl Bus {
                 if (0x3000..=0x37FF).contains(&offset) {
                     let idx = (offset - 0x3000) as usize;
                     return self.sa1_iram[idx % self.sa1_iram.len()];
-                }
-                // DQ3 workaround: map 00:FC00-FFFF vectors to the SA-1 program bank (0C)
-                if self.mapper_type == crate::cartridge::MapperType::DragonQuest3
-                    && offset >= 0xFC00
-                {
-                    let phys = self.sa1_phys_addr(self.sa1.boot_pb as u32, offset);
-                    return self.rom.get(phys % self.rom_size).copied().unwrap_or(0xFF);
                 }
                 if (0x6000..=0x7FFF).contains(&offset) {
                     if let Some(idx) = self.sa1_cpu_bwram_addr(offset) {
@@ -2097,7 +1728,7 @@ impl Bus {
                     }
                     // APU registers
                     0x2140..=0x217F => {
-                        // Optional: fake APU boot handshake (SMW/DQ3 early init)
+                        // Optional: fake APU boot handshake (early init aid)
                         let val = if self.fake_apu {
                             // Before the first $CC, expose the IPL signature AA/BB.
                             let sig = match offset & 0x03 {
@@ -2206,6 +1837,108 @@ impl Bus {
                                             );
                                         }
                                     }
+                                    if std::env::var_os("TRACE_SFS_APU_WAIT").is_some()
+                                        && offset == 0x2140
+                                        && matches!(
+                                            self.last_cpu_pc,
+                                            0x008858 | 0x008884 | 0x0088BD
+                                        )
+                                    {
+                                        use std::sync::OnceLock;
+                                        static TRACE_PC: OnceLock<Option<u32>> = OnceLock::new();
+                                        let watch_pc = TRACE_PC.get_or_init(|| {
+                                            std::env::var("TRACE_SFS_APU_WAIT_PC")
+                                                .ok()
+                                                .and_then(|v| {
+                                                    let t = v.trim();
+                                                    let t = t.trim_start_matches("0x");
+                                                    u32::from_str_radix(t, 16)
+                                                        .ok()
+                                                        .or_else(|| t.parse::<u32>().ok())
+                                                })
+                                        });
+                                        if let Some(pc) = *watch_pc {
+                                            if self.last_cpu_pc != pc {
+                                                // Skip early noisy loops unless PC matches.
+                                                return v;
+                                            }
+                                        }
+                                        use std::sync::atomic::{AtomicU32, Ordering};
+                                        static CNT: AtomicU32 = AtomicU32::new(0);
+                                        let n = CNT.fetch_add(1, Ordering::Relaxed);
+                                        if n < 64 {
+                                            if let Some(smp) = apu.inner.smp.as_ref() {
+                                                let smp_pc = smp.reg_pc;
+                                                let smp_psw = smp.get_psw();
+                                                println!(
+                                                    "[SFS-APU-WAIT] cpu_pc=00:{:04X} apu_p0={:02X} cpu_to_apu=[{:02X} {:02X} {:02X} {:02X}] smp_pc={:04X} psw={:02X} stopped={} apu_cycles={}",
+                                                    (self.last_cpu_pc & 0xFFFF) as u16,
+                                                    v,
+                                                    apu.port_latch[0],
+                                                    apu.port_latch[1],
+                                                    apu.port_latch[2],
+                                                    apu.port_latch[3],
+                                                    smp_pc,
+                                                    smp_psw,
+                                                    smp.is_stopped() as u8,
+                                                    apu.total_smp_cycles
+                                                );
+                                                if std::env::var_os("TRACE_SFS_APU_WAIT_DUMP")
+                                                    .is_some()
+                                                {
+                                                    let mut code = [0u8; 16];
+                                                    for (i, b) in code.iter_mut().enumerate() {
+                                                        *b = apu
+                                                            .inner
+                                                            .read_u8(smp_pc.wrapping_add(i as u16) as u32);
+                                                    }
+                                                    println!(
+                                                        "[SFS-APU-WAIT] smp_code@{:04X}={:02X?}",
+                                                        smp_pc, code
+                                                    );
+                                                }
+                                            } else {
+                                                println!(
+                                                    "[SFS-APU-WAIT] cpu_pc=00:{:04X} apu_p0={:02X} smp=<none>",
+                                                    (self.last_cpu_pc & 0xFFFF) as u16,
+                                                    v
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if std::env::var_os("TRACE_SFS_APU_MISMATCH").is_some()
+                                        && offset == 0x2140
+                                        && matches!(self.last_cpu_pc, 0x008858 | 0x00885B)
+                                    {
+                                        let expected = self.wram.get(0x0006).copied().unwrap_or(0);
+                                        if v != expected {
+                                            use std::sync::atomic::{AtomicU32, Ordering};
+                                            static CNT: AtomicU32 = AtomicU32::new(0);
+                                            let n = CNT.fetch_add(1, Ordering::Relaxed);
+                                            if n < 256 {
+                                                let (smp_pc, psw) = apu
+                                                    .inner
+                                                    .smp
+                                                    .as_ref()
+                                                    .map(|s| (s.reg_pc, s.get_psw()))
+                                                    .unwrap_or((0, 0));
+                                                println!(
+                                                    "[SFS-APU-MISMATCH] cpu_pc=00:{:04X} apu_p0={:02X} expected={:02X} wram04={:02X} wram02={:02X} cpu_to_apu=[{:02X} {:02X} {:02X} {:02X}] smp_pc={:04X} psw={:02X}",
+                                                    (self.last_cpu_pc & 0xFFFF) as u16,
+                                                    v,
+                                                    expected,
+                                                    self.wram.get(0x0004).copied().unwrap_or(0),
+                                                    self.wram.get(0x0002).copied().unwrap_or(0),
+                                                    apu.port_latch[0],
+                                                    apu.port_latch[1],
+                                                    apu.port_latch[2],
+                                                    apu.port_latch[3],
+                                                    smp_pc,
+                                                    psw
+                                                );
+                                            }
+                                        }
+                                    }
                                     v
                                 })
                                 .unwrap_or(0)
@@ -2308,7 +2041,7 @@ impl Bus {
                                 }
                             }
                             crate::cartridge::MapperType::DragonQuest3 => {
-                                // DQ3: treat 6000-7FFF as BW-RAM window via SA-1 mapping
+                                // Treat 6000-7FFF as BW-RAM window via SA-1 mapping
                                 if let Some(idx) = self.sa1_bwram_addr(offset) {
                                     self.sa1_bwram[idx]
                                 } else {
@@ -2377,7 +2110,7 @@ impl Bus {
                 } else {
                     ((bank - 0x7E) as usize) * 0x10000 + (offset as usize)
                 };
-                // Debug: trace key handshake variables in WRAM (DQ3 NMI paths)
+                // Debug: trace key handshake variables in WRAM (NMI paths)
                 if self.trace_nmi_wram {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static READ_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -2470,28 +2203,12 @@ impl Bus {
         // SA-1 LoROM: 32KB banks across 4MB; 0x80-0xFF mirror 0x00-0x7F.
         let rom_addr = self.dq3_phys_addr(bank as u8, offset);
 
-        if (crate::debug_flags::mapper() || crate::debug_flags::boot_verbose())
-            && bank == 0xC0
-            && offset < 0x0100
-        {
-            static mut C0_ACCESS_COUNT: u32 = 0;
-            unsafe {
-                C0_ACCESS_COUNT += 1;
-                if C0_ACCESS_COUNT <= 5 {
-                    println!(
-                        "DQ3 ROM read {:02X}:{:04X} -> phys=0x{:06X} (size=0x{:06X})",
-                        bank, offset, rom_addr, self.rom_size
-                    );
-                }
-            }
-        }
-
         let value = self.rom[rom_addr % self.rom_size];
         self.mdr = value;
         value
     }
 
-    // DQ3エンハンスメント領域の判定
+    // エンハンスメント領域の判定 (0x30)
     #[allow(dead_code)]
     fn is_dq3_enhancement_area(&self, bank: u32, _offset: u16) -> bool {
         // エンハンスメントチップ0x30の専用領域
@@ -2501,7 +2218,7 @@ impl Bus {
         }
     }
 
-    // DQ3エンハンスメント処理
+    // エンハンスメント処理 (0x30)
     fn handle_dq3_enhancement(&self, bank: u32, offset: u16) -> u8 {
         // エンハンスメント機能の実装
         match bank {
@@ -2510,38 +2227,8 @@ impl Bus {
                 // Dragon Quest 3はHiROMベース：全アドレス範囲にROMデータ
                 let rom_addr = (bank as usize) * 0x10000 + (offset as usize);
 
-                // Bank 00の低位アドレスをデバッグ
-                if bank == 0x00 && offset <= 0x1000 && crate::debug_flags::debug_dq3_bank() {
-                    static mut BANK00_DEBUG_COUNT: u32 = 0;
-                    unsafe {
-                        BANK00_DEBUG_COUNT += 1;
-                        if BANK00_DEBUG_COUNT <= 5 {
-                            println!(
-                                "DQ3 Bank 00:{:04X} -> rom_addr=0x{:06X}, rom_size=0x{:06X}",
-                                offset, rom_addr, self.rom_size
-                            );
-                        }
-                    }
-                }
-
                 if rom_addr < self.rom_size {
-                    let value = self.rom[rom_addr];
-
-                    // Bank 00の値をログ
-                    if bank == 0x00 && offset <= 0x1000 {
-                        static mut BANK00_VALUE_COUNT: u32 = 0;
-                        unsafe {
-                            BANK00_VALUE_COUNT += 1;
-                            if BANK00_VALUE_COUNT <= 5 {
-                                println!(
-                                    "  DQ3 ROM[0x{:06X}] = 0x{:02X} (Bank {:02X}:{:04X})",
-                                    rom_addr, value, bank, offset
-                                );
-                            }
-                        }
-                    }
-
-                    value
+                    self.rom[rom_addr]
                 } else {
                     // ROM範囲外の場合はミラー
                     let mirror_addr = rom_addr % self.rom_size;
@@ -2550,7 +2237,7 @@ impl Bus {
             }
             0x03 | 0x24 => {
                 // Bank 03/24を適切なROM領域にマップ
-                // DQ3の4MB ROMでの特殊バンク処理
+                // 4MB ROMでの特殊バンク処理
                 if offset < 0x8000 {
                     // 低アドレス領域：特殊マッピング
                     let rom_addr = match bank {
@@ -2687,9 +2374,11 @@ impl Bus {
         // Debug: watch a specific address write (S-CPU side)
         if let Some(watch) = crate::debug_flags::watch_addr_write() {
             if watch == addr {
+                let sl = self.ppu.scanline;
+                let cyc = self.ppu.get_cycle();
                 println!(
-                    "[watchW] {:02X}:{:04X} <= {:02X} PC={:06X}",
-                    bank, offset, value, self.last_cpu_pc
+                    "[watchW] {:02X}:{:04X} <= {:02X} PC={:06X} sl={} cyc={}",
+                    bank, offset, value, self.last_cpu_pc, sl, cyc
                 );
             }
         }
@@ -2820,7 +2509,7 @@ impl Bus {
                             }
                         }
                     }
-                    // PPU registers (no DQ3-specific overrides)
+                    // PPU registers (no overrides)
                     0x2100..=0x213F => {
                         if crate::debug_flags::trace_burnin_v224() {
                             let pc16 = (self.last_cpu_pc & 0xFFFF) as u16;
@@ -3334,7 +3023,7 @@ impl Bus {
                                 }
                             }
                             crate::cartridge::MapperType::DragonQuest3 => {
-                                // DQ3: treat 6000-7FFF as BW-RAM window via SA-1 mapping
+                                // Treat 6000-7FFF as BW-RAM window via SA-1 mapping
                                 if let Some(idx) = self.sa1_bwram_addr(offset) {
                                     self.sa1_bwram[idx] = value;
                                     self.sram_dirty = true;
@@ -3373,7 +3062,7 @@ impl Bus {
                         // Other areas are ROM, ignore writes
                     }
                     crate::cartridge::MapperType::DragonQuest3 => {
-                        // DQ3 SRAM (HiROMベース)
+                        // SRAM (HiROMベース)
                         if (0x6000..0x8000).contains(&offset) {
                             let sram_addr =
                                 ((bank - 0x40) as usize) * 0x2000 + ((offset - 0x6000) as usize);
@@ -3394,14 +3083,6 @@ impl Bus {
                 } else {
                     ((bank - 0x7E) as usize) * 0x10000 + (offset as usize)
                 };
-                if (0x1002C..=0x1002D).contains(&wram_addr)
-                    && crate::debug_flags::trace_dq3_sp_mem()
-                {
-                    println!(
-                        "DQ3_SP_MEM write {:02X}:{:04X} -> WRAM[0x{:05X}] = {:02X}",
-                        bank, offset, wram_addr, value
-                    );
-                }
                 // Watch suspected handshake flag 7F:7DC0 (opt-in)
                 if wram_addr == 0x1FDC0
                     && crate::debug_flags::trace_handshake()
@@ -3470,7 +3151,7 @@ impl Bus {
                         }
                     }
                     crate::cartridge::MapperType::DragonQuest3 => {
-                        // DQ3 SRAM (ミラー領域)
+                        // SRAM (ミラー領域)
                         if (0x6000..0x8000).contains(&offset) {
                             let sram_addr =
                                 ((bank - 0xC0) as usize) * 0x2000 + ((offset - 0x6000) as usize);
@@ -3495,31 +3176,6 @@ impl Bus {
             let hi = if (lo & 0x80) != 0 { 0x80 } else { 0x00 };
             return (hi << 8) | lo;
         }
-        // Special case for interrupt vectors in Dragon Quest III
-        if (0xFFE0..=0xFFFF).contains(&addr)
-            && self.mapper_type == crate::cartridge::MapperType::DragonQuest3
-        {
-            // Read from ROM directly for interrupt vectors
-            let rom_offset = addr as usize;
-            if rom_offset + 1 < self.rom.len() {
-                let lo = self.rom[rom_offset] as u16;
-                let hi = self.rom[rom_offset + 1] as u16;
-                let result = lo | (hi << 8);
-
-                // Debug for BRK vector
-                if addr == 0xFFFE {
-                    unsafe {
-                        static mut VECTOR_DEBUG: u32 = 0;
-                        VECTOR_DEBUG += 1;
-                        if VECTOR_DEBUG <= 5 {
-                            println!("Reading BRK/IRQ vector at 0x{:04X}: 0x{:04X} (ROM[{:06X}]={:02X},{:02X})", 
-                                     addr, result, rom_offset, lo as u8, hi as u8);
-                        }
-                    }
-                }
-                return result;
-            }
-        }
 
         let lo = self.read_u8(addr) as u16;
         let hi = self.read_u8(addr.wrapping_add(1)) as u16;
@@ -3527,6 +3183,17 @@ impl Bus {
     }
 
     pub fn write_u16(&mut self, addr: u32, value: u16) {
+        if std::env::var_os("TRACE_APU_U16").is_some() {
+            let off = (addr & 0xFFFF) as u16;
+            if (0x2140..=0x2143).contains(&off) {
+                println!(
+                    "[APU-U16] PC={:06X} ${:04X} <- {:04X}",
+                    self.last_cpu_pc,
+                    off,
+                    value
+                );
+            }
+        }
         self.write_u8(addr, (value & 0xFF) as u8);
         self.write_u8(addr.wrapping_add(1), (value >> 8) as u8);
     }
@@ -3543,19 +3210,6 @@ impl Bus {
                     0
                 };
                 let v = d0 | (d1 << 1);
-                if std::env::var_os("TRACE_4016").is_some() {
-                    use std::sync::atomic::{AtomicU32, Ordering};
-                    static COUNT: AtomicU32 = AtomicU32::new(0);
-                    let n = COUNT.fetch_add(1, Ordering::Relaxed);
-                    if n < 256 {
-                        println!(
-                            "[TRACE4016] read#{} $4016 -> 0b{:02b} PC={:06X}",
-                            n + 1,
-                            v & 0x03,
-                            self.last_cpu_pc,
-                        );
-                    }
-                }
                 v
             }
             0x4017 => {
@@ -3567,19 +3221,6 @@ impl Bus {
                     0
                 };
                 let v = 0x1C | d0 | (d1 << 1);
-                if std::env::var_os("TRACE_4016").is_some() {
-                    use std::sync::atomic::{AtomicU32, Ordering};
-                    static COUNT: AtomicU32 = AtomicU32::new(0);
-                    let n = COUNT.fetch_add(1, Ordering::Relaxed);
-                    if n < 256 {
-                        println!(
-                            "[TRACE4016] read#{} $4017 -> 0b{:02b} PC={:06X}",
-                            n + 1,
-                            v & 0x03,
-                            self.last_cpu_pc,
-                        );
-                    }
-                }
                 v
             }
             // 0x4210 - RDNMI: NMI flag and version
@@ -3839,31 +3480,7 @@ impl Bus {
                 self.wio
             }
             // JOY1/2/3/4 data
-            0x4218 => {
-                let force = std::env::var("JOY1L_FORCE")
-                    .ok()
-                    .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok());
-                let val = force.unwrap_or(self.joy_data[0]);
-                if std::env::var_os("TRACE_4218").is_some() {
-                    use std::sync::atomic::{AtomicU32, Ordering};
-                    static COUNT: AtomicU32 = AtomicU32::new(0);
-                    let n = COUNT.fetch_add(1, Ordering::Relaxed);
-                    if n < 32 {
-                        println!(
-                            "[TRACE4218] read#{:02} value=0x{:02X} joy_data[0]=0x{:02X} joy_data[1]=0x{:02X} vblank={} busy={} PC={:06X} force={:?}",
-                            n + 1,
-                            val,
-                            self.joy_data[0],
-                            self.joy_data[1],
-                            self.ppu.is_vblank(),
-                            self.joy_busy_counter,
-                            self.last_cpu_pc,
-                            force
-                        );
-                    }
-                }
-                val
-            } // JOY1L
+            0x4218 => self.joy_data[0], // JOY1L
             0x4219 => self.joy_data[1], // JOY1H
             0x421A => self.joy_data[2], // JOY2L
             0x421B => self.joy_data[3], // JOY2H
@@ -3925,19 +3542,6 @@ impl Bus {
         match addr {
             // Controller ports
             0x4016 => {
-                if std::env::var_os("TRACE_4016").is_some() {
-                    use std::sync::atomic::{AtomicU32, Ordering};
-                    static COUNT: AtomicU32 = AtomicU32::new(0);
-                    let n = COUNT.fetch_add(1, Ordering::Relaxed);
-                    if n < 256 {
-                        println!(
-                            "[TRACE4016] write#{} $4016 <- 0x{:02X} PC={:06X}",
-                            n + 1,
-                            value,
-                            self.last_cpu_pc
-                        );
-                    }
-                }
                 self.input_system.write_strobe(value);
             }
             // PPU/CPU communication
@@ -4412,6 +4016,25 @@ impl Bus {
         f(&mut apu);
     }
 
+    #[inline]
+    pub fn try_with_apu_mut<F>(&mut self, f: F) -> bool
+    where
+        F: FnOnce(&mut crate::apu::Apu),
+    {
+        if let Some(apu_mutex) = Arc::get_mut(&mut self.apu) {
+            let apu = apu_mutex.get_mut().unwrap_or_else(|e| e.into_inner());
+            f(apu);
+            return true;
+        }
+
+        if let Ok(mut apu) = self.apu.try_lock() {
+            f(&mut apu);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn set_mapper_type(&mut self, mapper: crate::cartridge::MapperType) {
         self.mapper_type = mapper;
     }
@@ -4651,18 +4274,22 @@ impl Bus {
             self.input_system.write_strobe(0);
 
             // Auto-joypad: emulate the hardware serial read (16 bits per pad).
-            // SNES stores bits as "1=Low=Pressed" with first serial bit (B) as MSB.
+            // Manual serial order is B,Y,Select,Start,Up,Down,Left,Right,A,X,L,R,0,0,0,0
+            // and the hardware packs this MSB-first into JOYxH/JOYxL:
+            //   bit15..8 = B,Y,Select,Start,Up,Down,Left,Right
+            //   bit7..0  = A,X,L,R,0,0,0,0
             let mt = self.input_system.is_multitap_enabled();
             let mut b1: u16 = 0;
             let mut b2: u16 = 0;
             let mut b3: u16 = 0;
             let mut b4: u16 = 0;
-            for _ in 0..16 {
-                b1 = (b1 << 1) | ((self.input_system.read_controller1() & 1) as u16);
-                b2 = (b2 << 1) | ((self.input_system.read_controller2() & 1) as u16);
+            for i in 0..16 {
+                let bit_pos = 15 - i;
+                b1 |= ((self.input_system.read_controller1() & 1) as u16) << bit_pos;
+                b2 |= ((self.input_system.read_controller2() & 1) as u16) << bit_pos;
                 if mt {
-                    b3 = (b3 << 1) | ((self.input_system.read_controller3() & 1) as u16);
-                    b4 = (b4 << 1) | ((self.input_system.read_controller4() & 1) as u16);
+                    b3 |= ((self.input_system.read_controller3() & 1) as u16) << bit_pos;
+                    b4 |= ((self.input_system.read_controller4() & 1) as u16) << bit_pos;
                 }
             }
 
@@ -4807,6 +4434,7 @@ impl Bus {
         // 参照の衝突を避けるため、必要値を先に取り出す
         let table_addr = { self.dma_controller.channels[channel].hdma_table_addr };
         let control = { self.dma_controller.channels[channel].control };
+        let dest_base = { self.dma_controller.channels[channel].dest_address };
 
         let line_info = self.read_u8(table_addr);
         if line_info == 0 {
@@ -4825,6 +4453,8 @@ impl Bus {
             line_count = 128;
         }
         let indirect = (control & 0x40) != 0; // bit6: indirect addressing
+        let unit = control & 0x07;
+        let len = Self::hdma_transfer_len(unit) as usize;
 
         // NOTE: HDMA tables live in the bank specified by A1Bn ($43x4) / src_address bank.
         // Indirect HDMA data blocks live in the bank specified by DASB ($43x7).
@@ -4851,37 +4481,40 @@ impl Bus {
             ch.hdma_table_addr = Bus::add16_in_bank(ch.hdma_table_addr, 2);
         }
 
+        // Latch data for this entry once; repeat entries reuse it on each line.
+        if len != 0 {
+            let src = if indirect {
+                self.dma_controller.channels[channel].hdma_indirect_addr
+            } else {
+                self.dma_controller.channels[channel].hdma_table_addr
+            };
+            let mut latched = [0u8; 4];
+            for i in 0..len.min(4) {
+                latched[i] = self.read_u8(Bus::add16_in_bank(src, i as u32));
+            }
+            let mut ch = &mut self.dma_controller.channels[channel];
+            ch.hdma_latched = latched;
+            ch.hdma_latched_len = len as u8;
+            if indirect {
+                ch.hdma_indirect_addr = Bus::add16_in_bank(src, len as u32);
+            } else {
+                ch.hdma_table_addr = Bus::add16_in_bank(src, len as u32);
+            }
+        }
+
         true
     }
 
     fn perform_hdma_transfer(&mut self, channel: usize) {
         // Mark write context so PPU can allow HDMA during HBlank appropriately
         self.ppu.begin_hdma_context();
+        self.ppu.set_debug_dma_channel(Some(channel as u8));
         // 必要な情報を事前に取得して、借用を短く保つ
         let dest_base = { self.dma_controller.channels[channel].dest_address };
         let control = { self.dma_controller.channels[channel].control };
         let unit = control & 0x07;
         let len = Self::hdma_transfer_len(unit) as usize;
-        let indirect = (control & 0x40) != 0;
-        let src = if indirect {
-            self.dma_controller.channels[channel].hdma_indirect_addr
-        } else {
-            self.dma_controller.channels[channel].hdma_table_addr
-        };
-
-        // 1ライン分のデータを読み出し
-        let mut bytes: [u8; 4] = [0; 4];
-        for (i, slot) in bytes.iter_mut().enumerate().take(len) {
-            *slot = self.read_u8(Bus::add16_in_bank(src, i as u32));
-        }
-        // Transfer consumes bytes only on scanlines where it executes.
-        if indirect {
-            self.dma_controller.channels[channel].hdma_indirect_addr =
-                Bus::add16_in_bank(src, len as u32);
-        } else {
-            self.dma_controller.channels[channel].hdma_table_addr =
-                Bus::add16_in_bank(src, len as u32);
-        }
+        let bytes = self.dma_controller.channels[channel].hdma_latched;
 
         // 書き込み（PPU writable or APU I/O）
         for (i, data) in bytes.iter().enumerate().take(len) {
@@ -4929,6 +4562,7 @@ impl Bus {
         }
         self.ppu.end_hdma_context();
     }
+
 
     #[inline]
     fn hdma_transfer_len(unit: u8) -> u8 {
@@ -5829,6 +5463,18 @@ impl Bus {
 impl CpuBus for Bus {
     fn read_u8(&mut self, addr: u32) -> u8 {
         let v = Bus::read_u8(self, addr);
+        if let Some(watch) = crate::debug_flags::watch_addr_read() {
+            if watch == addr {
+                let bank = (addr >> 16) & 0xFF;
+                let offset = (addr & 0xFFFF) as u16;
+                let sl = self.ppu.scanline;
+                let cyc = self.ppu.get_cycle();
+                println!(
+                    "[watchR] {:02X}:{:04X} -> {:02X} PC={:06X} sl={} cyc={}",
+                    bank, offset, v, self.last_cpu_pc, sl, cyc
+                );
+            }
+        }
         self.last_cpu_bus_addr = addr;
         self.on_cpu_bus_cycle();
         v

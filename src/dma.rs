@@ -191,10 +191,15 @@ impl DmaController {
                 // HDMAを有効化
                 for i in 0..8 {
                     if value & (1 << i) != 0 {
-                        self.channels[i].hdma_enabled = true;
-                        self.channels[i].hdma_terminated = false;
-                        // 初期化処理
-                        self.init_hdma_channel(i);
+                        // 未設定チャンネルは有効化しない（デフォルト値の暴走を防ぐ）
+                        if !self.channels[i].configured {
+                            self.channels[i].hdma_enabled = false;
+                        } else {
+                            self.channels[i].hdma_enabled = true;
+                            self.channels[i].hdma_terminated = false;
+                            // 初期化処理
+                            self.init_hdma_channel(i);
+                        }
                     } else {
                         self.channels[i].hdma_enabled = false;
                     }
@@ -296,6 +301,10 @@ impl DmaController {
                                     | ((value as u32) << 16);
                             self.channels[channel].configured = true;
                             self.channels[channel].cfg_src = true;
+                            // If HDMA is using A2A, update only the bank portion for subsequent table reads.
+                            let low = self.channels[channel].hdma_table_addr & 0x0000_FFFF;
+                            self.channels[channel].hdma_table_addr =
+                                (self.channels[channel].src_address & 0xFF00_0000) | low;
                             if debug_flags::dma_reg() {
                                 println!("DMA ch{} src.bank=0x{:02X}", channel, value);
                             }
@@ -351,11 +360,19 @@ impl DmaController {
                             // A2AnL ($43x8): HDMA table current address low. RW8.
                             self.channels[channel].a2a =
                                 (self.channels[channel].a2a & 0xFF00) | value as u16;
+                            // Mirror into internal HDMA table pointer (bank from A1Bn/src_address).
+                            let bank = self.channels[channel].src_address & 0xFF0000;
+                            self.channels[channel].hdma_table_addr =
+                                bank | (self.channels[channel].a2a as u32);
                         }
                         0x09 => {
                             // A2AnH ($43x9): HDMA table current address high. RW8.
                             self.channels[channel].a2a =
                                 (self.channels[channel].a2a & 0x00FF) | ((value as u16) << 8);
+                            // Mirror into internal HDMA table pointer (bank from A1Bn/src_address).
+                            let bank = self.channels[channel].src_address & 0xFF0000;
+                            self.channels[channel].hdma_table_addr =
+                                bank | (self.channels[channel].a2a as u32);
                         }
                         0x0A => {
                             // NLTRn ($43xA): HDMA reload flag + line counter. RW8.
