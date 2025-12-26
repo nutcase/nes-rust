@@ -292,7 +292,7 @@ impl Bus {
             wram: vec![0; 0x20000],
             wram_64k_mirror: std::env::var_os("WRAM_64K_MIRROR").is_some(),
             trace_nmi_wram: std::env::var_os("TRACE_NMI_WRAM").is_some(),
-            sram: vec![0; 0x8000],
+            sram: vec![0xFF; 0x8000],
             rom,
             ppu: crate::ppu::Ppu::new(),
             apu: Arc::new(Mutex::new(crate::apu::Apu::new())),
@@ -442,7 +442,7 @@ impl Bus {
             wram: vec![0; 0x20000],
             wram_64k_mirror: std::env::var_os("WRAM_64K_MIRROR").is_some(),
             trace_nmi_wram: std::env::var_os("TRACE_NMI_WRAM").is_some(),
-            sram: vec![0; sram_size.max(0x2000)], // Minimum 8KB SRAM
+            sram: vec![0xFF; sram_size.max(0x2000)], // Minimum 8KB SRAM
             rom,
             ppu: crate::ppu::Ppu::new(),
             apu: Arc::new(Mutex::new(crate::apu::Apu::new())),
@@ -4854,6 +4854,34 @@ impl Bus {
 
         let mut cur_src = src_addr;
         let addr_mode = ch.get_address_mode(); // 0:inc, 1:fix, 2:dec, 3:inc(approx)
+
+        // Optional OAM DMA tracing (helps diagnose sprite corruption on scene transitions)
+        if std::env::var_os("TRACE_OAM_DMA").is_some() && cpu_to_ppu && dest_base_full == 0x04 {
+            let frame = self.ppu.get_frame();
+            let frame_min = std::env::var("TRACE_OAM_DMA_FRAME_MIN")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let frame_max = std::env::var("TRACE_OAM_DMA_FRAME_MAX")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            if frame >= frame_min && frame <= frame_max {
+                let (oam_addr, oam_internal) = self.ppu.dbg_oam_addrs();
+                println!(
+                    "[OAM-DMA] frame={} ch{} size={} src=0x{:06X} unit={} addr_mode={} pc={:06X} oam_addr=0x{:03X} oam_int=0x{:03X}",
+                    frame,
+                    channel,
+                    transfer_size,
+                    src_addr,
+                    transfer_unit,
+                    addr_mode,
+                    self.last_cpu_pc,
+                    oam_addr,
+                    oam_internal
+                );
+            }
+        }
         let mut i = 0;
 
         // Debug: capture first few DMA setups to see what games configure (helps stuck WRAM fills)

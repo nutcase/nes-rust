@@ -1515,12 +1515,17 @@ impl Ppu {
     fn commit_latched_display_regs(&mut self) {
         let mut any = false;
         if let Some(v) = self.latched_inidisp.take() {
+            let prev_display = self.screen_display;
             self.screen_display = v;
             self.brightness = v & 0x0F;
+            self.maybe_reset_oam_on_inidisp(prev_display, v);
             any = true;
         }
         if let Some(v) = self.latched_tm.take() {
             self.main_screen_designation = v;
+            if v != 0 {
+                self.main_screen_designation_last_nonzero = v;
+            }
             any = true;
         }
         if let Some(v) = self.latched_ts.take() {
@@ -1572,6 +1577,23 @@ impl Ppu {
         }
         if any && crate::debug_flags::boot_verbose() {
             println!("PPU: latched regs committed at line {}", self.scanline);
+        }
+    }
+
+    #[inline]
+    fn maybe_reset_oam_on_inidisp(&mut self, prev_display: u8, new_display: u8) {
+        // OAM reset: when forced blank is deactivated, the internal OAM address reloads
+        // from OAMADD (in addition to the standard VBlank-start reset when not blanked).
+        let prev_blank = (prev_display & 0x80) != 0;
+        let new_blank = (new_display & 0x80) != 0;
+        if prev_blank && !new_blank {
+            self.oam_internal_addr = (self.oam_addr & 0x01FF) << 1;
+            if std::env::var_os("TRACE_OAM_RESET").is_some() && !crate::debug_flags::quiet() {
+                println!(
+                    "[OAM-RESET] scanline={} frame={} oam_addr=0x{:03X} internal=0x{:03X}",
+                    self.scanline, self.frame, self.oam_addr, self.oam_internal_addr
+                );
+            }
         }
     }
 
@@ -2295,11 +2317,7 @@ impl Ppu {
         if let Some(v) = crate::debug_flags::debug_force_tm() {
             return v;
         }
-        if self.main_screen_designation == 0 {
-            self.main_screen_designation_last_nonzero
-        } else {
-            self.main_screen_designation
-        }
+        self.main_screen_designation
     }
 
     // メインスクリーン用スプライト
@@ -4753,10 +4771,6 @@ impl Ppu {
                 };
                 let v = self.oam.get(mapped as usize).copied().unwrap_or(0);
                 self.oam_internal_addr = (internal + 1) & 0x03FF;
-                self.oam_addr = (self.oam_internal_addr >> 1) & 0x01FF;
-                if self.oam_priority_rotation_enabled {
-                    self.oam_eval_base = ((self.oam_addr & 0x00FE) >> 1) as u8;
-                }
                 v
             }
             0x39 | 0x3A => {
@@ -5044,6 +5058,7 @@ impl Ppu {
                 } else {
                     self.screen_display = applied_value;
                     self.brightness = applied_value & 0x0F;
+                    self.maybe_reset_oam_on_inidisp(prev_display, applied_value);
                 }
                 let log_value = if defer_update {
                     applied_value
@@ -5167,10 +5182,6 @@ impl Ppu {
                     self.oam_writes_total = self.oam_writes_total.saturating_add(1);
                 }
                 self.oam_internal_addr = (internal + 1) & 0x03FF;
-                self.oam_addr = (self.oam_internal_addr >> 1) & 0x01FF;
-                if self.oam_priority_rotation_enabled {
-                    self.oam_eval_base = ((self.oam_addr & 0x00FE) >> 1) as u8;
-                }
             }
             0x05 => {
                 // BGMODE: bit0-2: mode, bit4-7: tile size for BG1..BG4 (1=16x16)
@@ -6077,6 +6088,12 @@ impl Ppu {
     #[allow(dead_code)]
     pub fn get_subscreen_buffer(&self) -> &[u32] {
         &self.subscreen_buffer
+    }
+
+    // Debug helper: expose current OAM address and internal address.
+    #[inline]
+    pub fn dbg_oam_addrs(&self) -> (u16, u16) {
+        (self.oam_addr, self.oam_internal_addr)
     }
 
     pub fn is_forced_blank(&self) -> bool {
