@@ -1785,7 +1785,6 @@ fn rtl_generic<T: CpuBus>(state: &mut CoreState, bus: &mut T) -> u8 {
             "PB_CALL RTL pull {:02X}:{:04X} SP={:04X} ret={:02X}:{:02X}{:02X}",
             state.pb, state.pc, state.sp, pb, pch, pcl
         );
-
     }
 
     let (addr, pb) = if state.emulation_mode {

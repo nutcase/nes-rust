@@ -428,7 +428,8 @@ impl Ppu {
 
     fn bg_interlace_y(&self, y: u16) -> u16 {
         if self.bg_interlace_active() {
-            y.saturating_mul(2).saturating_add(self.interlace_field as u16)
+            y.saturating_mul(2)
+                .saturating_add(self.interlace_field as u16)
         } else {
             y
         }
@@ -1083,7 +1084,8 @@ impl Ppu {
                         ((self.window_bg_mask[3] & 0x0F) << 4) | (self.window_bg_mask[2] & 0x0F);
                     let wobjsel =
                         ((self.window_color_mask & 0x0F) << 4) | (self.window_obj_mask & 0x0F);
-                    let wobjlog = ((self.color_window_logic & 0x03) << 2) | (self.obj_window_logic & 0x03);
+                    let wobjlog =
+                        ((self.color_window_logic & 0x03) << 2) | (self.obj_window_logic & 0x03);
                     println!(
                         "[TRACE_SCANLINE_STATE] frame={} y={} INIDISP=0x{:02X} (blank={} bright={}) TM=0x{:02X} TS=0x{:02X} CGWSEL=0x{:02X} CGADSUB=0x{:02X} WH0={} WH1={} WH2={} WH3={} W12SEL=0x{:02X} W34SEL=0x{:02X} WOBJSEL=0x{:02X} WBGLOG=0x{:02X} WOBJLOG=0x{:02X} TMW=0x{:02X} TSW=0x{:02X}",
                         self.frame,
@@ -1206,16 +1208,10 @@ impl Ppu {
             if self.frame == cfg.frame && (x as u16) == cfg.x && (y as u16) == cfg.y {
                 let x_u = x as u16;
                 let y_u = y as u16;
-                let bg1_eval = self.evaluate_window_mask(
-                    x_u,
-                    self.window_bg_mask[0],
-                    self.bg_window_logic[0],
-                );
-                let bg2_eval = self.evaluate_window_mask(
-                    x_u,
-                    self.window_bg_mask[1],
-                    self.bg_window_logic[1],
-                );
+                let bg1_eval =
+                    self.evaluate_window_mask(x_u, self.window_bg_mask[0], self.bg_window_logic[0]);
+                let bg2_eval =
+                    self.evaluate_window_mask(x_u, self.window_bg_mask[1], self.bg_window_logic[1]);
                 let bg1_mask = self.should_mask_bg(x_u, 0, true);
                 let bg2_mask = self.should_mask_bg(x_u, 1, true);
                 let (bg1_color, bg1_pr) = self.render_bg_mode2_with_priority(x_u, y_u, 0);
@@ -3840,7 +3836,9 @@ impl Ppu {
         let bg_x = (x_hires.wrapping_add(scroll_x)) % wrap_x;
         let mut y_eff = y;
         if self.bg_interlace_active() {
-            y_eff = y_eff.saturating_mul(2).saturating_add(self.interlace_field as u16);
+            y_eff = y_eff
+                .saturating_mul(2)
+                .saturating_add(self.interlace_field as u16);
         }
         let bg_y = (y_eff.wrapping_add(scroll_y)) % wrap_y;
 
@@ -5728,7 +5726,8 @@ impl Ppu {
                 }
             }
             0x2C => {
-                let strict_latched = crate::debug_flags::strict_ppu_timing() && self.in_active_display();
+                let strict_latched =
+                    crate::debug_flags::strict_ppu_timing() && self.in_active_display();
                 if strict_latched {
                     self.latched_tm = Some(value);
                 } else {
@@ -7006,7 +7005,9 @@ impl Ppu {
                     let z = self.z_rank_for_bg(id, pr);
                     let replace = match best {
                         None => true,
-                        Some((_, _, best_id, best_z)) => z > best_z || (z == best_z && id > best_id),
+                        Some((_, _, best_id, best_z)) => {
+                            z > best_z || (z == best_z && id > best_id)
+                        }
                     };
                     if replace {
                         best = Some((color, pr, id, z));
@@ -7212,7 +7213,9 @@ impl Ppu {
                     let z = self.z_rank_for_bg(id, pr);
                     let replace = match best {
                         None => true,
-                        Some((_, _, best_id, best_z)) => z > best_z || (z == best_z && id > best_id),
+                        Some((_, _, best_id, best_z)) => {
+                            z > best_z || (z == best_z && id > best_id)
+                        }
                     };
                     if replace {
                         best = Some((color, pr, id, z));

@@ -58,9 +58,7 @@ fn write_framebuffer_png(
         let a = ((px >> 24) & 0xFF) as u8;
         rgba.extend_from_slice(&[r, g, b, a]);
     }
-    writer
-        .write_image_data(&rgba)
-        .map_err(|e| e.to_string())?;
+    writer.write_image_data(&rgba).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -74,7 +72,9 @@ fn write_framebuffer_image(
         Some(ext) if ext.eq_ignore_ascii_case("ppm") => {
             write_framebuffer_ppm(path, fb, width, height).map_err(|e| e.to_string())
         }
-        Some(ext) if ext.eq_ignore_ascii_case("png") => write_framebuffer_png(path, fb, width, height),
+        Some(ext) if ext.eq_ignore_ascii_case("png") => {
+            write_framebuffer_png(path, fb, width, height)
+        }
         _ => write_framebuffer_png(path, fb, width, height),
     }
 }
@@ -943,12 +943,9 @@ impl Emulator {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "logs/headless_fb.png".to_string());
-                if let Err(e) = write_framebuffer_image(
-                    std::path::Path::new(&out_path),
-                    fb,
-                    256,
-                    224,
-                ) {
+                if let Err(e) =
+                    write_framebuffer_image(std::path::Path::new(&out_path), fb, 256, 224)
+                {
                     eprintln!("Failed to dump framebuffer: {}", e);
                 } else {
                     println!("Framebuffer dumped to {}", out_path);
@@ -2021,9 +2018,7 @@ impl Emulator {
             // APU も更新
             let apu_cycles = cpu_cycles; // APUはCPUと同じクロック
             if !self.bus.is_fake_apu() {
-                self.apu_cycle_debt = self
-                    .apu_cycle_debt
-                    .saturating_add(apu_cycles as u32);
+                self.apu_cycle_debt = self.apu_cycle_debt.saturating_add(apu_cycles as u32);
                 if self.apu_cycle_debt >= self.apu_step_batch {
                     self.step_apu_debt(false);
                 }
@@ -3496,7 +3491,7 @@ impl Emulator {
 
         // PPU/APU/Memory/Input
         save_state.ppu_state = self.bus.get_ppu().to_save_state();
-        if let Ok(apu) = self.bus.get_apu_shared().lock() {
+        if let Ok(mut apu) = self.bus.get_apu_shared().lock() {
             save_state.apu_state = apu.to_save_state();
         }
         let (wram, sram) = self.bus.snapshot_memory();

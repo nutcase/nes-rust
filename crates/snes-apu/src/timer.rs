@@ -8,6 +8,16 @@ pub struct Timer {
     counter_high: u8
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimerState {
+    pub resolution: i32,
+    pub is_running: bool,
+    pub ticks: i32,
+    pub target: u8,
+    pub counter_low: u8,
+    pub counter_high: u8,
+}
+
 impl Timer {
     pub fn new(resolution: i32) -> Timer {
         Timer {
@@ -26,6 +36,26 @@ impl Timer {
         self.target = 0;
         self.counter_low = 0;
         self.counter_high = 0;
+    }
+
+    pub fn get_state(&self) -> TimerState {
+        TimerState {
+            resolution: self.resolution,
+            is_running: self.is_running,
+            ticks: self.ticks,
+            target: self.target,
+            counter_low: self.counter_low,
+            counter_high: self.counter_high,
+        }
+    }
+
+    pub fn set_state(&mut self, state: &TimerState) {
+        self.resolution = state.resolution;
+        self.is_running = state.is_running;
+        self.ticks = state.ticks;
+        self.target = state.target;
+        self.counter_low = state.counter_low;
+        self.counter_high = state.counter_high;
     }
 
     pub fn cpu_cycles_callback(&mut self, num_cycles: i32) {

@@ -1,6 +1,38 @@
 use super::apu::Apu;
 use std::sync::OnceLock;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmpState {
+    pub pc: u16,
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub psw: u8,
+    pub sp: u8,
+    pub is_stopped: bool,
+    pub cycle_count: i32,
+}
+
+// Internal waitstate cycles per opcode (SNESLAB SPC700 waitstate table).
+const INTERNAL_WAITSTATES: [u8; 256] = [
+    0, 3, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 2,
+    2, 3, 0, 3, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+    0, 3, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 3, 2,
+    0, 3, 0, 3, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 3,
+    0, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 3,
+    2, 3, 0, 3, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+    0, 3, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 2, 1,
+    0, 3, 0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1,
+    0, 3, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0,
+    2, 3, 0, 3, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 10, 3,
+    1, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1,
+    0, 3, 0, 3, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1,
+    1, 3, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 7,
+    2, 3, 0, 3, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0, 4, 1,
+    0, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0,
+    0, 3, 0, 3, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0, 3, 0,
+];
+
 pub struct Smp {
     emulator: *mut Apu,
 
@@ -79,6 +111,31 @@ impl Smp {
         self.executed_cycles = 0;
     }
 
+    pub fn get_state(&self) -> SmpState {
+        SmpState {
+            pc: self.reg_pc,
+            a: self.reg_a,
+            x: self.reg_x,
+            y: self.reg_y,
+            psw: self.get_psw(),
+            sp: self.reg_sp,
+            is_stopped: self.is_stopped,
+            cycle_count: self.cycle_count,
+        }
+    }
+
+    pub fn set_state(&mut self, state: &SmpState) {
+        self.reg_pc = state.pc;
+        self.reg_a = state.a;
+        self.reg_x = state.x;
+        self.reg_y = state.y;
+        self.set_psw(state.psw);
+        self.reg_sp = state.sp;
+        self.is_stopped = state.is_stopped;
+        self.cycle_count = state.cycle_count;
+        self.executed_cycles = 0;
+    }
+
     pub fn set_reg_ya(&mut self, value: u16) {
         self.reg_a = value as u8;
         self.reg_y = (value >> 8) as u8;
@@ -129,11 +186,19 @@ impl Smp {
 
     fn read(&mut self, addr: u16) -> u8 {
         self.cycles(1);
+        let wait = self.emulator().wait_cycles(addr);
+        if wait > 0 {
+            self.cycles(wait);
+        }
         self.emulator().read_u8(addr as u32)
     }
 
     fn write(&mut self, addr: u16, value: u8) {
         self.cycles(1);
+        let wait = self.emulator().wait_cycles(addr);
+        if wait > 0 {
+            self.cycles(wait);
+        }
         self.emulator().write_u8(addr as u32, value);
     }
 
@@ -978,6 +1043,13 @@ impl Smp {
             if !self.is_stopped {
                 let pc = self.reg_pc;
                 let opcode = self.read_pc();
+                let internal_waits = INTERNAL_WAITSTATES[opcode as usize] as i32;
+                if internal_waits > 0 {
+                    let penalty = self.emulator().internal_wait_penalty();
+                    if penalty > 0 {
+                        self.cycles(internal_waits * penalty);
+                    }
+                }
                 if let Some((start, end)) = Self::trace_sfs_range() {
                     if pc >= start && pc <= end {
                         let b1 = self.emulator().peek_u8(self.reg_pc);

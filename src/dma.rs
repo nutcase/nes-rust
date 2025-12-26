@@ -391,7 +391,6 @@ impl DmaController {
                         }
                         _ => {}
                     }
-
                 }
             }
             _ => {}
@@ -465,7 +464,8 @@ impl DmaController {
             }
 
             // HDMA転送実行（repeat=1は毎ライン、repeat=0は最初の1回のみ）
-            let do_transfer = self.channels[i].hdma_repeat_flag || self.channels[i].hdma_do_transfer;
+            let do_transfer =
+                self.channels[i].hdma_repeat_flag || self.channels[i].hdma_do_transfer;
             if do_transfer {
                 self.perform_hdma_transfer(i, bus);
                 if !self.channels[i].hdma_repeat_flag {
@@ -537,11 +537,13 @@ impl DmaController {
         }
 
         if indirect {
-            self.channels[channel].hdma_indirect_addr =
-                self.channels[channel].hdma_indirect_addr.wrapping_add(count as u32);
+            self.channels[channel].hdma_indirect_addr = self.channels[channel]
+                .hdma_indirect_addr
+                .wrapping_add(count as u32);
         } else {
-            self.channels[channel].hdma_table_addr =
-                self.channels[channel].hdma_table_addr.wrapping_add(count as u32);
+            self.channels[channel].hdma_table_addr = self.channels[channel]
+                .hdma_table_addr
+                .wrapping_add(count as u32);
         }
     }
 }

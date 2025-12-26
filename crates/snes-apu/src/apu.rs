@@ -1,7 +1,7 @@
-use super::smp::Smp;
+use super::smp::{Smp, SmpState};
 use super::dsp::dsp::Dsp;
-use super::timer::Timer;
-use super::spc::spc::{Spc, RAM_LEN, IPL_ROM_LEN};
+use super::timer::{Timer, TimerState};
+use super::spc::spc::{Spc, RAM_LEN, IPL_ROM_LEN, REG_LEN};
 
 static DEFAULT_IPL_ROM: [u8; IPL_ROM_LEN] = [
     0xcd, 0xef, 0xbd, 0xe8, 0x00, 0xc6, 0x1d, 0xd0,
@@ -12,6 +12,19 @@ static DEFAULT_IPL_ROM: [u8; IPL_ROM_LEN] = [
     0x01, 0x10, 0xef, 0x7e, 0xf4, 0x10, 0xeb, 0xba,
     0xf6, 0xda, 0x00, 0xba, 0xf4, 0xc4, 0xf4, 0xdd,
     0x5d, 0xd0, 0xdb, 0x1f, 0x00, 0x00, 0xc0, 0xff];
+
+#[derive(Clone)]
+pub struct ApuState {
+    pub ram: [u8; RAM_LEN],
+    pub ipl_rom: [u8; IPL_ROM_LEN],
+    pub smp: SmpState,
+    pub dsp_regs: [u8; REG_LEN],
+    pub timers: [TimerState; 3],
+    pub is_ipl_rom_enabled: bool,
+    pub dsp_reg_address: u8,
+    pub cpu_to_apu_ports: [u8; 4],
+    pub apu_to_cpu_ports: [u8; 4],
+}
 
 pub struct Apu {
     ram: Box<[u8; RAM_LEN]>,
@@ -87,6 +100,25 @@ impl Apu {
         self.ram[0x00f0] = 0x0A;
         self.set_control_reg(0xB0);
         self.ram[0x00f1] = 0xB0;
+    }
+
+    /// TEST($F0) wait states: add 0/1/4/9 cycles on RAM vs I/O/ROM access.
+    pub(crate) fn wait_cycles(&self, address: u16) -> i32 {
+        let test = self.ram[0x00f0];
+        let internal = (test >> 6) & 0x03;
+        let external = (test >> 4) & 0x03;
+        let wait_table = [0i32, 1, 4, 9];
+        let is_io = (address & 0x00f0) == 0x00f0;
+        let is_rom = address >= 0xffc0 && self.is_ipl_rom_enabled;
+        let wait = if is_io || is_rom { external } else { internal };
+        wait_table[wait as usize]
+    }
+
+    pub(crate) fn internal_wait_penalty(&self) -> i32 {
+        let test = self.ram[0x00f0];
+        let internal = (test >> 6) & 0x03;
+        let wait_table = [0i32, 1, 4, 9];
+        wait_table[internal as usize]
     }
 
     /// S-CPU からの APUIO 書き込み（$2140-$2143）。S-SMP からは $F4-$F7 の読み出しで観測される。
@@ -221,7 +253,13 @@ impl Apu {
         } else if address >= 0xffc0 && self.is_ipl_rom_enabled {
             self.ipl_rom[(address - 0xffc0) as usize]
         } else {
-            self.ram[address as usize]
+            let test = self.ram[0x00f0];
+            let ram_read_enabled = (test & 0x04) == 0;
+            if !ram_read_enabled {
+                0x00
+            } else {
+                self.ram[address as usize]
+            }
         }
     }
 
@@ -375,6 +413,11 @@ impl Apu {
                 _ => () // Do nothing
             }
         } else {
+            let test = self.ram[0x00f0];
+            let ram_write_enabled = (test & 0x02) != 0;
+            if !ram_write_enabled {
+                return;
+            }
             if std::env::var_os("TRACE_SFS_APU_VAR81").is_some()
                 && (address == 0x0081 || address == 0x0181)
             {
@@ -456,6 +499,49 @@ impl Apu {
         self.set_control_reg(control_reg);
 
         self.dsp_reg_address = self.ram[0xf2];
+    }
+
+    pub fn get_state(&mut self) -> ApuState {
+        let smp_state = self.smp.as_ref().unwrap().get_state();
+        let mut dsp_regs = [0u8; REG_LEN];
+        let dsp = self.dsp.as_mut().unwrap();
+        for i in 0..REG_LEN {
+            dsp_regs[i] = dsp.get_register(i as u8);
+        }
+        ApuState {
+            ram: self.ram.as_ref().clone(),
+            ipl_rom: self.ipl_rom.as_ref().clone(),
+            smp: smp_state,
+            dsp_regs,
+            timers: [
+                self.timers[0].get_state(),
+                self.timers[1].get_state(),
+                self.timers[2].get_state(),
+            ],
+            is_ipl_rom_enabled: self.is_ipl_rom_enabled,
+            dsp_reg_address: self.dsp_reg_address,
+            cpu_to_apu_ports: self.cpu_to_apu_ports,
+            apu_to_cpu_ports: self.apu_to_cpu_ports,
+        }
+    }
+
+    pub fn set_state_from(&mut self, state: &ApuState) {
+        self.reset();
+
+        self.ram.as_mut().copy_from_slice(&state.ram);
+        self.ipl_rom.as_mut().copy_from_slice(&state.ipl_rom);
+
+        self.smp.as_mut().unwrap().set_state(&state.smp);
+        self.dsp.as_mut().unwrap().set_state_from_regs(&state.dsp_regs);
+
+        self.timers[0].set_state(&state.timers[0]);
+        self.timers[1].set_state(&state.timers[1]);
+        self.timers[2].set_state(&state.timers[2]);
+
+        self.is_ipl_rom_enabled = state.is_ipl_rom_enabled;
+        self.dsp_reg_address = state.dsp_reg_address;
+        self.cpu_to_apu_ports = state.cpu_to_apu_ports;
+        self.apu_to_cpu_ports = state.apu_to_cpu_ports;
     }
 
     pub fn clear_echo_buffer(&mut self) {

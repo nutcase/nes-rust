@@ -197,6 +197,17 @@ impl Dsp {
         self.set_kon(spc.regs[0x4c]);
     }
 
+    pub fn set_state_from_regs(&mut self, regs: &[u8; REG_LEN]) {
+        for i in 0..REG_LEN {
+            match i {
+                0x4c | 0x5c => (), // Do nothing
+                _ => { self.set_register(i as u8, regs[i as usize]); }
+            }
+        }
+
+        self.set_kon(regs[0x4c]);
+    }
+
     pub fn cycles_callback(&mut self, num_cycles: i32) {
         self.cycles_since_last_flush += num_cycles;
     }

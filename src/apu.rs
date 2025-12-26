@@ -1,6 +1,8 @@
 //! APU wrapper using the external `snes-apu` crate (SPC700 + DSP).
-//! 現状: 精度よりも動作優先の簡易統合。セーブステートはダミー。
-use snes_apu::apu::Apu as SpcApu;
+//! 現状: 精度よりも動作優先の簡易統合。セーブステートは内部状態を保存/復元。
+use snes_apu::apu::{Apu as SpcApu, ApuState as SpcApuState};
+use snes_apu::smp::SmpState as SpcSmpState;
+use snes_apu::TimerState as SpcTimerState;
 
 // Clock ratio used to convert S-CPU cycles (3.579545MHz NTSC) to `snes-apu` internal cycles.
 //
@@ -671,7 +673,8 @@ impl Apu {
             }
             BootState::Running => {
                 // 稼働後はCPU->APU書き込みをそのまま渡すのみ。キャッシュ更新はHLE/SMW用途のみ。
-                if self.smw_apu_echo || self.smw_apu_hle_handshake || self.smw_apu_port_echo_strict {
+                if self.smw_apu_echo || self.smw_apu_hle_handshake || self.smw_apu_port_echo_strict
+                {
                     self.apu_to_cpu_ports[p] = value;
                 }
 
@@ -745,13 +748,163 @@ impl Apu {
         self.sample_rate
     }
 
-    // --- セーブステート（ダミー実装） ---
-    pub fn to_save_state(&self) -> crate::savestate::ApuSaveState {
-        crate::savestate::ApuSaveState::default()
+    // --- セーブステート ---
+    pub fn to_save_state(&mut self) -> crate::savestate::ApuSaveState {
+        let core = self.inner.get_state();
+        let mut st = crate::savestate::ApuSaveState::default();
+        st.ram = core.ram.to_vec();
+        st.ipl_rom = core.ipl_rom.to_vec();
+        st.dsp_registers = core.dsp_regs.to_vec();
+        st.ports = self.apu_to_cpu_ports;
+        st.cpu_to_apu_ports = core.cpu_to_apu_ports;
+        st.apu_to_cpu_ports = self.apu_to_cpu_ports;
+        st.port_latch = self.port_latch;
+        st.cycle_counter = self.total_smp_cycles;
+        st.smp_pc = core.smp.pc;
+        st.smp_a = core.smp.a;
+        st.smp_x = core.smp.x;
+        st.smp_y = core.smp.y;
+        st.smp_psw = core.smp.psw;
+        st.smp_sp = core.smp.sp;
+        st.smp_stopped = core.smp.is_stopped;
+        st.smp_cycle_count = core.smp.cycle_count;
+        st.dsp_reg_address = core.dsp_reg_address;
+        st.is_ipl_rom_enabled = core.is_ipl_rom_enabled;
+        st.boot_state = Self::boot_state_to_u8(self.boot_state);
+        st.boot_port0_echo = self.boot_port0_echo;
+        st.cycle_accum = self.cycle_accum;
+        st.master_volume_left = core.dsp_regs[0x0c];
+        st.master_volume_right = core.dsp_regs[0x1c];
+        st.echo_volume_left = core.dsp_regs[0x2c];
+        st.echo_volume_right = core.dsp_regs[0x3c];
+        st.timers = core
+            .timers
+            .iter()
+            .map(|t| crate::savestate::TimerSaveState {
+                enabled: t.is_running,
+                target: t.target,
+                counter: t.counter_high,
+                divider: t.ticks as u16,
+                divider_target: t.resolution as u16,
+            })
+            .collect();
+        st
     }
 
-    pub fn load_from_save_state(&mut self, _st: &crate::savestate::ApuSaveState) {
-        self.reset();
+    pub fn load_from_save_state(&mut self, st: &crate::savestate::ApuSaveState) {
+        let ram = Self::vec_to_array::<0x10000>(&st.ram);
+        let dsp_regs = Self::vec_to_array::<0x80>(&st.dsp_registers);
+        let ipl_rom = if st.ipl_rom.is_empty() {
+            self.inner.get_state().ipl_rom
+        } else {
+            Self::vec_to_array::<0x40>(&st.ipl_rom)
+        };
+
+        let timers = [
+            Self::timer_state_from_save(st.timers.get(0), 256),
+            Self::timer_state_from_save(st.timers.get(1), 256),
+            Self::timer_state_from_save(st.timers.get(2), 32),
+        ];
+
+        let smp_state = SpcSmpState {
+            pc: st.smp_pc,
+            a: st.smp_a,
+            x: st.smp_x,
+            y: st.smp_y,
+            psw: st.smp_psw,
+            sp: st.smp_sp,
+            is_stopped: st.smp_stopped,
+            cycle_count: st.smp_cycle_count,
+        };
+
+        let mut apu_to_cpu_ports = st.apu_to_cpu_ports;
+        if apu_to_cpu_ports == [0; 4] {
+            apu_to_cpu_ports = st.ports;
+        }
+
+        let apu_state = SpcApuState {
+            ram,
+            ipl_rom,
+            smp: smp_state,
+            dsp_regs,
+            timers,
+            is_ipl_rom_enabled: st.is_ipl_rom_enabled,
+            dsp_reg_address: st.dsp_reg_address,
+            cpu_to_apu_ports: st.cpu_to_apu_ports,
+            apu_to_cpu_ports,
+        };
+
+        self.inner.set_state_from(&apu_state);
+        self.apu_to_cpu_ports = apu_state.apu_to_cpu_ports;
+        self.port_latch = if st.port_latch == [0; 4] {
+            apu_state.cpu_to_apu_ports
+        } else {
+            st.port_latch
+        };
+        self.pending_port_writes.clear();
+        self.total_smp_cycles = st.cycle_counter;
+        self.cycle_accum = st.cycle_accum;
+        self.cycle_scale = Self::read_cycle_scale();
+        self.boot_state = Self::boot_state_from_u8(st.boot_state);
+        self.boot_port0_echo = if st.boot_port0_echo == 0 {
+            self.apu_to_cpu_ports[0]
+        } else {
+            st.boot_port0_echo
+        };
+        self.trace_last_f1 = self.inner.read_u8(0x00F1);
+        self.trace_last_fa = self.inner.read_u8(0x00FA);
+        for p in 0..4 {
+            self.trace_last_out_ports[p] = self.inner.cpu_read_port(p as u8);
+        }
+    }
+
+    fn vec_to_array<const N: usize>(data: &[u8]) -> [u8; N] {
+        let mut out = [0u8; N];
+        if !data.is_empty() {
+            let len = data.len().min(N);
+            out[..len].copy_from_slice(&data[..len]);
+        }
+        out
+    }
+
+    fn timer_state_from_save(
+        st: Option<&crate::savestate::TimerSaveState>,
+        resolution: i32,
+    ) -> SpcTimerState {
+        match st {
+            Some(t) => SpcTimerState {
+                resolution: if t.divider_target == 0 {
+                    resolution
+                } else {
+                    t.divider_target as i32
+                },
+                is_running: t.enabled,
+                ticks: t.divider as i32,
+                target: t.target,
+                counter_low: 0,
+                counter_high: t.counter,
+            },
+            None => SpcTimerState {
+                resolution,
+                ..SpcTimerState::default()
+            },
+        }
+    }
+
+    fn boot_state_to_u8(state: BootState) -> u8 {
+        match state {
+            BootState::ReadySignature => 1,
+            BootState::Uploading => 2,
+            BootState::Running => 3,
+        }
+    }
+
+    fn boot_state_from_u8(value: u8) -> BootState {
+        match value {
+            1 => BootState::ReadySignature,
+            2 => BootState::Uploading,
+            _ => BootState::Running,
+        }
     }
 
     // 旧ハンドシェイクAPI互換ダミー

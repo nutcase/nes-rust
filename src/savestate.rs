@@ -83,6 +83,40 @@ pub struct ApuSaveState {
     pub echo_volume_left: u8,
     #[serde(default)]
     pub echo_volume_right: u8,
+    #[serde(default)]
+    pub smp_pc: u16,
+    #[serde(default)]
+    pub smp_a: u8,
+    #[serde(default)]
+    pub smp_x: u8,
+    #[serde(default)]
+    pub smp_y: u8,
+    #[serde(default)]
+    pub smp_psw: u8,
+    #[serde(default)]
+    pub smp_sp: u8,
+    #[serde(default)]
+    pub smp_stopped: bool,
+    #[serde(default)]
+    pub smp_cycle_count: i32,
+    #[serde(default)]
+    pub cpu_to_apu_ports: [u8; 4],
+    #[serde(default)]
+    pub apu_to_cpu_ports: [u8; 4],
+    #[serde(default)]
+    pub port_latch: [u8; 4],
+    #[serde(default)]
+    pub dsp_reg_address: u8,
+    #[serde(default)]
+    pub is_ipl_rom_enabled: bool,
+    #[serde(default)]
+    pub ipl_rom: Vec<u8>,
+    #[serde(default)]
+    pub boot_state: u8,
+    #[serde(default)]
+    pub boot_port0_echo: u8,
+    #[serde(default)]
+    pub cycle_accum: f64,
 }
 
 #[derive(Serialize, Deserialize, Default)]

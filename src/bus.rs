@@ -3181,9 +3181,7 @@ impl Bus {
             if (0x2140..=0x2143).contains(&off) {
                 println!(
                     "[APU-U16] PC={:06X} ${:04X} <- {:04X}",
-                    self.last_cpu_pc,
-                    off,
-                    value
+                    self.last_cpu_pc, off, value
                 );
             }
         }
@@ -4475,7 +4473,6 @@ impl Bus {
         self.ppu.end_hdma_context();
     }
 
-
     #[inline]
     fn hdma_transfer_len(unit: u8) -> u8 {
         match unit & 0x07 {
@@ -4851,8 +4848,7 @@ impl Bus {
             let burnin_pre_wram_hash = fnv1a64(pre);
             println!(
                 "[BURNIN-DMAMEM] PREREAD-WRAM pc={:06X} hash={:016X}",
-                self.last_cpu_pc,
-                burnin_pre_wram_hash
+                self.last_cpu_pc, burnin_pre_wram_hash
             );
         }
 
