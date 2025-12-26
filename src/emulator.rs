@@ -1563,13 +1563,17 @@ impl Emulator {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        if frame_count <= nmi_guard_frames {
-            self.bus.get_ppu_mut().nmi_enabled = false;
-            // pending NMI を必ずクリア
-            let _ = self.bus.read_u8(0x4210);
-        } else if frame_count == nmi_guard_frames + 1 {
-            self.bus.get_ppu_mut().nmi_enabled = true;
-            let _ = self.bus.read_u8(0x4210);
+        if nmi_guard_frames > 0 {
+            if frame_count <= nmi_guard_frames {
+                self.bus.get_ppu_mut().nmi_enabled = false;
+                // pending NMI を必ずクリア
+                let _ = self.bus.read_u8(0x4210);
+            } else if frame_count == nmi_guard_frames + 1 {
+                // ガード解除後は $4200 の設定に従う
+                let nmi_en = (self.bus.nmitimen() & 0x80) != 0;
+                self.bus.get_ppu_mut().nmi_enabled = nmi_en;
+                let _ = self.bus.read_u8(0x4210);
+            }
         }
         // Optional: dump S-CPU PC for early-frame debugging (enable via SHOW_PC=1)
         if std::env::var_os("SHOW_PC").is_some() && frame_count <= 16 {
