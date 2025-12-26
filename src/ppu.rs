@@ -294,7 +294,7 @@ pub struct Ppu {
     sprite_tile_budget_remaining: i16,
     #[allow(dead_code)]
     sprite_draw_disabled: bool,
-    sprite_timeover_stop_x: u16, // when time-over triggers, tiles starting at >= stop_x are forbidden
+    sprite_timeover_first_idx: u8, // lowest line_sprites index allowed to render (per scanline)
 
     // --- Dot-level window/color-math gating (per visible scanline) ---
     line_window_prepared: bool,
@@ -819,7 +819,7 @@ impl Ppu {
             sprite_tile_entry_counts: [0; 256],
             sprite_tile_budget_remaining: 0,
             sprite_draw_disabled: false,
-            sprite_timeover_stop_x: 256,
+            sprite_timeover_first_idx: 0,
             line_window_prepared: false,
             color_window_lut: [0; 256],
             main_bg_window_lut: [[0; 256]; 4],
@@ -1308,6 +1308,10 @@ impl Ppu {
         // NMIパルスは許可時のみCPUへ届ける。ラッチを使って多重発火を防ぐ。
         if self.nmi_enabled && !self.nmi_latched {
             self.nmi_latched = true; // ensure one NMI per VBlank
+        }
+        // SNESdev: internal OAM address resets to OAMADD at VBlank start when display is enabled.
+        if !self.is_forced_blank() {
+            self.oam_internal_addr = (self.oam_addr & 0x01FF) << 1;
         }
         if std::env::var_os("TRACE_VBLANK").is_some() {
             use std::sync::atomic::{AtomicU32, Ordering};
@@ -2277,13 +2281,8 @@ impl Ppu {
                 let tile_y = rel_y / 8;
                 let pixel_x = rel_x % 8;
                 let pixel_y = rel_y % 8;
-                // Time-over gating: allow only tiles whose 8px block started before stop_x
-                if self.sprite_timeover_stop_x < 256 {
-                    let stop_x = self.sprite_timeover_stop_x as i16;
-                    let tile_start_x = sx.saturating_add((tile_x as i16) * 8);
-                    if tile_start_x >= stop_x {
-                        continue;
-                    }
+                if (idx as u8) < self.sprite_timeover_first_idx {
+                    continue;
                 }
                 let color = self.render_sprite_tile(sprite, tile_x, tile_y, pixel_x, pixel_y);
                 if color != 0 {
@@ -4756,6 +4755,10 @@ impl Ppu {
                 };
                 let v = self.oam.get(mapped as usize).copied().unwrap_or(0);
                 self.oam_internal_addr = (internal + 1) & 0x03FF;
+                self.oam_addr = (self.oam_internal_addr >> 1) & 0x01FF;
+                if self.oam_priority_rotation_enabled {
+                    self.oam_eval_base = ((self.oam_addr & 0x00FE) >> 1) as u8;
+                }
                 v
             }
             0x39 | 0x3A => {
@@ -5166,6 +5169,10 @@ impl Ppu {
                     self.oam_writes_total = self.oam_writes_total.saturating_add(1);
                 }
                 self.oam_internal_addr = (internal + 1) & 0x03FF;
+                self.oam_addr = (self.oam_internal_addr >> 1) & 0x01FF;
+                if self.oam_priority_rotation_enabled {
+                    self.oam_eval_base = ((self.oam_addr & 0x00FE) >> 1) as u8;
+                }
             }
             0x05 => {
                 // BGMODE: bit0-2: mode, bit4-7: tile size for BG1..BG4 (1=16x16)
@@ -6240,8 +6247,7 @@ impl Ppu {
         }
         self.sprite_overflow = false;
         self.sprite_time_over = false;
-        // We currently do not emulate the partial-tile fetch artifact precisely; keep rendering ungated.
-        self.sprite_timeover_stop_x = 256;
+        self.sprite_timeover_first_idx = 0;
 
         // Gather sprites in rotated OAM order (starting at oam_eval_base), cap at 32 like hardware.
         //
@@ -6366,7 +6372,8 @@ impl Ppu {
         // Time-over (tile overflow) evaluation for this scanline.
         // Count up to 34 tiles across the 32-sprite range list; if there are more, latch time over.
         let mut tiles_seen: u16 = 0;
-        'time_eval: for s in self.line_sprites.iter().rev() {
+        self.sprite_timeover_first_idx = 0;
+        'time_eval: for (rev_idx, s) in self.line_sprites.iter().enumerate().rev() {
             let mut sx = Self::sprite_x_signed(s.x);
             if sx == -256 {
                 sx = 0;
@@ -6382,10 +6389,12 @@ impl Ppu {
                 tiles_seen = tiles_seen.saturating_add(1);
                 if tiles_seen > 34 {
                     self.sprite_time_over = true;
+                    let cutoff = (rev_idx.saturating_add(1)).min(255) as u8;
+                    self.sprite_timeover_first_idx = cutoff;
                     if !self.sprite_time_over_latched && crate::debug_flags::trace_burnin_obj() {
                         println!(
-                            "[BURNIN-OBJ][LATCH] time_over set: frame={} line={} tiles_seen={}",
-                            self.frame, scanline, tiles_seen
+                            "[BURNIN-OBJ][LATCH] time_over set: frame={} line={} tiles_seen={} first_idx={}",
+                            self.frame, scanline, tiles_seen, self.sprite_timeover_first_idx
                         );
                     }
                     self.sprite_time_over_latched = true;
@@ -7716,6 +7725,13 @@ impl Ppu {
             self.color_window_logic,
             self.tmw_mask,
             self.tsw_mask
+        );
+        println!(
+            "OAM: addr=0x{:03X} internal=0x{:03X} eval_base={} rotation={}",
+            self.oam_addr,
+            self.oam_internal_addr,
+            self.oam_eval_base,
+            self.oam_priority_rotation_enabled
         );
         println!("Screen Display: 0x{:02X}", self.screen_display);
         println!("NMI: enabled={}, flag={}", self.nmi_enabled, self.nmi_flag);
