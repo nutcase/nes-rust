@@ -421,6 +421,52 @@ impl Ppu {
         crate::debug_flags::force_display()
     }
 
+    #[inline]
+    fn bg_interlace_active(&self) -> bool {
+        self.interlace && (self.bg_mode == 5 || self.bg_mode == 6)
+    }
+
+    fn bg_interlace_y(&self, y: u16) -> u16 {
+        if self.bg_interlace_active() {
+            y.saturating_mul(2).saturating_add(self.interlace_field as u16)
+        } else {
+            y
+        }
+    }
+
+    fn obj_interlace_active(&self) -> bool {
+        self.interlace && self.obj_interlace
+    }
+
+    fn obj_line_for_scanline(&self, scanline: u16) -> u16 {
+        if self.obj_interlace_active() {
+            (scanline << 1) | (self.interlace_field as u16)
+        } else {
+            scanline
+        }
+    }
+
+    fn obj_sprite_dy(&self, obj_line: u16, sprite_y: u8) -> u16 {
+        if self.obj_interlace_active() {
+            let sprite_y_line = (sprite_y as u16) << 1;
+            obj_line.wrapping_sub(sprite_y_line) & 0x01FF
+        } else {
+            (obj_line as u8).wrapping_sub(sprite_y) as u16
+        }
+    }
+
+    fn obj_sprite_height_lines(&self, sprite_height: u16) -> u16 {
+        // OBJ interlace shows alternate lines each field, so compare against the
+        // original sprite height (not doubled). This makes pixels appear half-height
+        // across a single field.
+        sprite_height
+    }
+
+    fn obj_sprite_rel_y(&self, dy_lines: u16) -> u8 {
+        // For OBJ interlace, dy_lines already encodes even/odd lines per field.
+        dy_lines as u8
+    }
+
     // --- Coarse NTSC timing helpers ---
     #[inline]
     fn first_visible_dot(&self) -> u16 {
@@ -2200,7 +2246,7 @@ impl Ppu {
             return (0, 0);
         }
         let x_i16 = x as i16;
-        let y_u8 = y as u8;
+        let obj_line = self.obj_line_for_scanline(y);
         let sprites = &self.line_sprites;
         let sprites_by_pri = &self.line_sprites_by_priority;
 
@@ -2214,10 +2260,10 @@ impl Ppu {
                 let sprite = &sprites[idx];
                 let (sprite_width, sprite_height) = self.get_sprite_pixel_size(&sprite.size);
                 let sx = Self::sprite_x_signed(sprite.x);
-                let sy = sprite.y;
                 // Y is 8-bit and wraps; test overlap via wrapped subtraction.
-                let dy = y_u8.wrapping_sub(sy);
-                if (dy as u16) >= sprite_height as u16 {
+                let dy_lines = self.obj_sprite_dy(obj_line, sprite.y);
+                let sprite_height_lines = self.obj_sprite_height_lines(sprite_height as u16);
+                if dy_lines >= sprite_height_lines {
                     continue;
                 }
                 if x_i16 < sx || x_i16 >= sx.saturating_add(sprite_width as i16) {
@@ -2226,7 +2272,7 @@ impl Ppu {
 
                 // スプライト内相対座標→タイル/ピクセル座標
                 let rel_x = (x_i16 - sx) as u8;
-                let rel_y = dy;
+                let rel_y = self.obj_sprite_rel_y(dy_lines);
                 let tile_x = rel_x / 8;
                 let tile_y = rel_y / 8;
                 let pixel_x = rel_x % 8;
@@ -2836,7 +2882,13 @@ impl Ppu {
         let wrap_x = width_tiles * tile_px;
         let wrap_y = height_tiles * tile_px;
 
-        let (mosaic_x, mosaic_y) = self.apply_mosaic(x, y, bg_num);
+        let y_line = self.bg_interlace_y(y);
+        let (mosaic_x, mosaic_y_base) = self.apply_mosaic(x, y, bg_num);
+        let mosaic_y_line = if y_line == y {
+            mosaic_y_base
+        } else {
+            self.apply_mosaic(x, y_line, bg_num).1
+        };
         let (scroll_x, scroll_y) = match bg_num {
             0 => (self.bg1_hscroll, self.bg1_vscroll),
             1 => (self.bg2_hscroll, self.bg2_vscroll),
@@ -2845,10 +2897,11 @@ impl Ppu {
             _ => (0, 0),
         };
         let bg_x = (mosaic_x + scroll_x) % wrap_x;
-        let bg_y = (mosaic_y + scroll_y) % wrap_y;
+        let bg_y_tile = (mosaic_y_base + scroll_y) % wrap_y;
+        let bg_y_line = (mosaic_y_line + scroll_y) % wrap_y;
 
         let tile_x = bg_x / tile_px;
-        let tile_y = bg_y / tile_px;
+        let tile_y = bg_y_tile / tile_px;
 
         // Debug output disabled for performance
 
@@ -2921,7 +2974,7 @@ impl Ppu {
                 if TILEMAP_FOUND_COUNT < 20 && crate::debug_flags::boot_verbose() {
                     TILEMAP_FOUND_COUNT += 1;
                     println!("🗺️  TILEMAP[{}]: BG{} screen({},{}) bg({},{}) tile({},{}) map({},{}) quad={} base=0x{:04X} word_addr=0x{:04X} byte_addr=0x{:04X} entry=0x{:04X} tile_id={}",
-                            TILEMAP_FOUND_COUNT, bg_num, x, y, bg_x, bg_y, tile_x, tile_y, map_tx, map_ty, quadrant, tilemap_base, map_entry_word_addr, map_entry_addr, map_entry, tile_id_raw);
+                            TILEMAP_FOUND_COUNT, bg_num, x, y, bg_x, bg_y_tile, tile_x, tile_y, map_tx, map_ty, quadrant, tilemap_base, map_entry_word_addr, map_entry_addr, map_entry, tile_id_raw);
                 }
             } else if TILEMAP_FOUND_COUNT == 0
                 && INVALID_TILEMAP_COUNT < 5
@@ -2940,7 +2993,7 @@ impl Ppu {
         let priority = (map_entry & 0x2000) != 0;
 
         let mut rel_x = (bg_x % tile_px) as u8;
-        let mut rel_y = (bg_y % tile_px) as u8;
+        let mut rel_y = (bg_y_line % tile_px) as u8;
         if flip_x {
             rel_x = (tile_px as u8 - 1) - rel_x;
         }
@@ -3086,7 +3139,13 @@ impl Ppu {
             }
         }
 
-        let (mosaic_x, mosaic_y) = self.apply_mosaic(x, y, bg_num);
+        let y_line = self.bg_interlace_y(y);
+        let (mosaic_x, mosaic_y_base) = self.apply_mosaic(x, y, bg_num);
+        let mosaic_y_line = if y_line == y {
+            mosaic_y_base
+        } else {
+            self.apply_mosaic(x, y_line, bg_num).1
+        };
         let (scroll_x, scroll_y) = match bg_num {
             0 => (self.bg1_hscroll, self.bg1_vscroll),
             1 => (self.bg2_hscroll, self.bg2_vscroll),
@@ -3094,14 +3153,22 @@ impl Ppu {
             3 => (self.bg4_hscroll, self.bg4_vscroll),
             _ => (0, 0),
         };
-        self.render_bg_4bpp_impl(bg_num, mosaic_x, mosaic_y, scroll_x, scroll_y)
+        self.render_bg_4bpp_impl(
+            bg_num,
+            mosaic_x,
+            mosaic_y_base,
+            mosaic_y_line,
+            scroll_x,
+            scroll_y,
+        )
     }
 
     fn render_bg_4bpp_impl(
         &self,
         bg_num: u8,
         mosaic_x: u16,
-        mosaic_y: u16,
+        mosaic_y_base: u16,
+        mosaic_y_line: u16,
         scroll_x: u16,
         scroll_y: u16,
     ) -> (u32, u8) {
@@ -3114,10 +3181,11 @@ impl Ppu {
         let wrap_y = height_tiles * tile_px;
 
         let bg_x = (mosaic_x + scroll_x) % wrap_x;
-        let bg_y = (mosaic_y + scroll_y) % wrap_y;
+        let bg_y_tile = (mosaic_y_base + scroll_y) % wrap_y;
+        let bg_y_line = (mosaic_y_line + scroll_y) % wrap_y;
 
         let tile_x = bg_x / tile_px;
-        let tile_y = bg_y / tile_px;
+        let tile_y = bg_y_tile / tile_px;
 
         // Debug output disabled for performance
 
@@ -3150,7 +3218,7 @@ impl Ppu {
             static mut DEBUG_TILEMAP_COUNT: u32 = 0;
             unsafe {
                 DEBUG_TILEMAP_COUNT += 1;
-                if DEBUG_TILEMAP_COUNT <= 3 && mosaic_x < 5 && mosaic_y < 5 {
+                if DEBUG_TILEMAP_COUNT <= 3 && mosaic_x < 5 && mosaic_y_base < 5 {
                     println!(
                         "  BG{} tilemap_base=0x{:04X}, map_entry_addr=0x{:04X}, VRAM_len=0x{:04X}",
                         bg_num,
@@ -3184,7 +3252,7 @@ impl Ppu {
         let map_entry = ((map_entry_hi as u16) << 8) | (map_entry_lo as u16);
 
         // Optional tilemap sampling (disabled by default)
-        if crate::debug_flags::boot_verbose() && mosaic_x == 0 && mosaic_y == 0 {
+        if crate::debug_flags::boot_verbose() && mosaic_x == 0 && mosaic_y_base == 0 {
             println!(
                 "Tilemap entry @0x{:04X} = 0x{:04X}",
                 map_entry_addr, map_entry
@@ -3198,7 +3266,7 @@ impl Ppu {
         let priority = (map_entry & 0x2000) != 0;
 
         let mut rel_x = (bg_x % tile_px) as u8;
-        let mut rel_y = (bg_y % tile_px) as u8;
+        let mut rel_y = (bg_y_line % tile_px) as u8;
         if flip_x {
             rel_x = (tile_px as u8 - 1) - rel_x;
         }
@@ -3293,10 +3361,10 @@ impl Ppu {
             static mut TILE_DEBUG_COUNT: u32 = 0;
             unsafe {
                 TILE_DEBUG_COUNT += 1;
-                if TILE_DEBUG_COUNT <= 10 && mosaic_x < 4 && mosaic_y < 4 {
+                if TILE_DEBUG_COUNT <= 10 && mosaic_x < 4 && mosaic_y_base < 4 {
                     println!(
                         "Tile({},{}) tile=0x{:03X} planes=[{:02X},{:02X},{:02X},{:02X}]",
-                        mosaic_x, mosaic_y, tile_id, plane0, plane1, plane2, plane3
+                        mosaic_x, mosaic_y_base, tile_id, plane0, plane1, plane2, plane3
                     );
                 }
             }
@@ -3350,7 +3418,13 @@ impl Ppu {
         let wrap_x = width_tiles * tile_px;
         let wrap_y = height_tiles * tile_px;
 
-        let (mosaic_x, mosaic_y) = self.apply_mosaic(x, y, bg_num);
+        let y_line = self.bg_interlace_y(y);
+        let (mosaic_x, mosaic_y_base) = self.apply_mosaic(x, y, bg_num);
+        let mosaic_y_line = if y_line == y {
+            mosaic_y_base
+        } else {
+            self.apply_mosaic(x, y_line, bg_num).1
+        };
         let (scroll_x, scroll_y) = match bg_num {
             0 => (self.bg1_hscroll, self.bg1_vscroll),
             1 => (self.bg2_hscroll, self.bg2_vscroll),
@@ -3359,10 +3433,11 @@ impl Ppu {
             _ => (0, 0),
         };
         let bg_x = (mosaic_x.wrapping_add(scroll_x)) % wrap_x;
-        let bg_y = (mosaic_y.wrapping_add(scroll_y)) % wrap_y;
+        let bg_y_tile = (mosaic_y_base.wrapping_add(scroll_y)) % wrap_y;
+        let bg_y_line = (mosaic_y_line.wrapping_add(scroll_y)) % wrap_y;
 
         let tile_x = bg_x / tile_px;
-        let tile_y = bg_y / tile_px;
+        let tile_y = bg_y_tile / tile_px;
 
         let tilemap_base_word = match bg_num {
             0 => self.bg1_tilemap_base,
@@ -3396,7 +3471,7 @@ impl Ppu {
         let priority = (map_entry & 0x2000) != 0;
 
         let mut rel_x = (bg_x % tile_px) as u8;
-        let mut rel_y = (bg_y % tile_px) as u8;
+        let mut rel_y = (bg_y_line % tile_px) as u8;
         if flip_x {
             rel_x = (tile_px as u8 - 1) - rel_x;
         }
@@ -3693,7 +3768,13 @@ impl Ppu {
             return (0, 0);
         }
 
-        let (mosaic_x, mosaic_y) = self.apply_mosaic(x, y, bg_num);
+        let y_line = self.bg_interlace_y(y);
+        let (mosaic_x, mosaic_y_base) = self.apply_mosaic(x, y, bg_num);
+        let mosaic_y_line = if y_line == y {
+            mosaic_y_base
+        } else {
+            self.apply_mosaic(x, y_line, bg_num).1
+        };
         // OPT applies to screen tile columns 1..32; the leftmost 8 pixels are never affected.
         // The offset map itself is read from BG3 using BG3HOFS/BG3VOFS, so the screen-column
         // selection must not depend on BG1/BG2 fine scroll.
@@ -3702,7 +3783,14 @@ impl Ppu {
 
         let scroll_x = self.mode2_opt_hscroll_lut[bg_num as usize][col];
         let scroll_y = self.mode2_opt_vscroll_lut[bg_num as usize][col];
-        self.render_bg_4bpp_impl(bg_num, mosaic_x, mosaic_y, scroll_x, scroll_y)
+        self.render_bg_4bpp_impl(
+            bg_num,
+            mosaic_x,
+            mosaic_y_base,
+            mosaic_y_line,
+            scroll_x,
+            scroll_y,
+        )
     }
 
     fn render_bg_mode5(&self, x: u16, y: u16, bg_num: u8, is_main: bool) -> (u32, u8) {
@@ -3751,7 +3839,11 @@ impl Ppu {
             _ => (0, 0),
         };
         let bg_x = (x_hires.wrapping_add(scroll_x)) % wrap_x;
-        let bg_y = (y.wrapping_add(scroll_y)) % wrap_y;
+        let mut y_eff = y;
+        if self.bg_interlace_active() {
+            y_eff = y_eff.saturating_mul(2).saturating_add(self.interlace_field as u16);
+        }
+        let bg_y = (y_eff.wrapping_add(scroll_y)) % wrap_y;
 
         let tile_x = bg_x / tile_w;
         let tile_y = bg_y / tile_h;
@@ -3897,6 +3989,7 @@ impl Ppu {
             if sprite_y >= 240 {
                 continue;
             }
+            let obj_line = self.obj_line_for_scanline(scanline);
 
             // 高位テーブルからサイズ情報を取得
             let high_table_offset = 0x200 + (i / 4);
@@ -3917,7 +4010,9 @@ impl Ppu {
             let (_, sprite_height) = self.get_sprite_pixel_size(&size);
 
             // このスプライトが現在のスキャンラインに表示されるかチェック
-            if scanline >= sprite_y as u16 && scanline < sprite_y as u16 + sprite_height as u16 {
+            let dy_lines = self.obj_sprite_dy(obj_line, sprite_y);
+            let sprite_height_lines = self.obj_sprite_height_lines(sprite_height as u16);
+            if dy_lines < sprite_height_lines {
                 self.sprites_on_line_count += 1;
 
                 // スプライト制限チェック
@@ -4018,8 +4113,11 @@ impl Ppu {
             // スプライトのサイズを取得
             let (_, sprite_height) = self.get_sprite_pixel_size(&size);
 
+            let obj_line = self.obj_line_for_scanline(y);
             // このスプライトが現在のスキャンラインに表示されるかチェック
-            if y < sprite_y as u16 || y >= sprite_y as u16 + sprite_height as u16 {
+            let dy_lines = self.obj_sprite_dy(obj_line, sprite_y);
+            let sprite_height_lines = self.obj_sprite_height_lines(sprite_height as u16);
+            if dy_lines >= sprite_height_lines {
                 continue;
             }
 
@@ -6168,6 +6266,7 @@ impl Ppu {
             if y >= 240 {
                 continue;
             }
+            let obj_line = self.obj_line_for_scanline(scanline);
             // Determine size
             let high_table_offset = 0x200 + (i / 4);
             if high_table_offset >= self.oam.len() {
@@ -6184,8 +6283,9 @@ impl Ppu {
             };
             let (sprite_w, sprite_h) = self.get_sprite_pixel_size(&size);
             // Y is 8-bit and wraps; test overlap via wrapped subtraction.
-            let dy = (scanline as u8).wrapping_sub(y);
-            if (dy as u16) >= sprite_h as u16 {
+            let dy_lines = self.obj_sprite_dy(obj_line, y);
+            let sprite_height_lines = self.obj_sprite_height_lines(sprite_h as u16);
+            if dy_lines >= sprite_height_lines {
                 continue;
             }
 
@@ -6225,7 +6325,7 @@ impl Ppu {
                     i,
                     x,
                     y,
-                    dy,
+                    dy_lines,
                     size
                 );
             }
@@ -6699,7 +6799,7 @@ impl Ppu {
         0xFF000000 | (r8 << 16) | (g8 << 8) | b8
     }
 
-    // モザイク効果
+    // モザイク効果（座標そのものに適用。インターレースのY変換は呼び出し側で行う）
     fn apply_mosaic(&self, x: u16, y: u16, bg_num: u8) -> (u16, u16) {
         // 該当BGでモザイクが有効かチェック
         if !self.is_mosaic_enabled(bg_num) {
@@ -7540,6 +7640,10 @@ impl Ppu {
             self.bg_tile_16[index],
             self.bg_screen_size[index],
         )
+    }
+
+    pub fn get_setini(&self) -> u8 {
+        self.setini
     }
 
     /// Write a 15-bit RGB color to CGRAM at the given color index

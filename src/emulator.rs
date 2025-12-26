@@ -738,6 +738,7 @@ impl Emulator {
                 let frame_time = frame_start.elapsed();
                 self.performance_stats.update(frame_time);
                 self.frame_count += 1;
+                self.maybe_dump_framebuffer_at();
                 self.maybe_dump_mem_at();
 
                 // Periodic SRAM autosave (optional)
@@ -2180,9 +2181,55 @@ impl Emulator {
             (ppu.get_main_screen_designation() & 0x10) != 0
         );
         println!("  BG mode:    {}", ppu.get_bg_mode());
+        let setini = ppu.get_setini();
+        println!(
+            "  SETINI:     0x{:02X} (interlace={} obj_interlace={} pseudo_hires={} overscan={} extbg={})",
+            setini,
+            (setini & 0x01) != 0,
+            (setini & 0x02) != 0,
+            (setini & 0x08) != 0,
+            (setini & 0x04) != 0,
+            (setini & 0x40) != 0
+        );
+
+        let main_tm = ppu.get_main_screen_designation();
+        if (main_tm & 0x01) != 0 {
+            let (tile_base, map_base, tile_16, screen_size) = ppu.get_bg_config(1);
+            let size_desc = match screen_size {
+                0 => "32x32",
+                1 => "64x32",
+                2 => "32x64",
+                3 => "64x64",
+                _ => "???",
+            };
+            println!(
+                "  BG1 config: tile_base=0x{:04X} map_base=0x{:04X} tile_size={} screen={}",
+                tile_base,
+                map_base,
+                if tile_16 { "16x16" } else { "8x8" },
+                size_desc
+            );
+        }
+
+        if (main_tm & 0x08) != 0 {
+            let (tile_base, map_base, tile_16, screen_size) = ppu.get_bg_config(4);
+            let size_desc = match screen_size {
+                0 => "32x32",
+                1 => "64x32",
+                2 => "32x64",
+                3 => "64x64",
+                _ => "???",
+            };
+            println!(
+                "  BG4 config: tile_base=0x{:04X} map_base=0x{:04X} tile_size={} screen={}",
+                tile_base,
+                map_base,
+                if tile_16 { "16x16" } else { "8x8" },
+                size_desc
+            );
+        }
 
         // BG3 configuration
-        let main_tm = ppu.get_main_screen_designation();
         if (main_tm & 0x04) != 0 {
             // BG3 enabled
             let (tile_base, map_base, tile_16, screen_size) = ppu.get_bg_config(3);
