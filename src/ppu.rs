@@ -898,8 +898,8 @@ impl Ppu {
         let first_hblank = self.first_hblank_dot();
         let first_visible = self.first_visible_dot();
         let render_enabled = self.framebuffer_rendering_enabled;
-        let mut vis_last = self.get_visible_height();
-        let mut vblank_start = vis_last.saturating_add(1);
+        let mut vis_lines = self.get_visible_height();
+        let mut vblank_start = vis_lines;
         for _ in 0..cycles {
             // Advance any deferred control effects before processing this dot
             self.tick_deferred_ctrl_effects();
@@ -927,9 +927,9 @@ impl Ppu {
                 self.commit_latched_display_regs();
                 self.update_line_render_state();
                 // Visible height depends on display regs (e.g., overscan) latched at line start.
-                vis_last = self.get_visible_height();
-                vblank_start = vis_last.saturating_add(1);
-                if render_enabled && y >= 1 && y <= vis_last {
+                vis_lines = self.get_visible_height();
+                vblank_start = vis_lines;
+                if render_enabled && y < vis_lines {
                     // Prepare window LUTs at line start (OBJ list is prepared during previous HBlank)
                     self.prepare_line_window_luts();
                     self.prepare_line_opt_luts();
@@ -942,9 +942,9 @@ impl Ppu {
             }
 
             // Visible pixel render
-            if !self.v_blank && y >= 1 && y <= vis_last && x >= first_visible && x < first_hblank {
+            if !self.v_blank && y < vis_lines && x >= first_visible && x < first_hblank {
                 let fb_x = (x - first_visible) as usize;
-                let fb_y = (y - 1) as usize;
+                let fb_y = y as usize;
                 if fb_y < 224 && render_enabled {
                     self.render_dot(fb_x, fb_y);
                 }
@@ -988,8 +988,8 @@ impl Ppu {
                 } else {
                     // Prepare next visible scanline sprites during HBlank end
                     let ny = self.scanline;
-                    if ny >= 1 && ny <= vis_last {
-                        let vy = ny - 1;
+                    if ny < vis_lines {
+                        let vy = ny;
                         self.prepare_line_obj_pipeline(vy);
                     }
                 }
@@ -1340,8 +1340,8 @@ impl Ppu {
     // Returns true if we're currently in the active display area (not V/HBlank)
     #[inline]
     fn in_active_display(&self) -> bool {
-        let vis_last = self.get_visible_height();
-        let v_vis = self.scanline >= 1 && self.scanline <= vis_last;
+        let vis_lines = self.get_visible_height();
+        let v_vis = self.scanline < vis_lines;
         let h_vis = self.cycle >= self.first_visible_dot() && self.cycle < self.first_hblank_dot();
         v_vis && h_vis && !self.v_blank && !self.h_blank
     }
@@ -1364,7 +1364,7 @@ impl Ppu {
         if (self.screen_display & 0x80) != 0 {
             return true;
         }
-        let vblank_start = self.get_visible_height().saturating_add(1);
+        let vblank_start = self.get_visible_height();
         self.v_blank || self.scanline >= vblank_start
     }
 
@@ -1377,7 +1377,7 @@ impl Ppu {
         if (self.screen_display & 0x80) != 0 {
             return true;
         }
-        let vblank_start = self.get_visible_height().saturating_add(1);
+        let vblank_start = self.get_visible_height();
         if self.v_blank || self.scanline >= vblank_start {
             // Optional VBlank head/tail sub-windows for MDMA/CPU
             if strict && self.write_ctx != 2 {
@@ -1414,7 +1414,7 @@ impl Ppu {
         if (self.screen_display & 0x80) != 0 {
             return true;
         }
-        let vblank_start = self.get_visible_height().saturating_add(1);
+        let vblank_start = self.get_visible_height();
         if self.v_blank || self.scanline >= vblank_start {
             // Optional: enforce CGRAM MDMA/CPU head/tail guard in VBlank
             if self.write_ctx != 2 {
@@ -1461,7 +1461,7 @@ impl Ppu {
         if (self.screen_display & 0x80) != 0 {
             return true;
         }
-        let vblank_start = self.get_visible_height().saturating_add(1);
+        let vblank_start = self.get_visible_height();
         if self.v_blank || self.scanline >= vblank_start {
             // Optional: enforce OAM gap in VBlank for MDMA/CPU
             if crate::debug_flags::oam_gap_in_vblank()
@@ -1610,7 +1610,7 @@ impl Ppu {
         if (self.screen_display & 0x80) != 0 {
             return true;
         }
-        let vblank_start = self.get_visible_height().saturating_add(1);
+        let vblank_start = self.get_visible_height();
         if self.v_blank || self.scanline >= vblank_start {
             return true;
         }
@@ -1636,7 +1636,7 @@ impl Ppu {
         if (self.screen_display & 0x80) != 0 {
             return true;
         }
-        let vblank_start = self.get_visible_height().saturating_add(1);
+        let vblank_start = self.get_visible_height();
         if self.v_blank || self.scanline >= vblank_start {
             return true;
         }
@@ -5930,7 +5930,7 @@ impl Ppu {
             }
             0x33 => {
                 // SETINI (pseudo hires, EXTBG, interlace)
-                let vblank_start = self.get_visible_height().saturating_add(1);
+                let vblank_start = self.get_visible_height();
                 if crate::debug_flags::strict_ppu_timing() && self.scanline < vblank_start {
                     // Defer any change during visible region (including HBlank) to line start
                     self.latched_setini = Some(value);
@@ -7085,8 +7085,7 @@ impl Ppu {
                     let (c, p) = self.render_bg_4bpp_with_priority(x, y, 1);
                     consider!(c, p, 1);
                 }
-                // NOTE: preserve legacy behavior (no BG3 window mask check here).
-                if (enables & 0x04) != 0 {
+                if (enables & 0x04) != 0 && !self.should_mask_bg(x, 2, true) {
                     let (c, p) = self.render_bg_mode0_with_priority(x, y, 2);
                     consider!(c, p, 2);
                 }
