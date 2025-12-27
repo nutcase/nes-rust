@@ -2073,13 +2073,7 @@ impl Bus {
                             let idx = window % self.sram_size;
                             self.sram[idx]
                         } else {
-                            let rom_addr =
-                                ((bank - 0x40) as usize) * 0x8000 + ((offset - 0x8000) as usize);
-                            if rom_addr < self.rom_size {
-                                self.rom[rom_addr]
-                            } else {
-                                0xFF
-                            }
+                            self.read_rom_lohi(bank, offset)
                         }
                     }
                     crate::cartridge::MapperType::HiRom => {
@@ -2277,12 +2271,13 @@ impl Bus {
     fn read_rom_lohi(&self, bank: u32, offset: u16) -> u8 {
         match self.mapper_type {
             crate::cartridge::MapperType::LoRom => {
-                // LoROM: 32KB banks in upper half
-                let rom_addr = ((bank & 0x3F) as usize) * 0x8000 + ((offset - 0x8000) as usize);
-                if rom_addr < self.rom_size {
-                    self.rom[rom_addr]
-                } else {
+                // LoROM: 32KB banks in upper half. Use 7-bit bank to reach >2MB (e.g., 24/32 Mbit).
+                let rom_bank = (bank & 0x7F) as usize;
+                let rom_addr = rom_bank * 0x8000 + ((offset - 0x8000) as usize);
+                if self.rom_size == 0 {
                     0xFF
+                } else {
+                    self.rom[rom_addr % self.rom_size]
                 }
             }
             crate::cartridge::MapperType::HiRom => {

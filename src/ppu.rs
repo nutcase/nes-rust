@@ -1188,20 +1188,21 @@ impl Ppu {
         }
 
         // Use existing per-pixel composition with color math and windows.
-        let (mut main_color, mut main_layer_id) =
+        let (mut main_color, mut main_layer_id, mut main_obj_math_allowed) =
             self.render_main_screen_pixel_with_layer_cached(x as u16, y as u16);
         let main_transparent = main_color == 0;
         // If main pixel is transparent, treat as backdrop for color math decisions
         if main_color == 0 {
             main_color = self.cgram_to_rgb(0);
             main_layer_id = 5; // Backdrop layer id
+            main_obj_math_allowed = true;
         }
         let hires_out = self.line_hires_out;
         let need_subscreen = self.line_need_subscreen;
-        let (sub_color, sub_layer_id, sub_transparent) = if need_subscreen {
+        let (sub_color, sub_layer_id, sub_transparent, sub_obj_math_allowed) = if need_subscreen {
             self.render_sub_screen_pixel_with_layer_cached(x as u16, y as u16)
         } else {
-            (0, 5, true)
+            (0, 5, true, true)
         };
 
         if let Some(cfg) = trace_sample_dot_config() {
@@ -1253,6 +1254,7 @@ impl Ppu {
                     main_color,
                     sub_color,
                     main_layer_id,
+                    main_obj_math_allowed,
                     x as u16,
                     sub_transparent,
                 )
@@ -1264,6 +1266,7 @@ impl Ppu {
                     sub_color,
                     main_color,
                     sub_layer_id,
+                    sub_obj_math_allowed,
                     x as u16,
                     main_transparent,
                 )
@@ -1278,6 +1281,7 @@ impl Ppu {
                 main_color,
                 sub_color,
                 main_layer_id,
+                main_obj_math_allowed,
                 x as u16,
                 sub_transparent,
             )
@@ -1845,14 +1849,15 @@ impl Ppu {
         // Render all 256 pixels
         for x in 0..256 {
             // メインスクリーンとサブスクリーンを個別に描画（レイヤID付き）
-            let (mut main_color, mut main_layer_id) =
+            let (mut main_color, mut main_layer_id, mut main_obj_math_allowed) =
                 self.render_main_screen_pixel_with_layer(x as u16, y as u16);
             let main_transparent = main_color == 0;
             if main_color == 0 {
                 main_color = self.cgram_to_rgb(0);
                 main_layer_id = 5;
+                main_obj_math_allowed = true;
             }
-            let (sub_color, sub_layer_id, sub_transparent) =
+            let (sub_color, sub_layer_id, sub_transparent, sub_obj_math_allowed) =
                 self.render_sub_screen_pixel_with_layer(x as u16, y as u16);
 
             let final_color = if self.pseudo_hires {
@@ -1862,6 +1867,7 @@ impl Ppu {
                     main_color,
                     sub_color,
                     main_layer_id,
+                    main_obj_math_allowed,
                     x as u16,
                     sub_transparent,
                 );
@@ -1869,6 +1875,7 @@ impl Ppu {
                     sub_color,
                     main_color,
                     sub_layer_id,
+                    sub_obj_math_allowed,
                     x as u16,
                     main_transparent,
                 );
@@ -1879,6 +1886,7 @@ impl Ppu {
                     main_color,
                     sub_color,
                     main_layer_id,
+                    main_obj_math_allowed,
                     x as u16,
                     sub_transparent,
                 )
@@ -2257,15 +2265,21 @@ impl Ppu {
     }
 
     // 共通のスプライトピクセル取得（画面有効フラグを引数で渡す）
-    fn get_sprite_pixel_common(&self, x: u16, y: u16, enabled: bool, is_main: bool) -> (u32, u8) {
+    fn get_sprite_pixel_common(
+        &self,
+        x: u16,
+        y: u16,
+        enabled: bool,
+        is_main: bool,
+    ) -> (u32, u8, bool) {
         if !enabled {
-            return (0, 0);
+            return (0, 0, true);
         }
         if self.line_sprites.is_empty() {
-            return (0, 0);
+            return (0, 0, true);
         }
         if self.should_mask_sprite(x, is_main) {
-            return (0, 0);
+            return (0, 0, true);
         }
         let x_i16 = x as i16;
         let obj_line = self.obj_line_for_scanline(y);
@@ -2304,11 +2318,13 @@ impl Ppu {
                 }
                 let color = self.render_sprite_tile(sprite, tile_x, tile_y, pixel_x, pixel_y);
                 if color != 0 {
-                    return (color, sprite.priority);
+                    // OBJ color math is disabled for palettes 0-3 on real hardware.
+                    let math_allowed = sprite.palette >= 4;
+                    return (color, sprite.priority, math_allowed);
                 }
             }
         }
-        (0, 0)
+        (0, 0, true)
     }
 
     // Helper: Get effective main screen designation for rendering
@@ -2323,7 +2339,8 @@ impl Ppu {
     // メインスクリーン用スプライト
     fn get_sprite_pixel(&self, x: u16, y: u16) -> (u32, u8) {
         let enabled = (self.effective_main_screen_designation() & 0x10) != 0;
-        self.get_sprite_pixel_common(x, y, enabled, true)
+        let (color, pr, _math_allowed) = self.get_sprite_pixel_common(x, y, enabled, true);
+        (color, pr)
     }
 
     #[allow(dead_code)]
@@ -6906,17 +6923,17 @@ impl Ppu {
         enables: u8,
         has_bg: bool,
         has_obj: bool,
-    ) -> (u32, u8) {
+    ) -> (u32, u8, bool) {
         // BGとスプライトの情報を取得
         let (bg_color, bg_priority, bg_id) = if has_bg {
             self.get_main_bg_pixel(x, y, enables)
         } else {
             (0, 0, 0)
         };
-        let (sprite_color, sprite_priority) = if has_obj {
+        let (sprite_color, sprite_priority, sprite_math_allowed) = if has_obj {
             self.get_sprite_pixel_common(x, y, true, true)
         } else {
-            (0, 0)
+            (0, 0, true)
         };
 
         // プライオリティベースの合成（レイヤIDも取得）
@@ -6927,6 +6944,11 @@ impl Ppu {
             sprite_color,
             sprite_priority,
         );
+        let obj_math_allowed = if layer_id == 4 {
+            sprite_math_allowed
+        } else {
+            true
+        };
 
         // NOTE: This function is called per pixel, so keep debug work behind flags.
         if crate::debug_flags::render_verbose() || crate::debug_flags::debug_graphics_detected() {
@@ -6981,11 +7003,11 @@ impl Ppu {
             }
         }
 
-        (final_color, layer_id)
+        (final_color, layer_id, obj_math_allowed)
     }
 
     // メインスクリーン描画（レイヤID付き）
-    fn render_main_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8) {
+    fn render_main_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8, bool) {
         let enables = self.effective_main_screen_designation();
         let has_bg = (enables & 0x0F) != 0;
         let has_obj = (enables & 0x10) != 0;
@@ -6993,7 +7015,7 @@ impl Ppu {
     }
 
     // Render path for active scanlines using cached per-line enables.
-    fn render_main_screen_pixel_with_layer_cached(&mut self, x: u16, y: u16) -> (u32, u8) {
+    fn render_main_screen_pixel_with_layer_cached(&mut self, x: u16, y: u16) -> (u32, u8, bool) {
         self.render_main_screen_pixel_with_layer_internal(
             x,
             y,
@@ -7152,7 +7174,7 @@ impl Ppu {
         let enables = self.sub_screen_designation;
         let has_bg = (enables & 0x0F) != 0;
         let has_obj = (enables & 0x10) != 0;
-        let (color, _lid, _transparent) =
+        let (color, _lid, _transparent, _obj_math_allowed) =
             self.render_sub_screen_pixel_with_layer_internal(x, y, has_bg, has_obj);
         color
     }
@@ -7168,17 +7190,18 @@ impl Ppu {
         y: u16,
         has_bg: bool,
         has_obj: bool,
-    ) -> (u32, u8, bool) {
+    ) -> (u32, u8, bool, bool) {
         if !has_bg && !has_obj {
             // No sub-screen layers enabled -> fixed color backdrop.
-            return (self.fixed_color_to_rgb(), 5, true);
+            return (self.fixed_color_to_rgb(), 5, true, true);
         }
         let (bg_color, bg_priority, bg_id) = if has_bg {
             self.get_sub_bg_pixel(x, y)
         } else {
             (0, 0, 0)
         };
-        let (sprite_color, sprite_priority) = self.get_sprite_pixel_common(x, y, has_obj, false);
+        let (sprite_color, sprite_priority, sprite_math_allowed) =
+            self.get_sprite_pixel_common(x, y, has_obj, false);
         let (final_color, layer_id) = self.composite_pixel_with_layer(
             bg_color,
             bg_priority,
@@ -7186,22 +7209,31 @@ impl Ppu {
             sprite_color,
             sprite_priority,
         );
+        let obj_math_allowed = if layer_id == 4 {
+            sprite_math_allowed
+        } else {
+            true
+        };
         if final_color != 0 {
-            (final_color, layer_id, false)
+            (final_color, layer_id, false, obj_math_allowed)
         } else {
             // Sub-screen backdrop is the fixed color ($2132), not CGRAM[0].
-            (self.fixed_color_to_rgb(), 5, true)
+            (self.fixed_color_to_rgb(), 5, true, true)
         }
     }
 
-    fn render_sub_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8, bool) {
+    fn render_sub_screen_pixel_with_layer(&mut self, x: u16, y: u16) -> (u32, u8, bool, bool) {
         let enables = self.sub_screen_designation;
         let has_bg = (enables & 0x0F) != 0;
         let has_obj = (enables & 0x10) != 0;
         self.render_sub_screen_pixel_with_layer_internal(x, y, has_bg, has_obj)
     }
 
-    fn render_sub_screen_pixel_with_layer_cached(&mut self, x: u16, y: u16) -> (u32, u8, bool) {
+    fn render_sub_screen_pixel_with_layer_cached(
+        &mut self,
+        x: u16,
+        y: u16,
+    ) -> (u32, u8, bool, bool) {
         self.render_sub_screen_pixel_with_layer_internal(
             x,
             y,
@@ -7346,7 +7378,8 @@ impl Ppu {
     #[allow(dead_code)]
     fn get_sub_sprite_pixel(&self, x: u16, y: u16) -> (u32, u8) {
         let enabled = (self.sub_screen_designation & 0x10) != 0;
-        self.get_sprite_pixel_common(x, y, enabled, false)
+        let (color, pr, _math_allowed) = self.get_sprite_pixel_common(x, y, enabled, false);
+        (color, pr)
     }
 
     // メイン・サブスクリーン間のカラー演算（対象レイヤ限定の簡易版）
@@ -7355,6 +7388,7 @@ impl Ppu {
         main_color_in: u32,
         sub_color_in: u32,
         main_layer_id: u8,
+        main_obj_math_allowed: bool,
         x: u16,
         sub_transparent: bool,
     ) -> u32 {
@@ -7430,6 +7464,11 @@ impl Ppu {
         } else {
             self.fixed_color_to_rgb()
         };
+
+        // OBJ color math is disabled for palettes 0-3 on real hardware.
+        if main_layer_id == 4 && !main_obj_math_allowed {
+            return main_color;
+        }
 
         // このメインレイヤにカラー演算が許可されているか
         if !self.is_color_math_enabled(main_layer_id) {
