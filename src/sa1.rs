@@ -279,8 +279,8 @@ impl Sa1 {
 
     #[inline]
     fn ccdma_enabled(&self) -> bool {
-        // CC mode (M bit) and enable (C bit)
-        (self.registers.dma_control & 0xA0) == 0xA0
+        // CC mode (M bit). Some titles program CC-DMA without setting C.
+        (self.registers.dma_control & 0x20) != 0
     }
 
     #[inline]
@@ -808,12 +808,10 @@ impl Sa1 {
                 self.registers.brf[idx] = value;
                 self.registers.brf_pos = idx + 1;
                 // When 16 bytes are written in type2 mode, mark buffer ready
-                if self.ccdma_type() == Some(2)
-                    && self.ccdma_enabled()
-                    && self.registers.brf_pos == 16
-                {
+                if self.ccdma_enabled() && self.registers.brf_pos == 16 {
                     self.registers.ccdma_pending = true;
                     self.registers.ccdma_buffer_ready = true;
+                    self.registers.handshake_state = 1;
                 }
                 if std::env::var_os("TRACE_SA1_REG").is_some() {
                     println!("SA1 BRF W ${:04X} = {:02X}", 0x2240 + idx as u16, value);
@@ -992,6 +990,24 @@ impl Sa1 {
                         }
                     }
                 }
+                // CC-DMA can be triggered even if C bit is not set.
+                if !dest_is_bwram
+                    && self.ccdma_enabled()
+                    && !self.registers.ccdma_pending
+                    && (self.registers.dma_control & 0x80) == 0
+                {
+                    self.registers.ccdma_pending = true;
+                    self.registers.handshake_state = 1;
+                    if crate::debug_flags::trace_sa1_dma() {
+                        println!(
+                            "SA1_DMA: start CC-DMA (dest IRAM, C=0) dcnt=0x{:02X} src=0x{:06X} dest=0x{:06X} len=0x{:04X}",
+                            self.registers.dma_control,
+                            self.registers.dma_source,
+                            self.registers.dma_dest,
+                            self.registers.dma_length
+                        );
+                    }
+                }
             }
             0x37 => {
                 self.registers.dma_dest =
@@ -1024,6 +1040,24 @@ impl Sa1 {
                                 self.registers.dma_length
                             );
                         }
+                    }
+                }
+                // CC-DMA can be triggered even if C bit is not set.
+                if dest_is_bwram
+                    && self.ccdma_enabled()
+                    && !self.registers.ccdma_pending
+                    && (self.registers.dma_control & 0x80) == 0
+                {
+                    self.registers.ccdma_pending = true;
+                    self.registers.handshake_state = 1;
+                    if crate::debug_flags::trace_sa1_dma() {
+                        println!(
+                            "SA1_DMA: start CC-DMA (dest BWRAM, C=0) dcnt=0x{:02X} src=0x{:06X} dest=0x{:06X} len=0x{:04X}",
+                            self.registers.dma_control,
+                            self.registers.dma_source,
+                            self.registers.dma_dest,
+                            self.registers.dma_length
+                        );
                     }
                 }
             }

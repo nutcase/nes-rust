@@ -94,7 +94,11 @@ impl Cartridge {
         // - rom_type: +0x26
         let _map_mode = rom[header_offset + 0x25];
         let rom_type = rom[header_offset + 0x26];
-        let mapper_type = Self::determine_mapper_type(rom_type, detected_mapper);
+        let mapper_type = if title.trim_start().starts_with("DRAGONQUEST3") {
+            MapperType::DragonQuest3
+        } else {
+            Self::determine_mapper_type(rom_type, detected_mapper)
+        };
 
         // Enhanced mapper validation
         Self::validate_mapper_compatibility(rom_type, &mapper_type)?;

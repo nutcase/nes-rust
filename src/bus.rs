@@ -917,7 +917,11 @@ impl Bus {
         let dest = self.sa1.registers.dma_dest;
         let len = self.sa1.registers.dma_length as usize;
 
-        let typ = self.sa1.ccdma_type().unwrap_or(0);
+        let typ = if self.sa1.registers.ccdma_buffer_ready && self.sa1.registers.brf_pos >= 16 {
+            2
+        } else {
+            self.sa1.ccdma_type().unwrap_or(0)
+        };
         if len == 0 {
             // For CC-DMA type2 allow zero-length as a single tile write
             if typ != 2 {
