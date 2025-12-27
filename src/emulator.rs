@@ -3170,27 +3170,60 @@ impl Emulator {
         if self.headless {
             return;
         }
-        if self
-            .window
-            .as_ref()
-            .map(|w| w.is_key_pressed(Key::F5, minifb::KeyRepeat::No))
-            .unwrap_or(false)
-        {
+        let (f5_pressed, f9_pressed, shift_down, slot) = {
+            let Some(w) = self.window.as_ref() else { return };
+            let f5_pressed = w.is_key_pressed(Key::F5, minifb::KeyRepeat::No);
+            let f9_pressed = w.is_key_pressed(Key::F9, minifb::KeyRepeat::No);
+            let shift_down = w.is_key_down(Key::LeftShift) || w.is_key_down(Key::RightShift);
+            let slot = if w.is_key_pressed(Key::Key1, minifb::KeyRepeat::No) {
+                Some(1)
+            } else if w.is_key_pressed(Key::Key2, minifb::KeyRepeat::No) {
+                Some(2)
+            } else if w.is_key_pressed(Key::Key3, minifb::KeyRepeat::No) {
+                Some(3)
+            } else if w.is_key_pressed(Key::Key4, minifb::KeyRepeat::No) {
+                Some(4)
+            } else if w.is_key_pressed(Key::Key5, minifb::KeyRepeat::No) {
+                Some(5)
+            } else if w.is_key_pressed(Key::Key6, minifb::KeyRepeat::No) {
+                Some(6)
+            } else if w.is_key_pressed(Key::Key7, minifb::KeyRepeat::No) {
+                Some(7)
+            } else if w.is_key_pressed(Key::Key8, minifb::KeyRepeat::No) {
+                Some(8)
+            } else if w.is_key_pressed(Key::Key9, minifb::KeyRepeat::No) {
+                Some(9)
+            } else {
+                None
+            };
+            (f5_pressed, f9_pressed, shift_down, slot)
+        };
+
+        if f5_pressed {
             match self.quick_save() {
                 Ok(_) => println!("Quick save completed successfully"),
                 Err(e) => println!("Failed to save: {}", e),
             }
         }
 
-        if self
-            .window
-            .as_ref()
-            .map(|w| w.is_key_pressed(Key::F9, minifb::KeyRepeat::No))
-            .unwrap_or(false)
-        {
+        if f9_pressed {
             match self.quick_load() {
                 Ok(_) => println!("Quick load completed successfully"),
                 Err(e) => println!("Failed to load: {}", e),
+            }
+        }
+
+        if let Some(slot) = slot {
+            if shift_down {
+                match self.save_to_slot(slot) {
+                    Ok(_) => println!("Save state {} completed successfully", slot),
+                    Err(e) => println!("Failed to save slot {}: {}", slot, e),
+                }
+            } else {
+                match self.load_from_slot(slot) {
+                    Ok(_) => println!("Load state {} completed successfully", slot),
+                    Err(e) => println!("Failed to load slot {}: {}", slot, e),
+                }
             }
         }
     }
