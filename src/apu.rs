@@ -28,6 +28,8 @@ pub struct Apu {
     // Reusable audio scratch buffers to avoid per-frame allocations.
     audio_left: Vec<i16>,
     audio_right: Vec<i16>,
+    // Last sample emitted (for gentle underflow fill).
+    last_audio_sample: (i16, i16),
     // Fractional SPC700 cycles accumulator (scaled from S-CPU cycles).
     cycle_accum: f64,
     cycle_scale: f64,
@@ -132,6 +134,7 @@ impl Apu {
             sample_rate: 32000,
             audio_left: Vec::new(),
             audio_right: Vec::new(),
+            last_audio_sample: (0, 0),
             cycle_accum: 0.0,
             cycle_scale,
             total_smp_cycles: 0,
@@ -198,6 +201,7 @@ impl Apu {
         self.inner.reset();
         self.audio_left.clear();
         self.audio_right.clear();
+        self.last_audio_sample = (0, 0);
         self.fast_upload = std::env::var("APU_FAST_UPLOAD")
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(false);
@@ -716,6 +720,7 @@ impl Apu {
             for s in samples.iter_mut() {
                 *s = (0, 0);
             }
+            self.last_audio_sample = (0, 0);
             return;
         };
 
@@ -723,9 +728,10 @@ impl Apu {
 
         let avail = dsp.output_buffer.get_sample_count().max(0);
         let to_read = need.min(avail);
+        let to_read_usize = to_read as usize;
 
         if to_read > 0 {
-            let read_len = to_read as usize;
+            let read_len = to_read_usize;
             if self.audio_left.len() < read_len {
                 self.audio_left.resize(read_len, 0);
                 self.audio_right.resize(read_len, 0);
@@ -736,11 +742,13 @@ impl Apu {
             for i in 0..read_len {
                 samples[i] = (left[i], right[i]);
             }
+            self.last_audio_sample = samples[read_len - 1];
         }
 
         // 足りない分は無音で埋める（リングバッファのアンダーラン対策）
-        for s in samples.iter_mut().skip(to_read as usize) {
-            *s = (0, 0);
+        let fill = self.last_audio_sample;
+        for s in samples.iter_mut().skip(to_read_usize) {
+            *s = fill;
         }
     }
 

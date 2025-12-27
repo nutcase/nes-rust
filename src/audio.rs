@@ -60,6 +60,7 @@ pub struct SnesAudioSource {
     sample_rate: u32,
     channels: u16,
     current_frame: Vec<(i16, i16)>,
+    last_sample: (i16, i16),
     // Interleaved sample cursor (L,R,L,R...) within current_frame.
     // current_frame holds stereo frames; cursor counts i16 samples.
     sample_cursor: usize,
@@ -75,6 +76,7 @@ impl SnesAudioSource {
             sample_rate,
             channels,
             current_frame: Vec::with_capacity(chunk_frames),
+            last_sample: (0, 0),
             sample_cursor: 0,
             chunk_frames: chunk_frames.max(1),
         }
@@ -86,8 +88,12 @@ impl SnesAudioSource {
             got = ring.pop_into(&mut self.current_frame, self.chunk_frames);
         }
 
+        if got > 0 {
+            self.last_sample = self.current_frame[got - 1];
+        }
         if got < self.chunk_frames {
-            self.current_frame.resize(self.chunk_frames, (0, 0));
+            self.current_frame
+                .resize(self.chunk_frames, self.last_sample);
         }
         self.sample_cursor = 0;
     }
@@ -102,15 +108,24 @@ impl Iterator for SnesAudioSource {
             self.generate_audio_frame();
         }
 
+        let is_right_channel = self.sample_cursor % 2 == 1;
+
         if self.current_frame.is_empty() {
-            return Some(0);
+            return Some(if is_right_channel {
+                self.last_sample.1
+            } else {
+                self.last_sample.0
+            });
         }
 
         let sample_index = self.sample_cursor / 2;
-        let is_right_channel = self.sample_cursor % 2 == 1;
 
         if sample_index >= self.current_frame.len() {
-            return Some(0);
+            return Some(if is_right_channel {
+                self.last_sample.1
+            } else {
+                self.last_sample.0
+            });
         }
 
         let sample = if is_right_channel {
@@ -151,7 +166,7 @@ pub struct AudioSystem {
     enabled: bool,
     volume: f32,
     sample_rate: u32,
-    frame_sample_rem_acc: u32,
+    frame_sample_rem_acc: u64,
     frame_scratch: Vec<(i16, i16)>,
     buffer_frames: usize,
     chunk_frames: usize,
@@ -283,18 +298,16 @@ impl AudioSystem {
         if !self.enabled {
             return;
         }
-        let sample_rate = apu.get_sample_rate();
-        const FPS: u32 = 60;
-        let base = (sample_rate / FPS) as usize;
-        let rem = sample_rate % FPS;
-        self.frame_sample_rem_acc = self.frame_sample_rem_acc.saturating_add(rem);
-        let extra = if self.frame_sample_rem_acc >= FPS {
-            self.frame_sample_rem_acc -= FPS;
-            1
-        } else {
-            0
-        };
-        let frame_size = base + extra;
+        let sample_rate_u32 = apu.get_sample_rate();
+        let sample_rate = sample_rate_u32 as u64;
+        // Match emulator timing (NTSC 341*262 dots, 4 master cycles per dot).
+        const MASTER_CLOCK_NTSC: u64 = 21_477_272;
+        const CYCLES_PER_FRAME: u64 = 341 * 262 * 4;
+        let numerator = sample_rate
+            .saturating_mul(CYCLES_PER_FRAME)
+            .saturating_add(self.frame_sample_rem_acc);
+        let frame_size = (numerator / MASTER_CLOCK_NTSC) as usize;
+        self.frame_sample_rem_acc = numerator % MASTER_CLOCK_NTSC;
         if frame_size == 0 {
             return;
         }
@@ -313,7 +326,7 @@ impl AudioSystem {
         if let Ok(mut ring) = self.ring.lock() {
             ring.push_samples(scratch);
         }
-        self.sample_rate = sample_rate;
+        self.sample_rate = sample_rate_u32;
     }
 
     fn restart_audio(&mut self) {
