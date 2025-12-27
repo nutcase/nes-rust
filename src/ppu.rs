@@ -2,6 +2,7 @@
 // Logging controls (runtime via env — see debug_flags)
 const IMPORTANT_WRITE_LIMIT: u32 = 10; // How many important writes to print
 use std::sync::OnceLock;
+use wide::u32x8;
 
 #[derive(Clone, Copy)]
 struct TraceScanlineStateConfig {
@@ -245,6 +246,10 @@ pub struct Ppu {
     // Render (back) buffers for the current in-progress frame.
     render_framebuffer: Vec<u32>,
     render_subscreen_buffer: Vec<u32>,
+    brightness_simd_buf: [u32; 8],
+    brightness_simd_len: u8,
+    brightness_simd_start: usize,
+    brightness_simd_factor: u8,
     // Headless高速化用: PPUのピクセル合成（フレームバッファ書き込み）を無効化できる。
     // 画面出力が不要なフレームをスキップし、最終フレームだけ描画する用途を想定。
     framebuffer_rendering_enabled: bool,
@@ -807,6 +812,10 @@ impl Ppu {
             subscreen_buffer: vec![0; 256 * 224],
             render_framebuffer: vec![0; 256 * 224],
             render_subscreen_buffer: vec![0; 256 * 224],
+            brightness_simd_buf: [0; 8],
+            brightness_simd_len: 0,
+            brightness_simd_start: 0,
+            brightness_simd_factor: 15,
             framebuffer_rendering_enabled: true,
             line_main_enables: 0,
             line_sub_enables: 0,
@@ -1133,6 +1142,10 @@ impl Ppu {
     // Render one pixel at the current (x,y)
     fn render_dot(&mut self, x: usize, y: usize) {
         if x == 0 {
+            // Ensure any pending brightness batch from the previous line is flushed.
+            self.flush_brightness_simd();
+        }
+        if x == 0 {
             if let Some(cfg) = trace_scanline_state_config() {
                 let y_u16 = y as u16;
                 if self.frame >= cfg.frame_min
@@ -1241,6 +1254,7 @@ impl Ppu {
             && !self.force_display_active()
             && !self.force_no_blank
         {
+            self.flush_brightness_simd();
             let pixel_offset = y * 256 + x;
             if pixel_offset < self.render_framebuffer.len() {
                 self.render_framebuffer[pixel_offset] = 0xFF000000;
@@ -1352,12 +1366,51 @@ impl Ppu {
         };
 
         let pixel_offset = y * 256 + x;
-        let final_brightness_color = self.apply_brightness(final_color);
+        let brightness_factor = if self.force_display_active() {
+            15
+        } else {
+            self.brightness & 0x0F
+        };
         if pixel_offset < self.render_framebuffer.len() {
-            self.render_framebuffer[pixel_offset] = final_brightness_color;
+            if brightness_factor >= 15 {
+                if self.brightness_simd_len > 0 {
+                    self.flush_brightness_simd();
+                }
+                self.render_framebuffer[pixel_offset] =
+                    (final_color & 0x00FF_FFFF) | 0xFF000000;
+            } else {
+                let expected_next =
+                    self.brightness_simd_start + self.brightness_simd_len as usize;
+                if self.brightness_simd_len == 0 {
+                    self.brightness_simd_start = pixel_offset;
+                    self.brightness_simd_factor = brightness_factor;
+                } else if self.brightness_simd_factor != brightness_factor
+                    || expected_next != pixel_offset
+                {
+                    self.flush_brightness_simd();
+                    self.brightness_simd_start = pixel_offset;
+                    self.brightness_simd_factor = brightness_factor;
+                }
+                if (self.brightness_simd_len as usize) < self.brightness_simd_buf.len() {
+                    self.brightness_simd_buf[self.brightness_simd_len as usize] = final_color;
+                    self.brightness_simd_len += 1;
+                    if self.brightness_simd_len as usize == self.brightness_simd_buf.len() {
+                        self.flush_brightness_simd();
+                    }
+                } else {
+                    self.flush_brightness_simd();
+                    self.brightness_simd_start = pixel_offset;
+                    self.brightness_simd_factor = brightness_factor;
+                    self.brightness_simd_buf[0] = final_color;
+                    self.brightness_simd_len = 1;
+                }
+            }
         }
         if need_subscreen && pixel_offset < self.render_subscreen_buffer.len() {
             self.render_subscreen_buffer[pixel_offset] = sub_color;
+        }
+        if x == 255 {
+            self.flush_brightness_simd();
         }
     }
 
@@ -3763,6 +3816,65 @@ impl Ppu {
         let g = ((((color >> 8) & 0xFF) * factor / 15) & 0xFF) << 8;
         let b = ((color & 0xFF) * factor / 15) & 0xFF;
         0xFF000000 | r | g | b
+    }
+
+    #[inline]
+    fn apply_brightness_with_factor(color: u32, factor: u8) -> u32 {
+        let factor = (factor as u32).min(15);
+        if factor >= 15 {
+            return (color & 0x00FF_FFFF) | 0xFF000000;
+        }
+        let r = ((((color >> 16) & 0xFF) * factor / 15) & 0xFF) << 16;
+        let g = ((((color >> 8) & 0xFF) * factor / 15) & 0xFF) << 8;
+        let b = ((color & 0xFF) * factor / 15) & 0xFF;
+        0xFF000000 | r | g | b
+    }
+
+    #[inline]
+    fn apply_brightness_simd_block(colors: [u32; 8], factor: u8) -> [u32; 8] {
+        let factor = (factor as u32).min(15);
+        if factor >= 15 {
+            return colors.map(|c| (c & 0x00FF_FFFF) | 0xFF000000);
+        }
+        let v = u32x8::from(colors);
+        let mask = u32x8::splat(0xFF);
+        let r = (v >> u32x8::splat(16)) & mask;
+        let g = (v >> u32x8::splat(8)) & mask;
+        let b = v & mask;
+        let f = u32x8::splat(factor);
+        let recip = u32x8::splat(0x8889); // exact for 0..3825 when >> 19
+        let shift = u32x8::splat(19);
+        let r = ((r * f) * recip) >> shift;
+        let g = ((g * f) * recip) >> shift;
+        let b = ((b * f) * recip) >> shift;
+        let out = u32x8::splat(0xFF000000)
+            | (r * u32x8::splat(1 << 16))
+            | (g * u32x8::splat(1 << 8))
+            | b;
+        out.into()
+    }
+
+    #[inline]
+    fn flush_brightness_simd(&mut self) {
+        let len = self.brightness_simd_len as usize;
+        if len == 0 {
+            return;
+        }
+        let start = self.brightness_simd_start;
+        let factor = self.brightness_simd_factor;
+        if start + len <= self.render_framebuffer.len() {
+            if len == self.brightness_simd_buf.len() {
+                let out = Self::apply_brightness_simd_block(self.brightness_simd_buf, factor);
+                self.render_framebuffer[start..start + len].copy_from_slice(&out);
+            } else {
+                for i in 0..len {
+                    let color = self.brightness_simd_buf[i];
+                    self.render_framebuffer[start + i] =
+                        Self::apply_brightness_with_factor(color, factor);
+                }
+            }
+        }
+        self.brightness_simd_len = 0;
     }
 
     #[inline]
