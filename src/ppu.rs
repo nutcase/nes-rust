@@ -11,6 +11,39 @@ struct TraceScanlineStateConfig {
     y_max: u16,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WindowLutConfig {
+    window1_left: u8,
+    window1_right: u8,
+    window2_left: u8,
+    window2_right: u8,
+    window_bg_mask: [u8; 4],
+    bg_window_logic: [u8; 4],
+    window_obj_mask: u8,
+    obj_window_logic: u8,
+    window_color_mask: u8,
+    color_window_logic: u8,
+    tmw_mask: u8,
+    tsw_mask: u8,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BgMapCache {
+    valid: bool,
+    tile_x: u16,
+    tile_y: u16,
+    map_entry: u16,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BgRowCache {
+    valid: bool,
+    tile_addr: u16,
+    rel_y: u8,
+    bpp: u8,
+    row: [u8; 8],
+}
+
 fn trace_scanline_state_config() -> Option<TraceScanlineStateConfig> {
     static CFG: OnceLock<Option<TraceScanlineStateConfig>> = OnceLock::new();
     CFG.get_or_init(|| {
@@ -239,6 +272,7 @@ pub struct Ppu {
     // SETINI bits
     overscan: bool,
     obj_interlace: bool,
+    force_no_blank: bool,
 
     pub nmi_enabled: bool,
     pub nmi_flag: bool,
@@ -276,6 +310,13 @@ pub struct Ppu {
     oam_writes_total: u64,
     // OAMDATA write latch (low table uses 16-bit word staging)
     oam_write_latch: u8,
+    oam_dirty: bool,
+    sprite_cached_y: [u8; 128],
+    sprite_cached_x_raw: [u16; 128],
+    sprite_cached_x_signed: [i16; 128],
+    sprite_cached_tile: [u16; 128],
+    sprite_cached_attr: [u8; 128],
+    sprite_cached_size_large: [bool; 128],
     // $2103 bit7: priority rotation enable
     oam_priority_rotation_enabled: bool,
     // OBJ timing metrics per frame
@@ -298,11 +339,17 @@ pub struct Ppu {
 
     // --- Dot-level window/color-math gating (per visible scanline) ---
     line_window_prepared: bool,
+    line_window_cfg: Option<WindowLutConfig>,
     color_window_lut: [u8; 256], // 1: inside color window per $2125(COL)
     main_bg_window_lut: [[u8; 256]; 4], // 1: BG masked on main at x
     sub_bg_window_lut: [[u8; 256]; 4], // 1: BG masked on sub at x
     main_obj_window_lut: [u8; 256], // 1: OBJ masked on main at x
     sub_obj_window_lut: [u8; 256], // 1: OBJ masked on sub at x
+
+    // --- BG tile row cache (per BG) ---
+    bg_cache_dirty: bool,
+    bg_map_cache: [BgMapCache; 4],
+    bg_row_cache: [BgRowCache; 4],
 
     // --- Mode 2 offset-per-tile (BG3 OPT) cached per visible scanline ---
     // Index is tile-column on screen (0..32). Column 0 is never affected by OPT.
@@ -780,6 +827,7 @@ impl Ppu {
             interlace_field: false,
             overscan: false,
             obj_interlace: false,
+            force_no_blank: crate::debug_flags::force_no_blank(),
 
             nmi_enabled: false,
             // 実機ではリセット直後に RDNMI フラグ(bit7)が1の状態から始まるため、初期値をtrueにしておく。
@@ -811,6 +859,13 @@ impl Ppu {
             cgram_writes_total: 0,
             oam_writes_total: 0,
             oam_write_latch: 0,
+            oam_dirty: true,
+            sprite_cached_y: [0; 128],
+            sprite_cached_x_raw: [0; 128],
+            sprite_cached_x_signed: [0; 128],
+            sprite_cached_tile: [0; 128],
+            sprite_cached_attr: [0; 128],
+            sprite_cached_size_large: [false; 128],
             oam_priority_rotation_enabled: false,
             obj_overflow_lines: 0,
             obj_time_over_lines: 0,
@@ -822,11 +877,15 @@ impl Ppu {
             sprite_draw_disabled: false,
             sprite_timeover_first_idx: 0,
             line_window_prepared: false,
+            line_window_cfg: None,
             color_window_lut: [0; 256],
             main_bg_window_lut: [[0; 256]; 4],
             sub_bg_window_lut: [[0; 256]; 4],
             main_obj_window_lut: [0; 256],
             sub_obj_window_lut: [0; 256],
+            bg_cache_dirty: true,
+            bg_map_cache: [BgMapCache::default(); 4],
+            bg_row_cache: [BgRowCache::default(); 4],
             mode2_opt_hscroll_lut: [[0; 33]; 2],
             mode2_opt_vscroll_lut: [[0; 33]; 2],
             oam_internal_addr: 0,
@@ -933,6 +992,11 @@ impl Ppu {
                     // Prepare window LUTs at line start (OBJ list is prepared during previous HBlank)
                     self.prepare_line_window_luts();
                     self.prepare_line_opt_luts();
+                    if self.line_sprites.is_empty() {
+                        // Skip sprite evaluation if no sprites are present on this scanline.
+                        self.line_main_has_obj = false;
+                        self.line_sub_has_obj = false;
+                    }
                 }
             }
 
@@ -1175,7 +1239,7 @@ impl Ppu {
         // Fast path: forced blank yields black without per-pixel composition.
         if (self.screen_display & 0x80) != 0
             && !self.force_display_active()
-            && std::env::var_os("FORCE_NO_BLANK").is_none()
+            && !self.force_no_blank
         {
             let pixel_offset = y * 256 + x;
             if pixel_offset < self.render_framebuffer.len() {
@@ -2560,7 +2624,7 @@ impl Ppu {
     }
 
     #[allow(dead_code)]
-    fn get_bg_pixel(&self, x: u16, y: u16) -> (u32, u8) {
+    fn get_bg_pixel(&mut self, x: u16, y: u16) -> (u32, u8) {
         // Debug background layer enable status
         static mut BG_PIXEL_DEBUG: bool = false;
         unsafe {
@@ -2811,30 +2875,31 @@ impl Ppu {
             .unwrap_or((0, 0))
     }
 
-    fn render_bg_mode0_with_priority(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_mode0_with_priority(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         self.render_bg_mode0(x, y, bg_num)
     }
 
-    fn render_bg_4bpp_with_priority(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_4bpp_with_priority(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         self.render_bg_4bpp(x, y, bg_num)
     }
 
-    fn render_bg_8bpp_with_priority(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_8bpp_with_priority(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         self.render_bg_8bpp(x, y, bg_num)
     }
 
-    fn render_bg_mode2_with_priority(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_mode2_with_priority(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         self.render_bg_mode2(x, y, bg_num)
     }
 
-    fn render_bg_mode5_with_priority(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_mode5_with_priority(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         self.render_bg_mode5(x, y, bg_num, true)
     }
 
-    fn render_bg_mode6_with_priority(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_mode6_with_priority(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         self.render_bg_mode6(x, y, bg_num, true)
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn sample_tile_2bpp(&self, tile_base: u16, tile_id: u16, px: u8, py: u8) -> u8 {
         // 2bpp tile = 8 words (16 bytes)
@@ -2851,6 +2916,7 @@ impl Ppu {
         (((plane1 >> bit) & 1) << 1) | ((plane0 >> bit) & 1)
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn sample_tile_4bpp(&self, tile_base: u16, tile_id: u16, px: u8, py: u8) -> u8 {
         // 4bpp tile = 16 words (32 bytes)
@@ -2875,7 +2941,7 @@ impl Ppu {
             | ((plane0 >> bit) & 1)
     }
 
-    fn render_bg_mode0(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_mode0(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         // Debug: Check if tilemap base addresses are set
         static mut BG_DEBUG_COUNT: u32 = 0;
         unsafe {
@@ -2935,61 +3001,7 @@ impl Ppu {
 
         // Debug output disabled for performance
 
-        let tilemap_base = match bg_num {
-            0 => self.bg1_tilemap_base,
-            1 => self.bg2_tilemap_base,
-            2 => self.bg3_tilemap_base,
-            3 => self.bg4_tilemap_base,
-            _ => 0,
-        } as u32;
-        // Tilemap base is in words
-        let tilemap_base_word = tilemap_base;
-        let (map_tx, map_ty) = (tile_x % 32, tile_y % 32);
-        let scx = (tile_x / 32) as u32;
-        let scy = (tile_y / 32) as u32;
-        let width_screens = if ss == 1 || ss == 3 { 2 } else { 1 } as u32;
-        let quadrant = scx + scy * width_screens;
-        // Calculate word address first, then convert to byte index
-        let map_entry_word_addr = tilemap_base_word
-            .saturating_add(quadrant * 0x400) // 32x32 tilemap = 1024 words
-            .saturating_add((map_ty as u32) * 32 + map_tx as u32)
-            & 0x7FFF; // VRAM mirrors at 0x8000 words
-        let map_entry_addr = (map_entry_word_addr * 2) as usize; // Convert to byte index for VRAM access
-
-        // Debug address calculation and VRAM content
-        static mut ADDR_DEBUG_COUNT: u32 = 0;
-        unsafe {
-            if ADDR_DEBUG_COUNT < 5
-                && map_entry_addr >= 0xE000
-                && crate::debug_flags::boot_verbose()
-            {
-                ADDR_DEBUG_COUNT += 1;
-                println!("📍 VRAM ACCESS[{}]: BG{} tilemap_base=0x{:04X}, final_addr=0x{:04X}, VRAM_len=0x{:04X}",
-                        ADDR_DEBUG_COUNT, bg_num, tilemap_base, map_entry_addr, self.vram.len());
-
-                // Show first few bytes of VRAM at this address (for debugging)
-                let start_addr = if self.vram.len() >= 0x10000 {
-                    map_entry_addr as usize
-                } else {
-                    (map_entry_addr & 0x7FFF) as usize
-                };
-
-                if start_addr + 15 < self.vram.len() {
-                    print!("   VRAM[0x{:04X}]: ", start_addr);
-                    for i in 0..16 {
-                        print!("{:02X} ", self.vram[start_addr + i]);
-                    }
-                    println!();
-                }
-            }
-        }
-
-        if map_entry_addr + 1 >= self.vram.len() {
-            return (0, 0);
-        }
-        let map_entry_lo = self.vram[map_entry_addr];
-        let map_entry_hi = self.vram[map_entry_addr + 1];
-        let map_entry = ((map_entry_hi as u16) << 8) | (map_entry_lo as u16);
+        let map_entry = self.get_bg_map_entry_cached(bg_num, tile_x, tile_y);
 
         // Debug and validate tilemap entries
         static mut TILEMAP_FOUND_COUNT: u32 = 0;
@@ -2997,22 +3009,31 @@ impl Ppu {
         unsafe {
             if map_entry != 0 {
                 let tile_id_raw = map_entry & 0x03FF;
-                let _palette_raw = (map_entry >> 10) & 0x07;
-
-                // Do not replace tilemap entries; render exactly what is in VRAM.
-
                 if TILEMAP_FOUND_COUNT < 20 && crate::debug_flags::boot_verbose() {
                     TILEMAP_FOUND_COUNT += 1;
-                    println!("🗺️  TILEMAP[{}]: BG{} screen({},{}) bg({},{}) tile({},{}) map({},{}) quad={} base=0x{:04X} word_addr=0x{:04X} byte_addr=0x{:04X} entry=0x{:04X} tile_id={}",
-                            TILEMAP_FOUND_COUNT, bg_num, x, y, bg_x, bg_y_tile, tile_x, tile_y, map_tx, map_ty, quadrant, tilemap_base, map_entry_word_addr, map_entry_addr, map_entry, tile_id_raw);
+                    println!(
+                        "🗺️  TILEMAP[{}]: BG{} screen({},{}) bg({},{}) tile({},{}) entry=0x{:04X} tile_id={}",
+                        TILEMAP_FOUND_COUNT,
+                        bg_num,
+                        x,
+                        y,
+                        bg_x,
+                        bg_y_tile,
+                        tile_x,
+                        tile_y,
+                        map_entry,
+                        tile_id_raw
+                    );
                 }
             } else if TILEMAP_FOUND_COUNT == 0
                 && INVALID_TILEMAP_COUNT < 5
                 && crate::debug_flags::boot_verbose()
             {
                 INVALID_TILEMAP_COUNT += 1;
-                println!("⚠️  EMPTY TILEMAP[{}]: BG{} at ({},{}) addr=0x{:04X} entry=0x{:04X} tilemap_base=0x{:04X}",
-                        INVALID_TILEMAP_COUNT, bg_num, x, y, map_entry_addr, map_entry, tilemap_base);
+                println!(
+                    "⚠️  EMPTY TILEMAP[{}]: BG{} at ({},{}) entry=0x{:04X}",
+                    INVALID_TILEMAP_COUNT, bg_num, x, y, map_entry
+                );
             }
         }
 
@@ -3052,9 +3073,6 @@ impl Ppu {
         // 2bpp tile = 16 bytes = 8 words
         let tile_addr = tile_base.wrapping_add(tile_id.wrapping_mul(8)) & 0x7FFF;
 
-        // Fix VRAM addressing: Handle high address ranges correctly
-        // VRAM is 64KB but may be mirrored/banked, don't reject high addresses immediately
-
         // Debug problematic tile addresses
         static mut BAD_ADDR_COUNT: u32 = 0;
         unsafe {
@@ -3066,31 +3084,7 @@ impl Ppu {
                 }
             }
         }
-        // tile_addr is in words, convert to byte index by multiplying by 2
-        let plane0_addr = ((tile_addr + rel_y as u16) as usize) * 2;
-        // 2bpp は同じ行内で plane0, plane1 が連続する 2 バイト（row*2 + {0,1}）
-        let plane1_addr = plane0_addr + 1;
-        if plane0_addr >= self.vram.len() || plane1_addr >= self.vram.len() {
-            return (0, 0);
-        }
-        let plane0 = self.vram[plane0_addr];
-        let plane1 = self.vram[plane1_addr];
-
-        // Debug output disabled for performance
-
-        // Debug VRAM tile data (quiet by default)
-        if crate::debug_flags::boot_verbose() {
-            static mut VRAM_DEBUG_COUNT: u32 = 0;
-            unsafe {
-                if VRAM_DEBUG_COUNT < 5 && (plane0 != 0 || plane1 != 0) {
-                    VRAM_DEBUG_COUNT += 1;
-                    println!("📊 VRAM TILE[{}]: tile_id={}, addr=0x{:04X}, plane0=0x{:02X}, plane1=0x{:02X}", 
-                            VRAM_DEBUG_COUNT, tile_id, tile_addr, plane0, plane1);
-                }
-            }
-        }
-        let bit = 7 - rel_x;
-        let color_index = ((plane1 >> bit) & 1) << 1 | ((plane0 >> bit) & 1);
+        let color_index = self.sample_bg_cached(bg_num, tile_addr, rel_y, rel_x, 2);
 
         // Debug first few non-zero pixels found
         static mut PIXEL_FOUND_COUNT: u32 = 0;
@@ -3137,7 +3131,7 @@ impl Ppu {
     }
 
     #[allow(dead_code)]
-    fn render_bg_mode1(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_mode1(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         // Mode 1: BG1/BG2は4bpp、BG3は2bpp
         if bg_num <= 1 {
             // 4bpp描画
@@ -3148,7 +3142,7 @@ impl Ppu {
         }
     }
 
-    fn render_bg_4bpp(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_4bpp(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         if crate::debug_flags::boot_verbose() {
             static mut DEBUG_FUNCTION_COUNT: u32 = 0;
             unsafe {
@@ -3194,7 +3188,7 @@ impl Ppu {
     }
 
     fn render_bg_4bpp_impl(
-        &self,
+        &mut self,
         bg_num: u8,
         mosaic_x: u16,
         mosaic_y_base: u16,
@@ -3219,75 +3213,7 @@ impl Ppu {
 
         // Debug output disabled for performance
 
-        let tilemap_base = match bg_num {
-            0 => self.bg1_tilemap_base,
-            1 => self.bg2_tilemap_base,
-            2 => self.bg3_tilemap_base,
-            3 => self.bg4_tilemap_base,
-            _ => 0,
-        } as u32;
-        // Tilemap base is in words
-        let tilemap_base_word = tilemap_base;
-        let (map_tx, map_ty) = (tile_x % 32, tile_y % 32);
-        let scx = (tile_x / 32) as u32;
-        let scy = (tile_y / 32) as u32;
-        let width_screens = if ss == 1 || ss == 3 { 2 } else { 1 } as u32;
-        let quadrant = scx + scy * width_screens;
-        // Calculate word address first, then convert to byte index
-        let map_entry_word_addr = tilemap_base_word
-            .saturating_add(quadrant * 0x400) // 32x32 tilemap = 1024 words
-            .saturating_add((map_ty as u32) * 32 + map_tx as u32);
-
-        // Apply VRAM mirroring to word address: VRAM is 32K words (0x0000-0x7FFF)
-        // Addresses 0x8000-0xFFFF mirror to 0x0000-0x7FFF
-        let map_entry_word_addr = map_entry_word_addr & 0x7FFF;
-        let map_entry_addr = map_entry_word_addr * 2; // Convert to byte index for VRAM access
-
-        // デバッグ: タイルマップアドレス計算を確認（オプトイン）
-        if std::env::var_os("DEBUG_TILEMAP_ADDR").is_some() && !crate::debug_flags::quiet() {
-            static mut DEBUG_TILEMAP_COUNT: u32 = 0;
-            unsafe {
-                DEBUG_TILEMAP_COUNT += 1;
-                if DEBUG_TILEMAP_COUNT <= 3 && mosaic_x < 5 && mosaic_y_base < 5 {
-                    println!(
-                        "  BG{} tilemap_base=0x{:04X}, map_entry_addr=0x{:04X}, VRAM_len=0x{:04X}",
-                        bg_num,
-                        tilemap_base,
-                        map_entry_addr,
-                        self.vram.len()
-                    );
-                }
-            }
-        }
-
-        if (map_entry_addr + 1) as usize >= self.vram.len() {
-            if std::env::var_os("DEBUG_TILEMAP_ADDR").is_some() && !crate::debug_flags::quiet() {
-                static mut DEBUG_MAP_COUNT: u32 = 0;
-                unsafe {
-                    DEBUG_MAP_COUNT += 1;
-                    if DEBUG_MAP_COUNT <= 3 {
-                        println!(
-                            "  BG{} EARLY RETURN: map_entry_addr=0x{:04X} out of VRAM bounds (len=0x{:04X})",
-                            bg_num,
-                            map_entry_addr,
-                            self.vram.len()
-                        );
-                    }
-                }
-            }
-            return (0, 0);
-        }
-        let map_entry_lo = self.vram[map_entry_addr as usize];
-        let map_entry_hi = self.vram[(map_entry_addr + 1) as usize];
-        let map_entry = ((map_entry_hi as u16) << 8) | (map_entry_lo as u16);
-
-        // Optional tilemap sampling (disabled by default)
-        if crate::debug_flags::boot_verbose() && mosaic_x == 0 && mosaic_y_base == 0 {
-            println!(
-                "Tilemap entry @0x{:04X} = 0x{:04X}",
-                map_entry_addr, map_entry
-            );
-        }
+        let map_entry = self.get_bg_map_entry_cached(bg_num, tile_x, tile_y);
 
         let mut tile_id = map_entry & 0x03FF;
         let palette = ((map_entry >> 10) & 0x07) as u8;
@@ -3337,73 +3263,7 @@ impl Ppu {
             }
         }
 
-        // 4bpp tile layout in VRAM (word-addressed):
-        // - words 0..7:  plane0 (low byte) + plane1 (high byte) for rows 0..7
-        // - words 8..15: plane2 (low byte) + plane3 (high byte) for rows 0..7
-        let row01_word = (tile_addr.wrapping_add(rel_y as u16)) & 0x7FFF;
-        let row23_word = (tile_addr.wrapping_add(8).wrapping_add(rel_y as u16)) & 0x7FFF;
-        let plane0_addr = (row01_word as usize) * 2;
-        let plane1_addr = plane0_addr + 1;
-        let plane2_addr = (row23_word as usize) * 2;
-        let plane3_addr = plane2_addr + 1;
-        if plane3_addr >= self.vram.len() {
-            return (0, 0);
-        }
-
-        // Dragon Quest III fix: Use static pattern for stability
-        let base_tile_addr = tile_addr as usize;
-        let _vram_data_sample = if base_tile_addr < self.vram.len() {
-            self.vram[base_tile_addr]
-        } else {
-            0
-        };
-        // Dragon Quest III: Disable fallback to see actual VRAM data
-        let needs_fallback = false;
-
-        let get_vram_with_fallback = |addr: usize, plane_offset: usize| -> u8 {
-            if addr < self.vram.len() {
-                let vram_data = self.vram[addr];
-
-                // If VRAM data is all zeros, use fallback for now
-                if vram_data == 0 && needs_fallback {
-                    match plane_offset {
-                        0..=7 => 0xFF,   // Plane 0: solid
-                        8..=15 => 0xAA,  // Plane 1: alternating
-                        16..=23 => 0x55, // Plane 2: alternating opposite
-                        24..=31 => 0x33, // Plane 3: sparse
-                        _ => 0,
-                    }
-                } else {
-                    vram_data
-                }
-            } else {
-                0 // Out of bounds
-            }
-        };
-
-        let plane0 = get_vram_with_fallback(plane0_addr, rel_y as usize);
-        let plane1 = get_vram_with_fallback(plane1_addr, rel_y as usize);
-        let plane2 = get_vram_with_fallback(plane2_addr, rel_y as usize);
-        let plane3 = get_vram_with_fallback(plane3_addr, rel_y as usize);
-
-        // Optional tile debug (disabled by default)
-        if crate::debug_flags::boot_verbose() {
-            static mut TILE_DEBUG_COUNT: u32 = 0;
-            unsafe {
-                TILE_DEBUG_COUNT += 1;
-                if TILE_DEBUG_COUNT <= 10 && mosaic_x < 4 && mosaic_y_base < 4 {
-                    println!(
-                        "Tile({},{}) tile=0x{:03X} planes=[{:02X},{:02X},{:02X},{:02X}]",
-                        mosaic_x, mosaic_y_base, tile_id, plane0, plane1, plane2, plane3
-                    );
-                }
-            }
-        }
-        let bit = 7 - rel_x;
-        let color_index = ((plane3 >> bit) & 1) << 3
-            | ((plane2 >> bit) & 1) << 2
-            | ((plane1 >> bit) & 1) << 1
-            | ((plane0 >> bit) & 1);
+        let color_index = self.sample_bg_cached(bg_num, tile_addr, rel_y, rel_x, 4);
 
         if color_index == 0 {
             return (0, 0);
@@ -3428,7 +3288,7 @@ impl Ppu {
     }
 
     #[allow(dead_code)]
-    fn render_bg_mode4(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_mode4(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         // Mode 4: BG1は8bpp、BG2は2bpp
         if bg_num == 0 {
             // BG1: 8bpp描画（256色）
@@ -3439,7 +3299,7 @@ impl Ppu {
         }
     }
 
-    fn render_bg_8bpp(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_8bpp(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         let tile_16 = self.bg_tile_16[bg_num as usize];
         let tile_px = if tile_16 { 16 } else { 8 } as u16;
         let ss = self.bg_screen_size[bg_num as usize];
@@ -3469,30 +3329,7 @@ impl Ppu {
         let tile_x = bg_x / tile_px;
         let tile_y = bg_y_tile / tile_px;
 
-        let tilemap_base_word = match bg_num {
-            0 => self.bg1_tilemap_base,
-            1 => self.bg2_tilemap_base,
-            2 => self.bg3_tilemap_base,
-            3 => self.bg4_tilemap_base,
-            _ => 0,
-        } as u32;
-        let (map_tx, map_ty) = (tile_x % 32, tile_y % 32);
-        let scx = (tile_x / 32) as u32;
-        let scy = (tile_y / 32) as u32;
-        let width_screens = if ss == 1 || ss == 3 { 2 } else { 1 } as u32;
-        let quadrant = scx + scy * width_screens;
-        let map_entry_word_addr = tilemap_base_word
-            .saturating_add(quadrant * 0x400)
-            .saturating_add((map_ty as u32) * 32 + map_tx as u32)
-            & 0x7FFF;
-        let map_entry_addr = map_entry_word_addr * 2;
-        if (map_entry_addr as usize + 1) >= self.vram.len() {
-            return (0, 0);
-        }
-
-        let map_entry_lo = self.vram[map_entry_addr as usize];
-        let map_entry_hi = self.vram[(map_entry_addr as usize) + 1];
-        let map_entry = ((map_entry_hi as u16) << 8) | (map_entry_lo as u16);
+        let map_entry = self.get_bg_map_entry_cached(bg_num, tile_x, tile_y);
 
         let mut tile_id = map_entry & 0x03FF;
         let palette = ((map_entry >> 10) & 0x07) as u8;
@@ -3526,43 +3363,7 @@ impl Ppu {
             _ => 0,
         };
         let tile_addr = tile_base.wrapping_add(tile_id.wrapping_mul(32)) & 0x7FFF;
-
-        let row01_word = (tile_addr.wrapping_add(rel_y as u16)) & 0x7FFF;
-        let row23_word = (tile_addr.wrapping_add(8).wrapping_add(rel_y as u16)) & 0x7FFF;
-        let row45_word = (tile_addr.wrapping_add(16).wrapping_add(rel_y as u16)) & 0x7FFF;
-        let row67_word = (tile_addr.wrapping_add(24).wrapping_add(rel_y as u16)) & 0x7FFF;
-
-        let plane0_addr = (row01_word as usize) * 2;
-        let plane1_addr = plane0_addr + 1;
-        let plane2_addr = (row23_word as usize) * 2;
-        let plane3_addr = plane2_addr + 1;
-        let plane4_addr = (row45_word as usize) * 2;
-        let plane5_addr = plane4_addr + 1;
-        let plane6_addr = (row67_word as usize) * 2;
-        let plane7_addr = plane6_addr + 1;
-        if plane7_addr >= self.vram.len() {
-            return (0, 0);
-        }
-
-        let p0 = self.vram[plane0_addr];
-        let p1 = self.vram[plane1_addr];
-        let p2 = self.vram[plane2_addr];
-        let p3 = self.vram[plane3_addr];
-        let p4 = self.vram[plane4_addr];
-        let p5 = self.vram[plane5_addr];
-        let p6 = self.vram[plane6_addr];
-        let p7 = self.vram[plane7_addr];
-
-        let bit = 7 - rel_x;
-        let mut color_index = 0u8;
-        color_index |= ((p0 >> bit) & 1) << 0;
-        color_index |= ((p1 >> bit) & 1) << 1;
-        color_index |= ((p2 >> bit) & 1) << 2;
-        color_index |= ((p3 >> bit) & 1) << 3;
-        color_index |= ((p4 >> bit) & 1) << 4;
-        color_index |= ((p5 >> bit) & 1) << 5;
-        color_index |= ((p6 >> bit) & 1) << 6;
-        color_index |= ((p7 >> bit) & 1) << 7;
+        let color_index = self.sample_bg_cached(bg_num, tile_addr, rel_y, rel_x, 8);
 
         if color_index == 0 {
             return (0, 0);
@@ -3792,7 +3593,7 @@ impl Ppu {
         (color, 1, layer_id)
     }
 
-    fn render_bg_mode2(&self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
+    fn render_bg_mode2(&mut self, x: u16, y: u16, bg_num: u8) -> (u32, u8) {
         // Mode 2: BG1/BG2 are 4bpp with offset-per-tile (OPT) using BG3 tilemap entries.
         if bg_num > 1 {
             return (0, 0);
@@ -3823,7 +3624,7 @@ impl Ppu {
         )
     }
 
-    fn render_bg_mode5(&self, x: u16, y: u16, bg_num: u8, is_main: bool) -> (u32, u8) {
+    fn render_bg_mode5(&mut self, x: u16, y: u16, bg_num: u8, is_main: bool) -> (u32, u8) {
         // Mode 5 (hi-res): BG tiles are effectively 16px wide by pairing tiles horizontally.
         // Background layers are de-interleaved between main/sub screens (even/odd columns).
         //
@@ -3840,12 +3641,6 @@ impl Ppu {
             2 => self.bg3_tile_base,
             _ => 0,
         };
-        let tilemap_base = match bg_num {
-            0 => self.bg1_tilemap_base,
-            1 => self.bg2_tilemap_base,
-            2 => self.bg3_tilemap_base,
-            _ => 0,
-        } as u32;
         let ss = self.bg_screen_size[bg_num as usize];
         let width_tiles = if ss == 1 || ss == 3 { 64 } else { 32 } as u16;
         let height_tiles = if ss == 2 || ss == 3 { 64 } else { 32 } as u16;
@@ -3880,22 +3675,7 @@ impl Ppu {
         let tile_x = bg_x / tile_w;
         let tile_y = bg_y / tile_h;
 
-        let (map_tx, map_ty) = (tile_x % 32, tile_y % 32);
-        let scx = (tile_x / 32) as u32;
-        let scy = (tile_y / 32) as u32;
-        let width_screens = if ss == 1 || ss == 3 { 2 } else { 1 } as u32;
-        let quadrant = scx + scy * width_screens;
-        let map_entry_word_addr = tilemap_base
-            .saturating_add(quadrant * 0x400)
-            .saturating_add((map_ty as u32) * 32 + map_tx as u32)
-            & 0x7FFF;
-        let map_entry_addr = (map_entry_word_addr * 2) as usize;
-        if map_entry_addr + 1 >= self.vram.len() {
-            return (0, 0);
-        }
-        let lo = self.vram[map_entry_addr];
-        let hi = self.vram[map_entry_addr + 1];
-        let entry = ((hi as u16) << 8) | (lo as u16);
+        let entry = self.get_bg_map_entry_cached(bg_num, tile_x, tile_y);
 
         let mut tile_id = entry & 0x03FF;
         let palette = ((entry >> 10) & 0x07) as u8;
@@ -3921,11 +3701,10 @@ impl Ppu {
         rel_x %= 8;
         rel_y %= 8;
 
-        let color_index = match bg_num {
-            0 | 2 => self.sample_tile_4bpp(tile_base, tile_id, rel_x, rel_y),
-            1 => self.sample_tile_2bpp(tile_base, tile_id, rel_x, rel_y),
-            _ => 0,
-        };
+        let bpp = if bg_num == 1 { 2 } else { 4 };
+        let tile_stride = if bpp == 2 { 8 } else { 16 };
+        let tile_addr = tile_base.wrapping_add(tile_id.wrapping_mul(tile_stride)) & 0x7FFF;
+        let color_index = self.sample_bg_cached(bg_num, tile_addr, rel_y, rel_x, bpp);
         if color_index == 0 {
             return (0, 0);
         }
@@ -3937,7 +3716,7 @@ impl Ppu {
         (color, priority_value)
     }
 
-    fn render_bg_mode6(&self, x: u16, y: u16, bg_num: u8, is_main: bool) -> (u32, u8) {
+    fn render_bg_mode6(&mut self, x: u16, y: u16, bg_num: u8, is_main: bool) -> (u32, u8) {
         // Mode 6: BG1は4bpp（高解像度512x448）
         if bg_num != 0 {
             return (0, 0);
@@ -3967,7 +3746,7 @@ impl Ppu {
         // Forced blank overrides everything (unless FORCE_DISPLAY or FORCE_NO_BLANK)
         if (self.screen_display & 0x80) != 0
             && !self.force_display_active()
-            && std::env::var_os("FORCE_NO_BLANK").is_none()
+            && !self.force_no_blank
         {
             return 0xFF000000;
         }
@@ -5190,6 +4969,7 @@ impl Ppu {
                             self.oam[odd] = value;
                         }
                         self.oam_writes_total = self.oam_writes_total.saturating_add(2);
+                        self.oam_dirty = true;
                     }
                 } else {
                     let mapped = (0x200 | (internal & 0x001F)) as usize;
@@ -5197,6 +4977,7 @@ impl Ppu {
                         self.oam[mapped] = value;
                     }
                     self.oam_writes_total = self.oam_writes_total.saturating_add(1);
+                    self.oam_dirty = true;
                 }
                 self.oam_internal_addr = (internal + 1) & 0x03FF;
             }
@@ -5231,6 +5012,7 @@ impl Ppu {
                     }
                 }
                 self.update_line_render_state();
+                self.bg_cache_dirty = true;
             }
             0x06 => {
                 self.bg_mosaic = value;
@@ -5244,11 +5026,13 @@ impl Ppu {
                 // Common reference formula (SNESdev): base word address = (value & 0xFC) << 8.
                 self.bg1_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[0] = value & 0x03;
+                self.bg_cache_dirty = true;
             }
             0x08 => {
                 // BG2SC ($2108): store base as VRAM word address (see $2107)
                 self.bg2_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[1] = value & 0x03;
+                self.bg_cache_dirty = true;
                 if (crate::debug_flags::ppu_write() || crate::debug_flags::boot_verbose())
                     && !crate::debug_flags::quiet()
                 {
@@ -5262,11 +5046,13 @@ impl Ppu {
                 // BG3SC ($2109): store base as VRAM word address (see $2107)
                 self.bg3_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[2] = value & 0x03;
+                self.bg_cache_dirty = true;
             }
             0x0A => {
                 // BG4SC ($210A): store base as VRAM word address (see $2107)
                 self.bg4_tilemap_base = ((value as u16) & 0xFC) << 8;
                 self.bg_screen_size[3] = value & 0x03;
+                self.bg_cache_dirty = true;
             }
             0x0B => {
                 // BG12NBA ($210B): Character (tile) data area designation.
@@ -5277,6 +5063,7 @@ impl Ppu {
                 let bg2 = ((value >> 4) & 0x0F) as u16;
                 self.bg1_tile_base = bg1 << 12;
                 self.bg2_tile_base = bg2 << 12;
+                self.bg_cache_dirty = true;
             }
             0x0C => {
                 // BG34NBA ($210C): Character (tile) data area designation.
@@ -5286,6 +5073,7 @@ impl Ppu {
                 let bg4 = ((value >> 4) & 0x0F) as u16;
                 self.bg3_tile_base = bg3 << 12;
                 self.bg4_tile_base = bg4 << 12;
+                self.bg_cache_dirty = true;
                 if (crate::debug_flags::ppu_write() || crate::debug_flags::boot_verbose())
                     && !crate::debug_flags::quiet()
                 {
@@ -5518,6 +5306,7 @@ impl Ppu {
 
                 if vram_index < self.vram.len() {
                     self.vram[vram_index] = value;
+                    self.bg_cache_dirty = true;
                 } else {
                     println!(
                         "WARNING: VRAM write out of bounds! index=0x{:05X} >= len=0x{:05X}",
@@ -5630,6 +5419,7 @@ impl Ppu {
 
                 if vram_index < self.vram.len() {
                     self.vram[vram_index] = value;
+                    self.bg_cache_dirty = true;
                 } else {
                     println!(
                         "WARNING: VRAM high write out of bounds! index=0x{:05X} >= len=0x{:05X}",
@@ -6282,6 +6072,10 @@ impl Ppu {
         self.sprite_time_over = false;
         self.sprite_timeover_first_idx = 0;
 
+        if self.oam_dirty {
+            self.rebuild_oam_cache();
+        }
+
         // Gather sprites in rotated OAM order (starting at oam_eval_base), cap at 32 like hardware.
         //
         // SNESdev/Super Famicom wiki behavior:
@@ -6294,33 +6088,28 @@ impl Ppu {
         // We approximate this by applying the horizontal inclusion rules and counting tiles across.
         let mut count_seen = 0u8;
         let mut in_range_total = 0u16;
+        let obj_line = self.obj_line_for_scanline(scanline);
+        let (small_w, small_h) = self.get_sprite_pixel_size(&SpriteSize::Small);
+        let (large_w, large_h) = self.get_sprite_pixel_size(&SpriteSize::Large);
         for n in 0..128u16 {
             let i = ((self.oam_eval_base as u16 + n) & 0x7F) as usize;
-            let oam_offset = i * 4;
-            if oam_offset + 3 >= self.oam.len() {
-                break;
-            }
-            let y = self.oam[oam_offset + 1];
+            let y = self.sprite_cached_y[i];
             // Y>=240 is hidden.
             if y >= 240 {
                 continue;
             }
-            let obj_line = self.obj_line_for_scanline(scanline);
             // Determine size
-            let high_table_offset = 0x200 + (i / 4);
-            if high_table_offset >= self.oam.len() {
-                break;
-            }
-            let high_table_byte = self.oam[high_table_offset];
-            let bit_shift = (i % 4) * 2;
-            let high_bits = (high_table_byte >> bit_shift) & 0x03;
-            let size_bit = (high_bits & 0x02) != 0;
+            let size_bit = self.sprite_cached_size_large[i];
             let size = if size_bit {
                 SpriteSize::Large
             } else {
                 SpriteSize::Small
             };
-            let (sprite_w, sprite_h) = self.get_sprite_pixel_size(&size);
+            let (sprite_w, sprite_h) = if size_bit {
+                (large_w, large_h)
+            } else {
+                (small_w, small_h)
+            };
             // Y is 8-bit and wraps; test overlap via wrapped subtraction.
             let dy_lines = self.obj_sprite_dy(obj_line, y);
             let sprite_height_lines = self.obj_sprite_height_lines(sprite_h as u16);
@@ -6329,9 +6118,8 @@ impl Ppu {
             }
 
             // Range stage horizontal inclusion: -size < X < 256 (X is signed 9-bit).
-            let x_lo = self.oam[oam_offset] as u16;
-            let x_raw = x_lo | (((high_bits & 0x01) as u16) << 8);
-            let mut x = Self::sprite_x_signed(x_raw);
+            let x_raw = self.sprite_cached_x_raw[i];
+            let mut x = self.sprite_cached_x_signed[i];
             // Bug: treat X == -256 as X == 0 for range/time evaluation.
             if x == -256 {
                 x = 0;
@@ -6348,10 +6136,9 @@ impl Ppu {
             in_range_total = in_range_total.saturating_add(1);
 
             // Pull rest of fields
-            let tile_lo = self.oam[oam_offset + 2] as u16;
-            let attr = self.oam[oam_offset + 3];
+            let attr = self.sprite_cached_attr[i];
             let x = x_raw;
-            let tile = tile_lo | (((attr & 0x01) as u16) << 8);
+            let tile = self.sprite_cached_tile[i];
             let palette = (attr >> 1) & 0x07;
             let priority = (attr >> 4) & 0x03;
             let flip_x = (attr & 0x40) != 0;
@@ -6438,6 +6225,36 @@ impl Ppu {
         }
     }
 
+    fn rebuild_oam_cache(&mut self) {
+        for i in 0..128usize {
+            let oam_offset = i * 4;
+            if oam_offset + 3 >= self.oam.len() {
+                break;
+            }
+            let y = self.oam[oam_offset + 1];
+            let x_lo = self.oam[oam_offset] as u16;
+            let tile_lo = self.oam[oam_offset + 2] as u16;
+            let attr = self.oam[oam_offset + 3];
+            let high_table_offset = 0x200 + (i / 4);
+            if high_table_offset >= self.oam.len() {
+                break;
+            }
+            let high_table_byte = self.oam[high_table_offset];
+            let bit_shift = (i % 4) * 2;
+            let high_bits = (high_table_byte >> bit_shift) & 0x03;
+            let x_raw = x_lo | (((high_bits & 0x01) as u16) << 8);
+            let tile = tile_lo | (((attr & 0x01) as u16) << 8);
+
+            self.sprite_cached_y[i] = y;
+            self.sprite_cached_x_raw[i] = x_raw;
+            self.sprite_cached_x_signed[i] = Self::sprite_x_signed(x_raw);
+            self.sprite_cached_tile[i] = tile;
+            self.sprite_cached_attr[i] = attr;
+            self.sprite_cached_size_large[i] = (high_bits & 0x02) != 0;
+        }
+        self.oam_dirty = false;
+    }
+
     // Consume time budget on first pixel of each 8px tile; disable OBJ for rest of line when exhausted
     #[allow(dead_code)]
     fn update_obj_time_over_at_x(&mut self, x: u16) {
@@ -6448,11 +6265,33 @@ impl Ppu {
 
     // Precompute per-x window masks for BG/OBJ and color window (dot gating)
     fn prepare_line_window_luts(&mut self) {
+        if self.bg_cache_dirty {
+            self.invalidate_bg_caches();
+        }
         if self.tmw_mask == 0 && self.tsw_mask == 0 && self.window_color_mask == 0 {
             self.line_window_prepared = false;
+            self.line_window_cfg = None;
+            return;
+        }
+        let cfg = WindowLutConfig {
+            window1_left: self.window1_left,
+            window1_right: self.window1_right,
+            window2_left: self.window2_left,
+            window2_right: self.window2_right,
+            window_bg_mask: self.window_bg_mask,
+            bg_window_logic: self.bg_window_logic,
+            window_obj_mask: self.window_obj_mask,
+            obj_window_logic: self.obj_window_logic,
+            window_color_mask: self.window_color_mask,
+            color_window_logic: self.color_window_logic,
+            tmw_mask: self.tmw_mask,
+            tsw_mask: self.tsw_mask,
+        };
+        if self.line_window_prepared && self.line_window_cfg == Some(cfg) {
             return;
         }
         self.line_window_prepared = true;
+        self.line_window_cfg = Some(cfg);
         for x in 0..256u16 {
             // Color window
             let wcol = if self.window_color_mask == 0 {
@@ -6630,6 +6469,154 @@ impl Ppu {
         let lo = self.vram[addr];
         let hi = self.vram[addr + 1];
         ((hi as u16) << 8) | (lo as u16)
+    }
+
+    fn invalidate_bg_caches(&mut self) {
+        if !self.bg_cache_dirty {
+            return;
+        }
+        for cache in &mut self.bg_map_cache {
+            cache.valid = false;
+        }
+        for cache in &mut self.bg_row_cache {
+            cache.valid = false;
+        }
+        self.bg_cache_dirty = false;
+    }
+
+    fn get_bg_map_entry_cached(&mut self, bg_num: u8, tile_x: u16, tile_y: u16) -> u16 {
+        if self.bg_cache_dirty {
+            self.invalidate_bg_caches();
+        }
+        let idx = bg_num as usize;
+        if idx >= self.bg_map_cache.len() {
+            return 0;
+        }
+        if {
+            let cache = &self.bg_map_cache[idx];
+            cache.valid && cache.tile_x == tile_x && cache.tile_y == tile_y
+        } {
+            return self.bg_map_cache[idx].map_entry;
+        }
+        let entry = self.read_bg_tilemap_entry_word(bg_num, tile_x, tile_y);
+        self.bg_map_cache[idx] = BgMapCache {
+            valid: true,
+            tile_x,
+            tile_y,
+            map_entry: entry,
+        };
+        entry
+    }
+
+    fn sample_bg_cached(
+        &mut self,
+        bg_num: u8,
+        tile_addr: u16,
+        rel_y: u8,
+        rel_x: u8,
+        bpp: u8,
+    ) -> u8 {
+        if self.bg_cache_dirty {
+            self.invalidate_bg_caches();
+        }
+        let idx = bg_num as usize;
+        if idx >= self.bg_row_cache.len() {
+            return 0;
+        }
+        let cache = &mut self.bg_row_cache[idx];
+        if !(cache.valid
+            && cache.tile_addr == tile_addr
+            && cache.rel_y == rel_y
+            && cache.bpp == bpp)
+        {
+            let mut row = [0u8; 8];
+            match bpp {
+                2 => {
+                    let row_word = tile_addr.wrapping_add(rel_y as u16) & 0x7FFF;
+                    let plane0_addr = (row_word as usize) * 2;
+                    let plane1_addr = plane0_addr + 1;
+                    if plane1_addr < self.vram.len() {
+                        let plane0 = self.vram[plane0_addr];
+                        let plane1 = self.vram[plane1_addr];
+                        for x in 0..8u8 {
+                            let bit = 7 - x;
+                            let c = (((plane1 >> bit) & 1) << 1) | ((plane0 >> bit) & 1);
+                            row[x as usize] = c;
+                        }
+                    }
+                }
+                4 => {
+                    let row01_word = tile_addr.wrapping_add(rel_y as u16) & 0x7FFF;
+                    let row23_word = tile_addr.wrapping_add(8).wrapping_add(rel_y as u16) & 0x7FFF;
+                    let plane0_addr = (row01_word as usize) * 2;
+                    let plane1_addr = plane0_addr + 1;
+                    let plane2_addr = (row23_word as usize) * 2;
+                    let plane3_addr = plane2_addr + 1;
+                    if plane3_addr < self.vram.len() {
+                        let p0 = self.vram[plane0_addr];
+                        let p1 = self.vram[plane1_addr];
+                        let p2 = self.vram[plane2_addr];
+                        let p3 = self.vram[plane3_addr];
+                        for x in 0..8u8 {
+                            let bit = 7 - x;
+                            let c = (((p3 >> bit) & 1) << 3)
+                                | (((p2 >> bit) & 1) << 2)
+                                | (((p1 >> bit) & 1) << 1)
+                                | ((p0 >> bit) & 1);
+                            row[x as usize] = c;
+                        }
+                    }
+                }
+                8 => {
+                    let row01_word = tile_addr.wrapping_add(rel_y as u16) & 0x7FFF;
+                    let row23_word = tile_addr.wrapping_add(8).wrapping_add(rel_y as u16) & 0x7FFF;
+                    let row45_word =
+                        tile_addr.wrapping_add(16).wrapping_add(rel_y as u16) & 0x7FFF;
+                    let row67_word =
+                        tile_addr.wrapping_add(24).wrapping_add(rel_y as u16) & 0x7FFF;
+                    let plane0_addr = (row01_word as usize) * 2;
+                    let plane1_addr = plane0_addr + 1;
+                    let plane2_addr = (row23_word as usize) * 2;
+                    let plane3_addr = plane2_addr + 1;
+                    let plane4_addr = (row45_word as usize) * 2;
+                    let plane5_addr = plane4_addr + 1;
+                    let plane6_addr = (row67_word as usize) * 2;
+                    let plane7_addr = plane6_addr + 1;
+                    if plane7_addr < self.vram.len() {
+                        let p0 = self.vram[plane0_addr];
+                        let p1 = self.vram[plane1_addr];
+                        let p2 = self.vram[plane2_addr];
+                        let p3 = self.vram[plane3_addr];
+                        let p4 = self.vram[plane4_addr];
+                        let p5 = self.vram[plane5_addr];
+                        let p6 = self.vram[plane6_addr];
+                        let p7 = self.vram[plane7_addr];
+                        for x in 0..8u8 {
+                            let bit = 7 - x;
+                            let mut c = 0u8;
+                            c |= ((p0 >> bit) & 1) << 0;
+                            c |= ((p1 >> bit) & 1) << 1;
+                            c |= ((p2 >> bit) & 1) << 2;
+                            c |= ((p3 >> bit) & 1) << 3;
+                            c |= ((p4 >> bit) & 1) << 4;
+                            c |= ((p5 >> bit) & 1) << 5;
+                            c |= ((p6 >> bit) & 1) << 6;
+                            c |= ((p7 >> bit) & 1) << 7;
+                            row[x as usize] = c;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            *cache = BgRowCache {
+                valid: true,
+                tile_addr,
+                rel_y,
+                bpp,
+                row,
+            };
+        }
+        cache.row.get(rel_x as usize).copied().unwrap_or(0)
     }
 
     // Summarize VRAM writes since last call, including FG mode info. Resets counters.
@@ -7732,6 +7719,7 @@ impl Ppu {
         if byte_addr + 1 < self.vram.len() {
             self.vram[byte_addr] = low_byte;
             self.vram[byte_addr + 1] = high_byte;
+            self.bg_cache_dirty = true;
         }
     }
 
@@ -7864,6 +7852,7 @@ impl Ppu {
         for i in 0..0x8000 {
             self.vram[i] = if i < 0x4000 { 0x11 } else { 0x22 };
         }
+        self.bg_cache_dirty = true;
 
         // Set up tilemap entries at high addresses (0xE000-0xFFFF range)
         let tilemap_start = 0x6000; // Start from 0xE000 & 0x7FFF = 0x6000

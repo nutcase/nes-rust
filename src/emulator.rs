@@ -90,6 +90,8 @@ pub struct PerformanceStats {
     dropped_frames: u64,
     total_frames: u64,
     last_fps_update: Instant,
+    dropped_frames_last_second: u64,
+    last_dropped_frames: u64,
     frame_times: Vec<Duration>,
     // Component-level timing
     cpu_time_total: Duration,
@@ -114,6 +116,8 @@ impl PerformanceStats {
             dropped_frames: 0,
             total_frames: 0,
             last_fps_update: Instant::now(),
+            dropped_frames_last_second: 0,
+            last_dropped_frames: 0,
             frame_times: Vec::with_capacity(60),
             cpu_time_total: Duration::ZERO,
             ppu_time_total: Duration::ZERO,
@@ -126,7 +130,8 @@ impl PerformanceStats {
         }
     }
 
-    fn update(&mut self, frame_time: Duration) {
+    fn update(&mut self, frame_time: Duration) -> bool {
+        let mut fps_updated = false;
         self.total_frames += 1;
         self.frame_times.push(frame_time);
 
@@ -162,8 +167,12 @@ impl PerformanceStats {
             self.dma_time_samples.clear();
             self.sa1_time_samples.clear();
 
+            self.dropped_frames_last_second = self.dropped_frames - self.last_dropped_frames;
+            self.last_dropped_frames = self.dropped_frames;
             self.last_fps_update = now;
+            fps_updated = true;
         }
+        fps_updated
     }
 
     fn add_cpu_time(&mut self, time: Duration) {
@@ -187,8 +196,8 @@ impl PerformanceStats {
         self.sa1_time_samples.push(time);
     }
 
-    fn should_skip_frame(&self, target_fps: f64) -> bool {
-        self.fps < target_fps * 0.85 // Skip if running more than 15% slower
+    fn should_skip_frame(&self, target_fps: f64, threshold_ratio: f64) -> bool {
+        self.fps < target_fps * threshold_ratio
     }
 
     #[allow(dead_code)]
@@ -230,9 +239,13 @@ pub struct Emulator {
     frame_skip_count: u8,
     max_frame_skip: u8,
     adaptive_timing: bool,
+    frame_skip_threshold: f64,
     performance_stats: PerformanceStats,
     audio_system: AudioSystem,
     present_every_auto: u64,
+    present_auto_good_streak: u8,
+    present_auto_bad_streak: u8,
+    present_auto_cooldown: u8,
     // NMI handling
     #[allow(dead_code)]
     nmi_triggered_this_flag: bool,
@@ -582,7 +595,12 @@ impl Emulator {
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .map(|v| v.min(10))
-            .unwrap_or(2);
+            .unwrap_or(4);
+        let frame_skip_threshold: f64 = std::env::var("FRAME_SKIP_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0 && *v < 1.0)
+            .unwrap_or(0.95);
         let apu_step_batch: u32 = std::env::var("APU_STEP_BATCH")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -612,9 +630,13 @@ impl Emulator {
             frame_skip_count: 0,
             max_frame_skip, // Allow skipping up to N frames for performance
             adaptive_timing: adaptive_timing_env && !disable_skip_env,
+            frame_skip_threshold,
             performance_stats: PerformanceStats::new(),
             audio_system,
             present_every_auto: 2,
+            present_auto_good_streak: 0,
+            present_auto_bad_streak: 0,
+            present_auto_cooldown: 0,
             nmi_triggered_this_flag: false,
             debugger: Debugger::new(),
             rom_title,
@@ -736,7 +758,7 @@ impl Emulator {
                     );
                 }
                 let frame_time = frame_start.elapsed();
-                self.performance_stats.update(frame_time);
+                let _ = self.performance_stats.update(frame_time);
                 self.frame_count += 1;
                 self.maybe_dump_framebuffer_at();
                 self.maybe_dump_mem_at();
@@ -1125,7 +1147,8 @@ impl Emulator {
             // Check if we should skip this frame for performance
             let should_skip_frame = self.adaptive_timing
                 && self.frame_skip_count < self.max_frame_skip
-                && self.performance_stats.should_skip_frame(60.0);
+                && self.performance_stats
+                    .should_skip_frame(60.0, self.frame_skip_threshold);
 
             let force_render_for_title_screen = std::env::var("FORCE_RENDER_ALL")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -1157,43 +1180,6 @@ impl Emulator {
             // Present/render cadence control (screen update can be expensive).
             let mut present_every = present_every_env.unwrap_or(2);
             if present_every_env.is_none() && auto_present {
-                let fps = self.performance_stats.fps;
-                let current = self.present_every_auto;
-                let next = match current {
-                    2 => {
-                        if fps < 43.0 {
-                            3
-                        } else {
-                            2
-                        }
-                    }
-                    3 => {
-                        if fps < 33.0 {
-                            4
-                        } else if fps > 50.0 {
-                            2
-                        } else {
-                            3
-                        }
-                    }
-                    4 => {
-                        if fps > 40.0 {
-                            3
-                        } else {
-                            4
-                        }
-                    }
-                    _ => 2,
-                };
-                if next != current {
-                    self.present_every_auto = next;
-                    if !crate::debug_flags::quiet() {
-                        println!(
-                            "AUTO_PRESENT: fps={:.1} -> present_every={}",
-                            fps, self.present_every_auto
-                        );
-                    }
-                }
                 present_every = self.present_every_auto.max(1);
             }
 
@@ -1221,7 +1207,62 @@ impl Emulator {
             }
 
             let frame_time = frame_start.elapsed();
-            self.performance_stats.update(frame_time);
+            let fps_updated = self.performance_stats.update(frame_time);
+
+            if present_every_env.is_none() && auto_present && fps_updated {
+                let fps = self.performance_stats.fps.min(60.0);
+                let dropped = self.performance_stats.dropped_frames_last_second;
+                let bad = fps < 58.0 || dropped > 0;
+                let good = fps > 59.6 && dropped == 0;
+
+                if dropped > 0 {
+                    // Keep a minimum present cadence for a few seconds after drops.
+                    self.present_auto_cooldown = self.present_auto_cooldown.max(3);
+                } else if self.present_auto_cooldown > 0 {
+                    self.present_auto_cooldown -= 1;
+                }
+
+                if bad {
+                    self.present_auto_bad_streak =
+                        self.present_auto_bad_streak.saturating_add(1);
+                    self.present_auto_good_streak = 0;
+                } else if good {
+                    self.present_auto_good_streak =
+                        self.present_auto_good_streak.saturating_add(1);
+                    self.present_auto_bad_streak = 0;
+                } else {
+                    self.present_auto_good_streak = 0;
+                    self.present_auto_bad_streak = 0;
+                }
+
+                let current = self.present_every_auto;
+                let mut next = current;
+                if self.present_auto_bad_streak >= 2 {
+                    next = 4;
+                } else if self.present_auto_bad_streak >= 1 && current == 2 {
+                    next = 3;
+                } else if self.present_auto_good_streak >= 2 {
+                    if current == 4 {
+                        next = 3;
+                    } else if current == 3 {
+                        next = 2;
+                    }
+                }
+
+                if self.present_auto_cooldown > 0 && next < 3 {
+                    next = 3;
+                }
+
+                if next != current {
+                    self.present_every_auto = next;
+                    if !crate::debug_flags::quiet() {
+                        println!(
+                            "AUTO_PRESENT: fps={:.1} drops={} cooldown={} -> present_every={}",
+                            fps, dropped, self.present_auto_cooldown, self.present_every_auto
+                        );
+                    }
+                }
+            }
 
             if !self.headless {
                 // Keep audio playback stable even when frames are skipped.

@@ -202,6 +202,11 @@ pub fn trace_hdma_window() -> bool {
     *ON.get_or_init(|| env_present("TRACE_HDMA_WINDOW"))
 }
 
+pub fn force_no_blank() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_present("FORCE_NO_BLANK"))
+}
+
 pub fn trace_bwram_sys() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_present("TRACE_BWRAM_SYS"))
