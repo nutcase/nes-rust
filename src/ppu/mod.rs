@@ -143,11 +143,18 @@ pub struct Ppu {
 
     // Set to true when the PPU completes a full frame (scanline wraps from 260 to -1)
     pub frame_complete: bool,
+
+    // Cached rendering_enabled flag — updated on $2001 write
+    rendering_enabled: bool,
+
+    // Per-scanline sprite cache: (sprite_num, y, tile_id, attributes, x)
+    scanline_sprites: [(u8, u8, u8, u8, u8); 8],
+    scanline_sprite_count: u8,
 }
 
 impl Ppu {
     pub fn new() -> Self {
-        let mut ppu = Ppu {
+        let ppu = Ppu {
             control: PpuControl::empty(),
             mask: PpuMask::empty(),
             // NES-accurate: VBlank is often set at power-on
@@ -188,11 +195,15 @@ impl Ppu {
             vblank_flag_set_this_frame: false,
             pending_nmi: false,
             frame_complete: false,
+            rendering_enabled: false,
+            scanline_sprites: [(0, 0, 0, 0, 0); 8],
+            scanline_sprite_count: 0,
         };
-        
+
         ppu
     }
 
+    #[inline]
     pub fn step(&mut self, cartridge: Option<&crate::cartridge::Cartridge>) -> bool {
         let mut nmi = false;
 
@@ -213,13 +224,13 @@ impl Ppu {
                 }
                 
                 // Copy horizontal scroll bits from t to v at cycle 257
-                if self.cycle == 257 && self.rendering_enabled() {
+                if self.cycle == 257 && self.rendering_enabled {
                     self.v = (self.v & !0x041F) | (self.t & 0x041F);
                 }
 
                 // Update vertical scroll during pre-render scanline
                 if self.cycle >= 280 && self.cycle <= 304 {
-                    if self.rendering_enabled() {
+                    if self.rendering_enabled {
                         // Copy vertical scroll bits from t to v
                         self.v = (self.v & !0x7BE0) | (self.t & 0x7BE0);
                     }
@@ -227,20 +238,17 @@ impl Ppu {
             }
             0..=239 => {
                 // Visible scanlines
-                
-                // DEBUG: Check if visible scanlines are being processed
-                static mut VISIBLE_SCANLINE_COUNT: u32 = 0;
-                // Processing visible scanline (debug reduced)
-                
-                // Perform sprite evaluation at the start of each visible scanline
-                if self.cycle == 1 {
+
+                // Evaluate sprites for this scanline at cycle 0
+                if self.cycle == 0 {
+                    self.evaluate_scanline_sprites(cartridge);
                 }
-                
+
                 if self.cycle >= 1 && self.cycle <= 256 {
                     self.render_pixel(cartridge);
 
                     // Increment coarse X every 8 pixels
-                    if self.cycle % 8 == 0 {
+                    if self.cycle & 7 == 0 {
                         self.increment_coarse_x();
                     }
                 }
@@ -251,7 +259,7 @@ impl Ppu {
                 }
 
                 // Copy horizontal scroll bits from t to v at cycle 257
-                if self.cycle == 257 && self.rendering_enabled() {
+                if self.cycle == 257 && self.rendering_enabled {
                     self.v = (self.v & !0x041F) | (self.t & 0x041F);
                 }
                 
@@ -285,7 +293,7 @@ impl Ppu {
         // Odd-frame cycle skip: on pre-render scanline of odd frames,
         // skip the last cycle (340) when rendering is enabled
         let cycle_limit = if self.scanline == -1
-            && self.rendering_enabled()
+            && self.rendering_enabled
             && (self.frame & 1) == 1
         {
             340
@@ -362,10 +370,9 @@ impl Ppu {
         self.force_rendered_frame = true;
     }
 
-    fn rendering_enabled(&self) -> bool {
-        self.mask.contains(PpuMask::BG_ENABLE) || self.mask.contains(PpuMask::SPRITE_ENABLE)
-    }
+    // rendering_enabled is now a cached field updated on $2001 write
 
+    #[inline]
     fn resolve_nametable(&self, logical_nt: usize, cartridge: Option<&crate::cartridge::Cartridge>) -> usize {
         if let Some(cart) = cartridge {
             match cart.mirroring() {
@@ -379,17 +386,18 @@ impl Ppu {
                     2 | 3 => 1,
                     _ => 0,
                 },
-                crate::cartridge::Mirroring::FourScreen => (logical_nt & 3) % 2,
+                crate::cartridge::Mirroring::FourScreen => logical_nt & 1,
                 crate::cartridge::Mirroring::OneScreenLower => 0,
                 crate::cartridge::Mirroring::OneScreenUpper => 1,
             }
         } else {
-            (logical_nt & 3) % 2
+            logical_nt & 1
         }
     }
 
+    #[inline]
     fn increment_coarse_x(&mut self) {
-        if !self.rendering_enabled() { return; }
+        if !self.rendering_enabled { return; }
         if (self.v & 0x001F) == 31 {
             self.v &= !0x001F;   // coarse X = 0
             self.v ^= 0x0400;    // toggle horizontal nametable
@@ -398,8 +406,9 @@ impl Ppu {
         }
     }
 
+    #[inline]
     fn increment_y(&mut self) {
-        if !self.rendering_enabled() { return; }
+        if !self.rendering_enabled { return; }
         if (self.v & 0x7000) != 0x7000 {
             // fine Y < 7, just increment
             self.v += 0x1000;
@@ -419,6 +428,7 @@ impl Ppu {
         }
     }
 
+    #[inline]
     fn render_pixel(&mut self, cartridge: Option<&crate::cartridge::Cartridge>) {
         let x = self.cycle - 1;
         let y = self.scanline;
@@ -443,7 +453,7 @@ impl Ppu {
                 let coarse_x = (self.v & 0x1F) as usize;
 
                 // Calculate which tile column pixel to render using fine X scroll
-                let pixel_col = (x % 8) as u8;
+                let pixel_col = (x & 7) as u8;
                 let scrolled_col = pixel_col + self.x;
                 let (tile_cx, tile_nt, tile_fx) = if scrolled_col >= 8 {
                     // Need the next tile
@@ -477,8 +487,8 @@ impl Ppu {
 
                     if pixel_value != 0 {
                         // Attribute table lookup using scroll coordinates
-                        let attr_x = tile_cx / 4;
-                        let attr_y = coarse_y / 4;
+                        let attr_x = tile_cx >> 2;
+                        let attr_y = coarse_y >> 2;
                         let attr_offset = 960 + attr_y * 8 + attr_x;
                         let attr_byte = if attr_offset < 1024 {
                             self.nametable[physical_nt][attr_offset]
@@ -486,8 +496,8 @@ impl Ppu {
                             0
                         };
 
-                        let block_x = (tile_cx % 4) / 2;
-                        let block_y = (coarse_y % 4) / 2;
+                        let block_x = (tile_cx & 3) >> 1;
+                        let block_y = (coarse_y & 3) >> 1;
                         let shift = (block_y * 2 + block_x) * 2;
                         let palette_num = (attr_byte >> shift) & 0x03;
 
@@ -531,147 +541,127 @@ impl Ppu {
 
         let pixel_index = ((y as usize * 256) + x as usize) * 3;
 
-        if pixel_index + 2 < self.buffer.len() {
-            let mut masked_color = final_color & 0x3F;
-            if self.mask.contains(PpuMask::GRAYSCALE) {
-                masked_color &= 0x30;
-            }
-            let color = PALETTE_COLORS[masked_color as usize];
-            self.buffer[pixel_index] = color.0;
-            self.buffer[pixel_index + 1] = color.1;
-            self.buffer[pixel_index + 2] = color.2;
+        let mut masked_color = final_color & 0x3F;
+        if self.mask.contains(PpuMask::GRAYSCALE) {
+            masked_color &= 0x30;
         }
+        let color = PALETTE_COLORS[masked_color as usize];
+        // Safety: x is 0..255 and y is 0..239 (guarded above), buffer is 256*240*3
+        let dest = &mut self.buffer[pixel_index..pixel_index + 3];
+        dest[0] = color.0;
+        dest[1] = color.1;
+        dest[2] = color.2;
     }
 
-    fn evaluate_sprites(&mut self) {
+    fn evaluate_scanline_sprites(&mut self, _cartridge: Option<&crate::cartridge::Cartridge>) {
+        self.scanline_sprite_count = 0;
         if self.scanline < 0 || self.scanline >= 240 {
             return;
         }
 
-        let sprite_height = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
+        let sprite_height: u16 = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
         let current_scanline = self.scanline as u16;
-        let mut sprites_on_scanline = 0;
 
-        for sprite_idx in 0..64 {
-            let oam_offset = sprite_idx * 4;
-            let sprite_y = self.oam[oam_offset];
+        for sprite_num in 0u8..64 {
+            let base = sprite_num as usize * 4;
+            let sprite_y = self.oam[base];
 
-            if sprite_y >= 0xEF {
-                continue;
-            }
+            if sprite_y >= 0xEF { continue; }
 
-            // OAM Y is scanline - 1
             let sprite_top = sprite_y as u16 + 1;
-            let sprite_bottom = sprite_top + sprite_height as u16;
+            let sprite_bottom = sprite_top + sprite_height;
 
             if current_scanline >= sprite_top && current_scanline < sprite_bottom {
-                sprites_on_scanline += 1;
-
-                if sprites_on_scanline > 8 {
+                let idx = self.scanline_sprite_count as usize;
+                if idx >= 8 {
                     self.status.insert(PpuStatus::SPRITE_OVERFLOW);
                     break;
                 }
+                self.scanline_sprites[idx] = (
+                    sprite_num,
+                    sprite_y,
+                    self.oam[base + 1],
+                    self.oam[base + 2],
+                    self.oam[base + 3],
+                );
+                self.scanline_sprite_count += 1;
             }
         }
     }
 
+    #[inline]
     fn render_sprites(&self, x: u8, y: u8, cartridge: Option<&crate::cartridge::Cartridge>, sprite_0_hit: &mut bool) -> Option<(u8, bool)> {
         if let Some(cart) = cartridge {
-            // Check all 64 sprites but limit to 8 per scanline (hardware limit)
-            let mut sprites_on_scanline = 0;
-            for sprite_num in 0..64 {
-                let base = sprite_num * 4;
-                if base + 3 >= 256 { break; }
+            let sprite_size: u8 = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
+            let count = self.scanline_sprite_count as usize;
 
-                let sprite_y = self.oam[base];
-                let tile_id = self.oam[base + 1];
-                let attributes = self.oam[base + 2];
-                let sprite_x = self.oam[base + 3];
+            for i in 0..count {
+                let (sprite_num, sprite_y, tile_id, attributes, sprite_x) = self.scanline_sprites[i];
 
-                // Skip off-screen sprites
-                if sprite_y >= 0xEF { continue; }
+                // Check if pixel is within sprite horizontal bounds
+                if x < sprite_x || (x as u16) >= sprite_x as u16 + 8 {
+                    continue;
+                }
 
-                let sprite_size = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
-
-                // NES OAM Y is "scanline - 1": sprite with Y=N appears on scanline N+1
                 let sprite_top = sprite_y as u16 + 1;
-                let sprite_bottom = sprite_top + sprite_size as u16;
+                let mut pixel_x = x - sprite_x;
+                let mut pixel_y = (y as u16 - sprite_top) as u8;
 
-                // Check if sprite is on current scanline
-                if (y as u16) >= sprite_top && (y as u16) < sprite_bottom {
-                    sprites_on_scanline += 1;
+                // Handle horizontal flip
+                if attributes & 0x40 != 0 {
+                    pixel_x = 7 - pixel_x;
+                }
 
-                    // NES hardware limit: max 8 sprites per scanline
-                    if sprites_on_scanline > 8 {
-                        break;
-                    }
+                // Handle vertical flip
+                if attributes & 0x80 != 0 {
+                    pixel_y = (sprite_size - 1) - pixel_y;
+                }
 
-                    // Check if pixel is within sprite horizontal bounds
-                    if x >= sprite_x && (x as u16) < sprite_x as u16 + 8 {
+                // Calculate pattern table address
+                let (pattern_table, actual_tile_id) = if sprite_size == 16 {
+                    let pattern_table: u16 = if tile_id & 0x01 != 0 { 0x1000 } else { 0x0000 };
+                    let actual_tile_id = tile_id & 0xFE;
+                    (pattern_table, actual_tile_id)
+                } else {
+                    let pattern_table: u16 = if self.control.contains(PpuControl::SPRITE_PATTERN) { 0x1000 } else { 0x0000 };
+                    (pattern_table, tile_id)
+                };
 
-                    let mut pixel_x = x - sprite_x;
-                    let mut pixel_y = (y as u16 - sprite_top) as u8;
-                    
-                    // Handle horizontal flip
-                    if attributes & 0x40 != 0 {
-                        pixel_x = 7 - pixel_x;
-                    }
-                    
-                    // Handle vertical flip
-                    if attributes & 0x80 != 0 {
-                        pixel_y = (sprite_size - 1) - pixel_y;
-                    }
-                    
-                    // Calculate pattern table address
-                    let (pattern_table, actual_tile_id) = if sprite_size == 16 {
-                        // 8x16 sprites: bit 0 of tile_id selects pattern table
-                        let pattern_table = if tile_id & 0x01 != 0 { 0x1000 } else { 0x0000 };
-                        let actual_tile_id = tile_id & 0xFE; // Use even tile number
-                        (pattern_table, actual_tile_id)
-                    } else {
-                        // 8x8 sprites: use control register
-                        let pattern_table = if self.control.contains(PpuControl::SPRITE_PATTERN) { 0x1000 } else { 0x0000 };
-                        (pattern_table, tile_id)
-                    };
-                    
-                    // For 8x16 sprites, select top or bottom half
-                    let final_tile_id = if sprite_size == 16 && pixel_y >= 8 {
-                        actual_tile_id + 1
-                    } else {
-                        actual_tile_id
-                    };
-                    
-                    let pattern_fine_y = (pixel_y % 8) as u16;
-                    let tile_addr = pattern_table + (final_tile_id as u16 * 16) + pattern_fine_y;
-                    
-                    // Read pattern data
-                    if tile_addr + 8 < 0x2000 {
-                        // Use cartridge's sprite-specific CHR read
-                        let low_byte = cart.read_chr(tile_addr);
-                        let high_byte = cart.read_chr(tile_addr + 8);
-                        let pixel_bit = 7 - pixel_x;
-                        let low_bit = (low_byte >> pixel_bit) & 1;
-                        let high_bit = (high_byte >> pixel_bit) & 1;
-                        let pixel_value = (high_bit << 1) | low_bit;
-                        
-                        if pixel_value != 0 {
-                            if sprite_num == 0 && x != 255 {
-                                *sprite_0_hit = true;
-                            }
+                // For 8x16 sprites, select top or bottom half
+                let final_tile_id = if sprite_size == 16 && pixel_y >= 8 {
+                    actual_tile_id + 1
+                } else {
+                    actual_tile_id
+                };
 
-                            let palette_num = attributes & 0x03;
-                            let palette_idx = 16 + palette_num * 4 + pixel_value;
+                let pattern_fine_y = (pixel_y & 7) as u16;
+                let tile_addr = pattern_table + (final_tile_id as u16 * 16) + pattern_fine_y;
 
-                            let color_index = if (palette_idx as usize) < 32 {
-                                self.palette[palette_idx as usize]
-                            } else {
-                                self.palette[16]
-                            };
+                // Read pattern data
+                if tile_addr + 8 < 0x2000 {
+                    let low_byte = cart.read_chr(tile_addr);
+                    let high_byte = cart.read_chr(tile_addr + 8);
+                    let pixel_bit = 7 - pixel_x;
+                    let low_bit = (low_byte >> pixel_bit) & 1;
+                    let high_bit = (high_byte >> pixel_bit) & 1;
+                    let pixel_value = (high_bit << 1) | low_bit;
 
-                            let priority_behind_bg = (attributes & 0x20) != 0;
-                            return Some((color_index, priority_behind_bg));
+                    if pixel_value != 0 {
+                        if sprite_num == 0 && x != 255 {
+                            *sprite_0_hit = true;
                         }
-                    }
+
+                        let palette_num = attributes & 0x03;
+                        let palette_idx = 16 + palette_num * 4 + pixel_value;
+
+                        let color_index = if (palette_idx as usize) < 32 {
+                            self.palette[palette_idx as usize]
+                        } else {
+                            self.palette[16]
+                        };
+
+                        let priority_behind_bg = (attributes & 0x20) != 0;
+                        return Some((color_index, priority_behind_bg));
                     }
                 }
             }
@@ -715,9 +705,9 @@ impl Ppu {
                     let nt_addr = (self.v & 0x2FFF) as usize;
                     if nt_addr >= 0x2000 {
                         let offset_in_nt = nt_addr - 0x2000;
-                        let logical_nt = (offset_in_nt / 0x400) % 4;
+                        let logical_nt = (offset_in_nt >> 10) & 3;
                         let table = self.resolve_nametable(logical_nt, cartridge);
-                        let offset = offset_in_nt % 0x400;
+                        let offset = offset_in_nt & 0x3FF;
                         self.read_buffer = if offset < 1024 {
                             self.nametable[table][offset]
                         } else {
@@ -738,9 +728,9 @@ impl Ppu {
                     if effective_v >= 0x2000 && effective_v < 0x3000 {
                         // Nametable read with proper mirroring
                         let addr = (effective_v - 0x2000) as usize;
-                        let logical_nt = (addr / 0x400) % 4;
+                        let logical_nt = (addr >> 10) & 3;
                         let table = self.resolve_nametable(logical_nt, cartridge);
-                        let offset = addr % 0x400;
+                        let offset = addr & 0x3FF;
                         self.read_buffer = if offset < 1024 {
                             self.nametable[table][offset]
                         } else {
@@ -788,6 +778,8 @@ impl Ppu {
             }
             0x2001 => {
                 self.mask = PpuMask::from_bits_truncate(data);
+                self.rendering_enabled = self.mask.contains(PpuMask::BG_ENABLE)
+                    || self.mask.contains(PpuMask::SPRITE_ENABLE);
             }
             0x2003 => {
                 self.oam_addr = data;
@@ -836,8 +828,8 @@ impl Ppu {
                 } else if write_v >= 0x2000 && write_v < 0x3000 {
                     // Nametable write
                     let addr = (write_v - 0x2000) as usize;
-                    let nt_index = (addr / 0x400) % 4;
-                    let offset = addr % 0x400;
+                    let nt_index = (addr >> 10) & 3;
+                    let offset = addr & 0x3FF;
 
                     if offset < 1024 {
                         let physical_nt = if let Some(cart) = cartridge {
@@ -852,12 +844,12 @@ impl Ppu {
                                     2 | 3 => 1,
                                     _ => 0,
                                 },
-                                crate::cartridge::Mirroring::FourScreen => nt_index % 2,
+                                crate::cartridge::Mirroring::FourScreen => nt_index & 1,
                                 crate::cartridge::Mirroring::OneScreenLower => 0,
                                 crate::cartridge::Mirroring::OneScreenUpper => 1,
                             }
                         } else {
-                            nt_index % 2
+                            nt_index & 1
                         };
 
                         self.nametable[physical_nt][offset] = data;

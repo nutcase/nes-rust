@@ -35,14 +35,9 @@ impl Bus {
         self.cartridge = Some(cartridge);
     }
 
+    #[inline]
     pub fn step_ppu(&mut self) -> bool {
-        let chr_data = if let Some(ref cartridge) = self.cartridge {
-            Some(cartridge)
-        } else {
-            None
-        };
-
-        self.ppu.step(chr_data)
+        self.ppu.step(self.cartridge.as_ref())
     }
 
     // New tick method for fine-grained synchronization (similar to reference emulator)

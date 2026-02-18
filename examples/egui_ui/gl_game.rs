@@ -112,16 +112,19 @@ impl GlGameRenderer {
     /// Upload an RGB24 frame buffer (NES format: 256x240x3 bytes).
     pub fn upload_frame_rgb24(&mut self, frame: &[u8], w: usize, h: usize) {
         let pixel_count = w * h;
-        self.rgba_buf.resize(pixel_count * 4, 0xFF);
+        let rgba_len = pixel_count * 4;
+        // Allocate only once; subsequent frames reuse the same buffer
+        if self.rgba_buf.len() != rgba_len {
+            self.rgba_buf.resize(rgba_len, 0xFF);
+        }
+        // Bounds are guaranteed: frame.len() == pixel_count * 3, rgba_buf.len() == pixel_count * 4
         for i in 0..pixel_count {
             let src = i * 3;
             let dst = i * 4;
-            if src + 2 < frame.len() {
-                self.rgba_buf[dst] = frame[src];
-                self.rgba_buf[dst + 1] = frame[src + 1];
-                self.rgba_buf[dst + 2] = frame[src + 2];
-                // alpha stays 0xFF from resize
-            }
+            self.rgba_buf[dst] = frame[src];
+            self.rgba_buf[dst + 1] = frame[src + 1];
+            self.rgba_buf[dst + 2] = frame[src + 2];
+            // alpha stays 0xFF from initial resize
         }
 
         unsafe {

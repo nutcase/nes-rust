@@ -133,6 +133,7 @@ impl Cartridge {
         }
     }
 
+    #[inline]
     pub fn read_chr(&self, addr: u16) -> u8 {
         match self.mapper {
             0 => self.read_chr_nrom(addr),

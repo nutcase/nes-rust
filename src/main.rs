@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use nes_emulator::Nes;
@@ -113,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples: Some(4096), // buffer size
     };
 
-    let audio_buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let audio_buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
     let audio_buffer_clone = audio_buffer.clone();
 
     let audio_device = audio_subsystem.open_playback(None, &desired_spec, |_spec| {
@@ -225,10 +226,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let audio_samples = nes.get_audio_buffer();
         if !audio_samples.is_empty() {
             if let Ok(mut buffer) = audio_buffer.lock() {
-                buffer.extend(audio_samples);
+                buffer.extend(audio_samples.iter());
                 // More conservative buffer management to prevent audio drops
                 if buffer.len() > 8192 {
-                    buffer.drain(0..2048);
+                    drop(buffer.drain(0..2048));
                 }
             }
         }
@@ -279,7 +280,7 @@ fn unmap_key_from_controller(key: Keycode, current: u8) -> u8 {
 }
 
 struct NesAudioCallback {
-    audio_buffer: Arc<Mutex<Vec<f32>>>,
+    audio_buffer: Arc<Mutex<VecDeque<f32>>>,
     phase: f32,
 }
 
@@ -289,8 +290,7 @@ impl AudioCallback for NesAudioCallback {
     fn callback(&mut self, out: &mut [f32]) {
         if let Ok(mut buffer) = self.audio_buffer.lock() {
             for sample in out.iter_mut() {
-                if !buffer.is_empty() {
-                    let audio_sample = buffer.remove(0);
+                if let Some(audio_sample) = buffer.pop_front() {
                     *sample = audio_sample;
                     self.phase = audio_sample;
                 } else {

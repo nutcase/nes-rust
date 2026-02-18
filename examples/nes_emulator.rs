@@ -6,7 +6,7 @@ use nes_emulator::Nes;
 use sdl2::audio::{AudioCallback, AudioSpecDesired};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -74,7 +74,7 @@ fn main() -> Result<(), String> {
         samples: Some(4096),
     };
 
-    let audio_buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let audio_buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
     let audio_buffer_clone = audio_buffer.clone();
     let audio_device = audio_subsystem
         .open_playback(None, &desired_audio, |_spec| NesAudioCallback {
@@ -264,9 +264,9 @@ fn main() -> Result<(), String> {
         let audio_samples = nes.get_audio_buffer();
         if !audio_samples.is_empty() {
             if let Ok(mut buffer) = audio_buffer.lock() {
-                buffer.extend(audio_samples);
+                buffer.extend(audio_samples.iter());
                 if buffer.len() > 8192 {
-                    buffer.drain(0..2048);
+                    drop(buffer.drain(0..2048));
                 }
             }
         }
@@ -301,12 +301,8 @@ fn main() -> Result<(), String> {
             ));
 
             let mut ram_writes: Vec<(usize, u8)> = Vec::new();
-            // Build combined RAM buffer: cpu_ram ++ prg_ram
-            let mut combined_ram = nes.ram().to_vec();
-            if let Some(sram) = nes.prg_ram() {
-                combined_ram.extend_from_slice(sram);
-            }
-            let live_ram = &combined_ram;
+            // Reuse persistent combined RAM buffer
+            cheat_ui.update_combined_ram(nes.ram(), nes.prg_ram());
 
             let full_output = egui_ctx.run(egui_state.input.take(), |ctx| {
                 let panel_resp = egui::SidePanel::right("cheat_panel")
@@ -320,7 +316,6 @@ fn main() -> Result<(), String> {
                                 cheat_ui.show_panel(
                                     ui,
                                     &mut ram_writes,
-                                    live_ram,
                                     Some(&cheat_path),
                                 );
                             });
@@ -451,7 +446,7 @@ fn select_rom() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 struct NesAudioCallback {
-    audio_buffer: Arc<Mutex<Vec<f32>>>,
+    audio_buffer: Arc<Mutex<VecDeque<f32>>>,
     phase: f32,
 }
 
@@ -461,8 +456,7 @@ impl AudioCallback for NesAudioCallback {
     fn callback(&mut self, out: &mut [f32]) {
         if let Ok(mut buffer) = self.audio_buffer.lock() {
             for sample in out.iter_mut() {
-                if !buffer.is_empty() {
-                    let audio_sample = buffer.remove(0);
+                if let Some(audio_sample) = buffer.pop_front() {
                     *sample = audio_sample;
                     self.phase = audio_sample;
                 } else {

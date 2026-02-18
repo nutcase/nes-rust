@@ -22,6 +22,8 @@ pub struct CheatToolUi {
     pub refresh_requested: bool,
     /// When true, emulation is paused (no ticks).
     pub paused: bool,
+    /// Reusable combined RAM buffer (cpu_ram ++ prg_ram) to avoid per-frame allocation.
+    pub combined_ram: Vec<u8>,
 }
 
 impl CheatToolUi {
@@ -34,6 +36,7 @@ impl CheatToolUi {
             ram_snapshot: vec![0u8; 0x800],
             refresh_requested: false,
             paused: false,
+            combined_ram: Vec::new(),
         }
     }
 
@@ -48,11 +51,19 @@ impl CheatToolUi {
         self.hex_viewer.update_prev(&prev);
     }
 
+    /// Update the reusable combined RAM buffer with current cpu_ram ++ prg_ram.
+    pub fn update_combined_ram(&mut self, cpu_ram: &[u8], prg_ram: Option<&[u8]>) {
+        self.combined_ram.clear();
+        self.combined_ram.extend_from_slice(cpu_ram);
+        if let Some(sram) = prg_ram {
+            self.combined_ram.extend_from_slice(sram);
+        }
+    }
+
     pub fn show_panel(
         &mut self,
         ui: &mut egui::Ui,
         ram_writes: &mut Vec<(usize, u8)>,
-        live_ram: &[u8],
         cheat_path: Option<&std::path::Path>,
     ) {
         ui.horizontal(|ui| {
@@ -76,7 +87,8 @@ impl CheatToolUi {
                 self.hex_viewer.show(ui, snap, ram_writes);
             }
             ActiveTab::CheatSearch => {
-                self.cheat_search_ui.show(ui, live_ram, cheat_path);
+                let ram = &self.combined_ram;
+                self.cheat_search_ui.show(ui, ram, cheat_path);
             }
         }
     }

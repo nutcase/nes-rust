@@ -288,9 +288,7 @@ impl Apu {
     }
 
     pub fn get_audio_buffer(&mut self) -> Vec<f32> {
-        let buffer = self.output_buffer.clone();
-        self.output_buffer.clear();
-        buffer
+        std::mem::take(&mut self.output_buffer)
     }
 
     pub fn frame_irq_pending(&self) -> bool {
@@ -536,14 +534,14 @@ impl PulseChannel {
             return 0.0;
         }
 
-        let duty_table: [[u8; 8]; 4] = [
+        const DUTY_TABLE: [[u8; 8]; 4] = [
             [0, 1, 0, 0, 0, 0, 0, 0], // 12.5%
             [0, 1, 1, 0, 0, 0, 0, 0], // 25%
             [0, 1, 1, 1, 1, 0, 0, 0], // 50%
             [1, 0, 0, 1, 1, 1, 1, 1], // 75%
         ];
 
-        if duty_table[self.duty as usize][self.duty_counter as usize] == 0 {
+        if DUTY_TABLE[self.duty as usize][self.duty_counter as usize] == 0 {
             return 0.0;
         }
 
@@ -622,12 +620,12 @@ impl TriangleChannel {
             return 0.0;
         }
 
-        let triangle_sequence: [u8; 32] = [
+        const TRIANGLE_SEQUENCE: [u8; 32] = [
             15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
         ];
 
-        triangle_sequence[self.sequence_counter as usize] as f32
+        TRIANGLE_SEQUENCE[self.sequence_counter as usize] as f32
     }
 }
 

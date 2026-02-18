@@ -1004,18 +1004,21 @@ impl Cpu {
         }
     }
 
+    #[inline]
     fn read_byte(&mut self, bus: &mut dyn CpuBus) -> u8 {
         let byte = bus.read(self.pc);
         self.pc = self.pc.wrapping_add(1);
         byte
     }
 
+    #[inline]
     fn read_word(&mut self, bus: &mut dyn CpuBus) -> u16 {
         let low = self.read_byte(bus) as u16;
         let high = self.read_byte(bus) as u16;
         (high << 8) | low
     }
 
+    #[inline]
     fn push(&mut self, bus: &mut dyn CpuBus, value: u8) {
         // Push to stack
         let addr = 0x0100 | self.sp as u16;
@@ -1023,6 +1026,7 @@ impl Cpu {
         self.sp = self.sp.wrapping_sub(1);
     }
 
+    #[inline]
     fn pull(&mut self, bus: &mut dyn CpuBus) -> u8 {
         // Pull from stack
         self.sp = self.sp.wrapping_add(1);
@@ -1031,11 +1035,13 @@ impl Cpu {
         value
     }
 
+    #[inline]
     fn set_zero_negative_flags(&mut self, value: u8) {
         self.status.set(StatusFlags::ZERO, value == 0);
         self.status.set(StatusFlags::NEGATIVE, value & 0x80 != 0);
     }
 
+    #[inline]
     fn branch(&mut self, bus: &mut dyn CpuBus, condition: bool) -> u8 {
         // Branch instructions: read offset byte and conditionally branch
         let branch_pc = self.pc.wrapping_sub(1); // PC where branch instruction was located
