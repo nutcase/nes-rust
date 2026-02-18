@@ -936,17 +936,57 @@ impl Ppu {
     
     
     
+    // Save state getters (registers)
+    pub fn get_t(&self) -> u16 { self.t }
+    pub fn get_x_scroll(&self) -> u8 { self.x }
+    pub fn get_w(&self) -> bool { self.w }
+    pub fn get_scanline(&self) -> i16 { self.scanline }
+    pub fn get_cycle(&self) -> u16 { self.cycle }
+    pub fn get_frame(&self) -> u64 { self.frame }
+    pub fn get_read_buffer(&self) -> u8 { self.read_buffer }
+
     // Save state setters
     pub fn set_palette(&mut self, palette: [u8; 32]) {
         self.palette = palette;
     }
-    
+
     pub fn set_nametable(&mut self, nametable: [[u8; 1024]; 2]) {
         self.nametable = nametable;
     }
-    
+
     pub fn set_oam(&mut self, oam: [u8; 256]) {
         self.oam = oam;
+    }
+
+    pub fn restore_registers(
+        &mut self,
+        control: u8,
+        mask: u8,
+        status: u8,
+        oam_addr: u8,
+        v: u16,
+        t: u16,
+        x: u8,
+        w: bool,
+        scanline: i16,
+        cycle: u16,
+        frame: u64,
+        read_buffer: u8,
+    ) {
+        self.control = PpuControl::from_bits_truncate(control);
+        self.mask = PpuMask::from_bits_truncate(mask);
+        self.rendering_enabled = self.mask.contains(PpuMask::BG_ENABLE)
+            || self.mask.contains(PpuMask::SPRITE_ENABLE);
+        self.status = PpuStatus::from_bits_truncate(status);
+        self.oam_addr = oam_addr;
+        self.v = v;
+        self.t = t;
+        self.x = x;
+        self.w = w;
+        self.scanline = scanline;
+        self.cycle = cycle;
+        self.frame = frame;
+        self.read_buffer = read_buffer;
     }
 
     pub fn write_oam_data(&mut self, addr: u8, data: u8) {

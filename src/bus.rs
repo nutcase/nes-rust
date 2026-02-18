@@ -299,6 +299,19 @@ impl Bus {
         )
     }
 
+    pub fn get_ppu_registers(&self) -> (u16, u16, u8, bool, i16, u16, u64, u8) {
+        (
+            self.ppu.get_vram_addr(),
+            self.ppu.get_t(),
+            self.ppu.get_x_scroll(),
+            self.ppu.get_w(),
+            self.ppu.get_scanline(),
+            self.ppu.get_cycle(),
+            self.ppu.get_frame(),
+            self.ppu.get_read_buffer(),
+        )
+    }
+
     pub fn get_ppu_palette(&self) -> [u8; 32] {
         self.ppu.get_palette()
     }
@@ -343,6 +356,7 @@ impl Bus {
         ram: impl AsRef<[u8]>,
         prg_bank: u8,
         chr_bank: u8,
+        ppu_regs: Option<(u8, u8, u8, u8, u16, u16, u8, bool, i16, u16, u64, u8)>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let ram = ram.as_ref();
         let palette = palette.as_ref();
@@ -376,6 +390,11 @@ impl Bus {
             let mut oam_array = [0u8; 256];
             oam_array.copy_from_slice(&oam[..256]);
             self.ppu.set_oam(oam_array);
+        }
+
+        // Restore PPU registers
+        if let Some((control, mask, status, oam_addr, v, t, x, w, scanline, cycle, frame, read_buf)) = ppu_regs {
+            self.ppu.restore_registers(control, mask, status, oam_addr, v, t, x, w, scanline, cycle, frame, read_buf);
         }
 
         // Restore cartridge bank state

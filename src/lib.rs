@@ -128,6 +128,10 @@ impl Nes {
     }
 
     pub fn save_state(&self, slot: u8, rom_filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (ppu_control, ppu_mask, ppu_status, ppu_oam_addr) = self.bus.get_ppu_state();
+        let (ppu_v, ppu_t, ppu_x, ppu_w, ppu_scanline, ppu_cycle, ppu_frame, ppu_data_buffer) =
+            self.bus.get_ppu_registers();
+
         let save_state = save_state::SaveState {
             cpu_a: self.cpu.a,
             cpu_x: self.cpu.x,
@@ -136,21 +140,21 @@ impl Nes {
             cpu_sp: self.cpu.sp,
             cpu_status: self.cpu.status.bits(),
             cpu_cycles: 0,
-            ppu_control: self.bus.get_ppu_state().0,
-            ppu_mask: self.bus.get_ppu_state().1,
-            ppu_status: self.bus.get_ppu_state().2,
-            ppu_oam_addr: self.bus.get_ppu_state().3,
+            ppu_control,
+            ppu_mask,
+            ppu_status,
+            ppu_oam_addr,
             ppu_scroll_x: 0,
             ppu_scroll_y: 0,
-            ppu_addr: 0,
-            ppu_data_buffer: 0,
-            ppu_w: false,
-            ppu_t: 0,
-            ppu_v: 0,
-            ppu_x: 0,
-            ppu_scanline: 0,
-            ppu_cycle: 0,
-            ppu_frame: 0,
+            ppu_addr: ppu_v,
+            ppu_data_buffer,
+            ppu_w,
+            ppu_t,
+            ppu_v,
+            ppu_x,
+            ppu_scanline,
+            ppu_cycle,
+            ppu_frame,
             ppu_palette: self.bus.get_ppu_palette(),
             ppu_nametable: self.bus.get_ppu_nametables_flat(),
             ppu_oam: self.bus.get_ppu_oam_flat(),
@@ -188,6 +192,20 @@ impl Nes {
             save_state.ram,
             save_state.cartridge_prg_bank,
             save_state.cartridge_chr_bank,
+            Some((
+                save_state.ppu_control,
+                save_state.ppu_mask,
+                save_state.ppu_status,
+                save_state.ppu_oam_addr,
+                save_state.ppu_v,
+                save_state.ppu_t,
+                save_state.ppu_x,
+                save_state.ppu_w,
+                save_state.ppu_scanline,
+                save_state.ppu_cycle,
+                save_state.ppu_frame,
+                save_state.ppu_data_buffer,
+            )),
         )?;
 
         Ok(())
