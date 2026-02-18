@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let desired_spec = sdl2::audio::AudioSpecDesired {
         freq: Some(44100),
         channels: Some(1), // mono
-        samples: Some(4096), // buffer size
+        samples: Some(1024), // smaller buffer for lower latency
     };
 
     let audio_buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -222,14 +222,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             buffer.copy_from_slice(frame_buffer);
         })?;
 
-        // Update audio buffer with improved buffering
+        // Update audio buffer
         let audio_samples = nes.get_audio_buffer();
         if !audio_samples.is_empty() {
             if let Ok(mut buffer) = audio_buffer.lock() {
                 buffer.extend(audio_samples.iter());
-                // More conservative buffer management to prevent audio drops
-                if buffer.len() > 8192 {
-                    drop(buffer.drain(0..2048));
+                // Keep buffer bounded: discard oldest samples beyond target
+                const MAX_BUFFER: usize = 4096;
+                if buffer.len() > MAX_BUFFER {
+                    let excess = buffer.len() - MAX_BUFFER;
+                    drop(buffer.drain(..excess));
                 }
             }
         }
@@ -289,19 +291,23 @@ impl AudioCallback for NesAudioCallback {
 
     fn callback(&mut self, out: &mut [f32]) {
         if let Ok(mut buffer) = self.audio_buffer.lock() {
-            for sample in out.iter_mut() {
-                if let Some(audio_sample) = buffer.pop_front() {
-                    *sample = audio_sample;
-                    self.phase = audio_sample;
-                } else {
-                    // Gradually fade to silence to avoid clicks
-                    self.phase *= 0.98;
-                    *sample = self.phase;
-                }
+            // Bulk drain into a local slice to release the lock quickly
+            let available = buffer.len().min(out.len());
+            for (i, sample) in out[..available].iter_mut().enumerate() {
+                let audio_sample = buffer[i];
+                *sample = audio_sample;
+                self.phase = audio_sample;
+            }
+            drop(buffer.drain(..available));
+
+            // Fill remaining with smooth decay (underrun)
+            for sample in out[available..].iter_mut() {
+                self.phase *= 0.995;
+                *sample = self.phase;
             }
         } else {
             for sample in out.iter_mut() {
-                self.phase *= 0.98;
+                self.phase *= 0.995;
                 *sample = self.phase;
             }
         }

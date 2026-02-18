@@ -220,10 +220,6 @@ impl Apu {
             self.sample_counter -= self.cpu_clock_rate;
             let sample = self.mix_output();
             self.output_buffer.push(sample);
-
-            if self.output_buffer.len() > 8192 {
-                self.output_buffer.drain(0..4096);
-            }
         }
     }
 
@@ -288,7 +284,8 @@ impl Apu {
     }
 
     pub fn get_audio_buffer(&mut self) -> Vec<f32> {
-        std::mem::take(&mut self.output_buffer)
+        // drain preserves Vec capacity, avoiding reallocation every frame
+        self.output_buffer.drain(..).collect()
     }
 
     pub fn frame_irq_pending(&self) -> bool {
