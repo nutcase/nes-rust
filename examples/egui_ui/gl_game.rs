@@ -73,7 +73,14 @@ impl GlGameRenderer {
             let stride = 4 * std::mem::size_of::<f32>() as GLsizei;
             let a_pos = gl::GetAttribLocation(program, c_str("a_pos").as_ptr());
             gl::EnableVertexAttribArray(a_pos as GLuint);
-            gl::VertexAttribPointer(a_pos as GLuint, 2, gl::FLOAT, gl::FALSE, stride, ptr::null());
+            gl::VertexAttribPointer(
+                a_pos as GLuint,
+                2,
+                gl::FLOAT,
+                gl::FALSE,
+                stride,
+                ptr::null(),
+            );
 
             let a_uv = gl::GetAttribLocation(program, c_str("a_uv").as_ptr());
             gl::EnableVertexAttribArray(a_uv as GLuint);
@@ -93,8 +100,16 @@ impl GlGameRenderer {
             gl::BindTexture(gl::TEXTURE_2D, texture);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as GLint);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as GLint);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as GLint);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as GLint);
+            gl::TexParameteri(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_WRAP_S,
+                gl::CLAMP_TO_EDGE as GLint,
+            );
+            gl::TexParameteri(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_WRAP_T,
+                gl::CLAMP_TO_EDGE as GLint,
+            );
             gl::BindTexture(gl::TEXTURE_2D, 0);
 
             Self {

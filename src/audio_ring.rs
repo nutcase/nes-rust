@@ -53,7 +53,9 @@ impl SpscRingBuffer {
             if next == head {
                 break;
             }
-            unsafe { *self.buffer[tail].get() = sample; }
+            unsafe {
+                *self.buffer[tail].get() = sample;
+            }
             tail = next;
             count += 1;
         }
@@ -88,7 +90,8 @@ impl SpscRingBuffer {
         let head = self.head.load(Ordering::Relaxed);
         let available = self.len();
         let skip = n.min(available);
-        self.head.store((head + skip) & self.mask, Ordering::Release);
+        self.head
+            .store((head + skip) & self.mask, Ordering::Release);
     }
 }
 

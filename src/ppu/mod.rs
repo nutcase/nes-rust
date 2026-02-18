@@ -5,14 +5,70 @@ mod tests;
 
 // NES Color Palette (RGB values)
 const PALETTE_COLORS: [(u8, u8, u8); 64] = [
-    (84, 84, 84), (0, 30, 116), (8, 16, 144), (48, 0, 136), (68, 0, 100), (92, 0, 48), (84, 4, 0), (60, 24, 0),
-    (32, 42, 0), (8, 58, 0), (0, 64, 0), (0, 60, 0), (0, 50, 60), (0, 0, 0), (0, 0, 0), (0, 0, 0),
-    (152, 150, 152), (8, 76, 196), (48, 50, 236), (92, 30, 228), (136, 20, 176), (160, 20, 100), (152, 34, 32), (120, 60, 0),
-    (84, 90, 0), (40, 114, 0), (8, 124, 0), (0, 118, 40), (0, 102, 120), (0, 0, 0), (0, 0, 0), (0, 0, 0),
-    (236, 238, 236), (76, 154, 236), (120, 124, 236), (176, 98, 236), (228, 84, 236), (236, 88, 180), (236, 106, 100), (212, 136, 32),
-    (160, 170, 0), (116, 196, 0), (76, 208, 32), (56, 204, 108), (56, 180, 204), (60, 60, 60), (0, 0, 0), (0, 0, 0),
-    (236, 238, 236), (168, 204, 236), (188, 188, 236), (212, 178, 236), (236, 174, 236), (236, 174, 212), (236, 180, 176), (228, 196, 144),
-    (204, 210, 120), (180, 222, 120), (168, 226, 144), (152, 226, 180), (160, 214, 228), (160, 162, 160), (0, 0, 0), (0, 0, 0),
+    (84, 84, 84),
+    (0, 30, 116),
+    (8, 16, 144),
+    (48, 0, 136),
+    (68, 0, 100),
+    (92, 0, 48),
+    (84, 4, 0),
+    (60, 24, 0),
+    (32, 42, 0),
+    (8, 58, 0),
+    (0, 64, 0),
+    (0, 60, 0),
+    (0, 50, 60),
+    (0, 0, 0),
+    (0, 0, 0),
+    (0, 0, 0),
+    (152, 150, 152),
+    (8, 76, 196),
+    (48, 50, 236),
+    (92, 30, 228),
+    (136, 20, 176),
+    (160, 20, 100),
+    (152, 34, 32),
+    (120, 60, 0),
+    (84, 90, 0),
+    (40, 114, 0),
+    (8, 124, 0),
+    (0, 118, 40),
+    (0, 102, 120),
+    (0, 0, 0),
+    (0, 0, 0),
+    (0, 0, 0),
+    (236, 238, 236),
+    (76, 154, 236),
+    (120, 124, 236),
+    (176, 98, 236),
+    (228, 84, 236),
+    (236, 88, 180),
+    (236, 106, 100),
+    (212, 136, 32),
+    (160, 170, 0),
+    (116, 196, 0),
+    (76, 208, 32),
+    (56, 204, 108),
+    (56, 180, 204),
+    (60, 60, 60),
+    (0, 0, 0),
+    (0, 0, 0),
+    (236, 238, 236),
+    (168, 204, 236),
+    (188, 188, 236),
+    (212, 178, 236),
+    (236, 174, 236),
+    (236, 174, 212),
+    (236, 180, 176),
+    (228, 196, 144),
+    (204, 210, 120),
+    (180, 222, 120),
+    (168, 226, 144),
+    (152, 226, 180),
+    (160, 214, 228),
+    (160, 162, 160),
+    (0, 0, 0),
+    (0, 0, 0),
 ];
 
 bitflags! {
@@ -57,77 +113,77 @@ pub struct Ppu {
     pub control: PpuControl,
     #[cfg(not(test))]
     control: PpuControl,
-    
+
     #[cfg(test)]
     pub mask: PpuMask,
     #[cfg(not(test))]
     mask: PpuMask,
-    
+
     #[cfg(test)]
     pub status: PpuStatus,
     #[cfg(not(test))]
     status: PpuStatus,
-    
+
     #[cfg(test)]
     pub oam_addr: u8,
     #[cfg(not(test))]
     oam_addr: u8,
-    
+
     #[cfg(test)]
     pub v: u16,
     #[cfg(not(test))]
     v: u16,
-    
+
     #[cfg(test)]
     pub t: u16,
     #[cfg(not(test))]
     t: u16,
-    
+
     #[cfg(test)]
     pub x: u8,
     #[cfg(not(test))]
     x: u8,
-    
+
     #[cfg(test)]
     pub w: bool,
     #[cfg(not(test))]
     w: bool,
-    
+
     #[cfg(test)]
     pub cycle: u16,
     #[cfg(not(test))]
     cycle: u16,
-    
+
     #[cfg(test)]
     pub scanline: i16,
     #[cfg(not(test))]
     scanline: i16,
-    
+
     frame: u64,
-    
+
     // Flag to preserve forced rendering from being overwritten (disabled for natural rendering)
     force_rendered_frame: bool,
-    
+
     #[cfg(test)]
     pub nametable: [[u8; 1024]; 2],
     #[cfg(not(test))]
     nametable: [[u8; 1024]; 2],
-    
+
     #[cfg(test)]
     pub palette: [u8; 32],
     #[cfg(not(test))]
     palette: [u8; 32],
-    
+
     #[cfg(test)]
     pub oam: [u8; 256],
     #[cfg(not(test))]
     oam: [u8; 256],
-    
+
     buffer: Vec<u8>,
-    
+
     // PPU $2007 read buffer for CHR-ROM reads
     read_buffer: u8,
-    
+
     // NMI suppression for race condition handling
     nmi_suppressed: bool,
 
@@ -157,21 +213,21 @@ impl Ppu {
             // Many games expect this for proper initialization
             status: PpuStatus::VBLANK,
             oam_addr: 0,
-            
+
             v: 0,
             t: 0,
             x: 0,
             w: false,
-            
+
             cycle: 0,
             scanline: -1,
             frame: 0,
             force_rendered_frame: false,
-            
+
             nametable: [[0; 1024]; 2],
             palette: [0x0F; 32], // Initialize with black (0x0F)
             oam: [0xFF; 256],    // Initialize OAM with 0xFF (sprites off-screen)
-            
+
             buffer: {
                 let mut buf = Vec::new();
                 // Initialize with dark background
@@ -214,7 +270,7 @@ impl Ppu {
                     self.status.remove(PpuStatus::SPRITE_0_HIT);
                     self.status.remove(PpuStatus::SPRITE_OVERFLOW);
                 }
-                
+
                 // Copy horizontal scroll bits from t to v at cycle 257
                 if self.cycle == 257 && self.rendering_enabled {
                     self.v = (self.v & !0x041F) | (self.t & 0x041F);
@@ -254,7 +310,7 @@ impl Ppu {
                 if self.cycle == 257 && self.rendering_enabled {
                     self.v = (self.v & !0x041F) | (self.t & 0x041F);
                 }
-                
+
                 // Removed automatic force rendering to fix frame synchronization issues
             }
             240 => {
@@ -284,9 +340,7 @@ impl Ppu {
 
         // Odd-frame cycle skip: on pre-render scanline of odd frames,
         // skip the last cycle (340) when rendering is enabled
-        let cycle_limit = if self.scanline == -1
-            && self.rendering_enabled
-            && (self.frame & 1) == 1
+        let cycle_limit = if self.scanline == -1 && self.rendering_enabled && (self.frame & 1) == 1
         {
             340
         } else {
@@ -317,7 +371,11 @@ impl Ppu {
                     let nametable_offset = tile_y * 32 + tile_x;
                     let tile_index = self.nametable[0][nametable_offset];
 
-                    let pattern_table_base = if self.control.contains(PpuControl::BG_PATTERN) { 0x1000 } else { 0x0000 };
+                    let pattern_table_base = if self.control.contains(PpuControl::BG_PATTERN) {
+                        0x1000
+                    } else {
+                        0x0000
+                    };
                     let tile_addr = pattern_table_base + (tile_index as u16) * 16;
 
                     let mut tile_data = [0u8; 16];
@@ -365,7 +423,11 @@ impl Ppu {
     // rendering_enabled is now a cached field updated on $2001 write
 
     #[inline]
-    fn resolve_nametable(&self, logical_nt: usize, cartridge: Option<&crate::cartridge::Cartridge>) -> usize {
+    fn resolve_nametable(
+        &self,
+        logical_nt: usize,
+        cartridge: Option<&crate::cartridge::Cartridge>,
+    ) -> usize {
         if let Some(cart) = cartridge {
             match cart.mirroring() {
                 crate::cartridge::Mirroring::Vertical => match logical_nt & 3 {
@@ -389,10 +451,12 @@ impl Ppu {
 
     #[inline]
     fn increment_coarse_x(&mut self) {
-        if !self.rendering_enabled { return; }
+        if !self.rendering_enabled {
+            return;
+        }
         if (self.v & 0x001F) == 31 {
-            self.v &= !0x001F;   // coarse X = 0
-            self.v ^= 0x0400;    // toggle horizontal nametable
+            self.v &= !0x001F; // coarse X = 0
+            self.v ^= 0x0400; // toggle horizontal nametable
         } else {
             self.v += 1;
         }
@@ -400,7 +464,9 @@ impl Ppu {
 
     #[inline]
     fn increment_y(&mut self) {
-        if !self.rendering_enabled { return; }
+        if !self.rendering_enabled {
+            return;
+        }
         if (self.v & 0x7000) != 0x7000 {
             // fine Y < 7, just increment
             self.v += 0x1000;
@@ -450,7 +516,11 @@ impl Ppu {
                 let (tile_cx, tile_nt, tile_fx) = if scrolled_col >= 8 {
                     // Need the next tile
                     let next_cx = if coarse_x == 31 { 0 } else { coarse_x + 1 };
-                    let next_nt = if coarse_x == 31 { logical_nt ^ 1 } else { logical_nt };
+                    let next_nt = if coarse_x == 31 {
+                        logical_nt ^ 1
+                    } else {
+                        logical_nt
+                    };
                     (next_cx, next_nt, scrolled_col - 8)
                 } else {
                     (coarse_x, logical_nt, scrolled_col)
@@ -464,7 +534,11 @@ impl Ppu {
                     0
                 };
 
-                let pattern_table = if self.control.contains(PpuControl::BG_PATTERN) { 0x1000u16 } else { 0x0000u16 };
+                let pattern_table = if self.control.contains(PpuControl::BG_PATTERN) {
+                    0x1000u16
+                } else {
+                    0x0000u16
+                };
                 let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
 
                 if tile_addr < 0x2000 {
@@ -551,14 +625,20 @@ impl Ppu {
             return;
         }
 
-        let sprite_height: u16 = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
+        let sprite_height: u16 = if self.control.contains(PpuControl::SPRITE_SIZE) {
+            16
+        } else {
+            8
+        };
         let current_scanline = self.scanline as u16;
 
         for sprite_num in 0u8..64 {
             let base = sprite_num as usize * 4;
             let sprite_y = self.oam[base];
 
-            if sprite_y >= 0xEF { continue; }
+            if sprite_y >= 0xEF {
+                continue;
+            }
 
             let sprite_top = sprite_y as u16 + 1;
             let sprite_bottom = sprite_top + sprite_height;
@@ -582,13 +662,24 @@ impl Ppu {
     }
 
     #[inline]
-    fn render_sprites(&self, x: u8, y: u8, cartridge: Option<&crate::cartridge::Cartridge>, sprite_0_hit: &mut bool) -> Option<(u8, bool)> {
+    fn render_sprites(
+        &self,
+        x: u8,
+        y: u8,
+        cartridge: Option<&crate::cartridge::Cartridge>,
+        sprite_0_hit: &mut bool,
+    ) -> Option<(u8, bool)> {
         if let Some(cart) = cartridge {
-            let sprite_size: u8 = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
+            let sprite_size: u8 = if self.control.contains(PpuControl::SPRITE_SIZE) {
+                16
+            } else {
+                8
+            };
             let count = self.scanline_sprite_count as usize;
 
             for i in 0..count {
-                let (sprite_num, sprite_y, tile_id, attributes, sprite_x) = self.scanline_sprites[i];
+                let (sprite_num, sprite_y, tile_id, attributes, sprite_x) =
+                    self.scanline_sprites[i];
 
                 // Check if pixel is within sprite horizontal bounds
                 if x < sprite_x || (x as u16) >= sprite_x as u16 + 8 {
@@ -615,7 +706,11 @@ impl Ppu {
                     let actual_tile_id = tile_id & 0xFE;
                     (pattern_table, actual_tile_id)
                 } else {
-                    let pattern_table: u16 = if self.control.contains(PpuControl::SPRITE_PATTERN) { 0x1000 } else { 0x0000 };
+                    let pattern_table: u16 = if self.control.contains(PpuControl::SPRITE_PATTERN) {
+                        0x1000
+                    } else {
+                        0x0000
+                    };
                     (pattern_table, tile_id)
                 };
 
@@ -661,7 +756,11 @@ impl Ppu {
         None
     }
 
-    pub fn read_register(&mut self, addr: u16, cartridge: Option<&crate::cartridge::Cartridge>) -> u8 {
+    pub fn read_register(
+        &mut self,
+        addr: u16,
+        cartridge: Option<&crate::cartridge::Cartridge>,
+    ) -> u8 {
         match addr {
             0x2002 => {
                 let status = self.status.bits();
@@ -691,7 +790,7 @@ impl Ppu {
                         0x14 => 0x04, // $3F14 mirrors $3F04
                         0x18 => 0x08, // $3F18 mirrors $3F08
                         0x1C => 0x0C, // $3F1C mirrors $3F0C
-                        _ => palette_addr & 0x1F
+                        _ => palette_addr & 0x1F,
                     };
                     // Also fill read_buffer with nametable data "underneath" the palette
                     let nt_addr = (self.v & 0x2FFF) as usize;
@@ -710,7 +809,7 @@ impl Ppu {
                 } else {
                     // All other memory: Buffered read (crucial for SMB)
                     let old_buffer = self.read_buffer;
-                    
+
                     // Update buffer with new data
                     let effective_v = if self.v >= 0x3000 && self.v < 0x3F00 {
                         self.v - 0x1000 // $3000-$3EFF mirrors $2000-$2EFF
@@ -738,21 +837,30 @@ impl Ppu {
                     } else {
                         self.read_buffer = 0;
                     }
-                    
+
                     old_buffer
                 };
-                
+
                 // CRITICAL: Increment VRAM address AFTER read
-                let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) { 32 } else { 1 };
+                let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) {
+                    32
+                } else {
+                    1
+                };
                 self.v = self.v.wrapping_add(increment) & 0x3FFF;
 
                 data
             }
-            _ => 0
+            _ => 0,
         }
     }
 
-    pub fn write_register(&mut self, addr: u16, data: u8, cartridge: Option<&crate::cartridge::Cartridge>) -> Option<(u16, u8)> {
+    pub fn write_register(
+        &mut self,
+        addr: u16,
+        data: u8,
+        cartridge: Option<&crate::cartridge::Cartridge>,
+    ) -> Option<(u16, u8)> {
         match addr {
             0x2000 => {
                 let old_nmi_enable = self.control.contains(PpuControl::NMI_ENABLE);
@@ -766,7 +874,6 @@ impl Ppu {
                 if !old_nmi_enable && new_nmi_enable && self.status.contains(PpuStatus::VBLANK) {
                     self.pending_nmi = true;
                 }
-
             }
             0x2001 => {
                 self.mask = PpuMask::from_bits_truncate(data);
@@ -786,7 +893,9 @@ impl Ppu {
                     self.t = (self.t & 0xFFE0) | ((data as u16) >> 3);
                     self.w = true;
                 } else {
-                    self.t = (self.t & 0x8C1F) | (((data as u16) & 0x07) << 12) | (((data as u16) >> 3) << 5);
+                    self.t = (self.t & 0x8C1F)
+                        | (((data as u16) & 0x07) << 12)
+                        | (((data as u16) >> 3) << 5);
                     self.w = false;
                 }
             }
@@ -814,7 +923,7 @@ impl Ppu {
                         0x14 => 0x04,
                         0x18 => 0x08,
                         0x1C => 0x0C,
-                        _ => palette_addr & 0x1F
+                        _ => palette_addr & 0x1F,
                     };
                     self.palette[mirrored_addr] = data;
                 } else if write_v >= 0x2000 && write_v < 0x3000 {
@@ -849,12 +958,20 @@ impl Ppu {
                 } else if write_v < 0x2000 {
                     // CHR write (for CHR RAM)
                     let chr_addr = write_v;
-                    let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) { 32 } else { 1 };
+                    let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) {
+                        32
+                    } else {
+                        1
+                    };
                     self.v = self.v.wrapping_add(increment) & 0x3FFF;
                     return Some((chr_addr, data));
                 }
 
-                let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) { 32 } else { 1 };
+                let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) {
+                    32
+                } else {
+                    1
+                };
                 self.v = self.v.wrapping_add(increment) & 0x3FFF;
             }
             _ => {}
@@ -876,74 +993,81 @@ impl Ppu {
     pub fn get_control(&self) -> PpuControl {
         self.control
     }
-    
+
     pub fn get_control_bits(&self) -> u8 {
         self.control.bits()
     }
-    
+
     pub fn get_mask(&self) -> PpuMask {
         self.mask
     }
-    
+
     pub fn get_mask_bits(&self) -> u8 {
         self.mask.bits()
     }
-    
+
     pub fn get_status(&self) -> PpuStatus {
         self.status
     }
-    
+
     pub fn get_status_bits(&self) -> u8 {
         self.status.bits()
     }
-    
+
     pub fn get_vram_addr(&self) -> u16 {
         self.v
     }
-    
+
     pub fn get_oam_addr(&self) -> u8 {
         self.oam_addr
     }
-    
+
     pub fn get_palette(&self) -> [u8; 32] {
         self.palette
     }
-    
+
     pub fn get_nametable(&self) -> [[u8; 1024]; 2] {
         self.nametable
     }
-    
+
     pub fn get_oam(&self) -> [u8; 256] {
         self.oam
     }
-    
-    
+
     pub fn get_current_vram_address(&self) -> u16 {
         self.v
     }
-    
-    
-    
-    
-    
+
     pub fn debug_get_control(&self) -> u8 {
         self.control.bits()
     }
-    
+
     pub fn debug_get_mask(&self) -> u8 {
         self.mask.bits()
     }
-    
-    
-    
+
     // Save state getters (registers)
-    pub fn get_t(&self) -> u16 { self.t }
-    pub fn get_x_scroll(&self) -> u8 { self.x }
-    pub fn get_w(&self) -> bool { self.w }
-    pub fn get_scanline(&self) -> i16 { self.scanline }
-    pub fn get_cycle(&self) -> u16 { self.cycle }
-    pub fn get_frame(&self) -> u64 { self.frame }
-    pub fn get_read_buffer(&self) -> u8 { self.read_buffer }
+    pub fn get_t(&self) -> u16 {
+        self.t
+    }
+    pub fn get_x_scroll(&self) -> u8 {
+        self.x
+    }
+    pub fn get_w(&self) -> bool {
+        self.w
+    }
+    pub fn get_scanline(&self) -> i16 {
+        self.scanline
+    }
+    pub fn get_cycle(&self) -> u16 {
+        self.cycle
+    }
+    pub fn get_frame(&self) -> u64 {
+        self.frame
+    }
+    pub fn get_read_buffer(&self) -> u8 {
+        self.read_buffer
+    }
 
     // Save state setters
     pub fn set_palette(&mut self, palette: [u8; 32]) {
@@ -975,8 +1099,8 @@ impl Ppu {
     ) {
         self.control = PpuControl::from_bits_truncate(control);
         self.mask = PpuMask::from_bits_truncate(mask);
-        self.rendering_enabled = self.mask.contains(PpuMask::BG_ENABLE)
-            || self.mask.contains(PpuMask::SPRITE_ENABLE);
+        self.rendering_enabled =
+            self.mask.contains(PpuMask::BG_ENABLE) || self.mask.contains(PpuMask::SPRITE_ENABLE);
         self.status = PpuStatus::from_bits_truncate(status);
         self.oam_addr = oam_addr;
         self.v = v;
@@ -992,9 +1116,6 @@ impl Ppu {
     pub fn write_oam_data(&mut self, addr: u8, data: u8) {
         self.oam[addr as usize] = data;
     }
-    
-    
-    
 
     pub fn get_palette_value(&self, index: usize) -> u8 {
         if index < self.palette.len() {
@@ -1003,5 +1124,4 @@ impl Ppu {
             0
         }
     }
-    
 }

@@ -11,12 +11,18 @@ impl Cpu {
 
     #[inline]
     pub(super) fn adc(&mut self, value: u8) {
-        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+        let carry = if self.status.contains(StatusFlags::CARRY) {
+            1
+        } else {
+            0
+        };
         let result = self.a as u16 + value as u16 + carry;
 
         self.status.set(StatusFlags::CARRY, result > 0xFF);
-        self.status.set(StatusFlags::OVERFLOW,
-            (self.a ^ result as u8) & (value ^ result as u8) & 0x80 != 0);
+        self.status.set(
+            StatusFlags::OVERFLOW,
+            (self.a ^ result as u8) & (value ^ result as u8) & 0x80 != 0,
+        );
 
         self.a = result as u8;
         self.set_zero_negative_flags(self.a);
@@ -269,7 +275,10 @@ impl Cpu {
 
     #[inline]
     pub(super) fn php(&mut self, bus: &mut dyn CpuBus) -> u8 {
-        self.push(bus, self.status.bits() | StatusFlags::BREAK.bits() | StatusFlags::UNUSED.bits());
+        self.push(
+            bus,
+            self.status.bits() | StatusFlags::BREAK.bits() | StatusFlags::UNUSED.bits(),
+        );
         3
     }
     #[inline]
@@ -282,7 +291,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_indirect_indexed_addr(bus);
         let value = bus.read(addr);
         self.ora(value);
-        if page_crossed { 6 } else { 5 }
+        if page_crossed {
+            6
+        } else {
+            5
+        }
     }
 
     #[inline]
@@ -311,7 +324,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_y_addr(bus);
         let value = bus.read(addr);
         self.ora(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -319,7 +336,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_x_addr(bus);
         let value = bus.read(addr);
         self.ora(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -395,7 +416,11 @@ impl Cpu {
     // ROL instructions
     #[inline]
     pub(super) fn rol(&mut self, value: u8) -> u8 {
-        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+        let carry = if self.status.contains(StatusFlags::CARRY) {
+            1
+        } else {
+            0
+        };
         self.status.set(StatusFlags::CARRY, value & 0x80 != 0);
         let result = (value << 1) | carry;
         self.set_zero_negative_flags(result);
@@ -429,7 +454,8 @@ impl Cpu {
     #[inline]
     pub(super) fn plp(&mut self, bus: &mut dyn CpuBus) -> u8 {
         let value = self.pull(bus);
-        self.status = StatusFlags::from_bits_truncate(value & !StatusFlags::BREAK.bits()) | StatusFlags::UNUSED;
+        self.status = StatusFlags::from_bits_truncate(value & !StatusFlags::BREAK.bits())
+            | StatusFlags::UNUSED;
         4
     }
     #[inline]
@@ -442,7 +468,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_indirect_indexed_addr(bus);
         let value = bus.read(addr);
         self.and(value);
-        if page_crossed { 6 } else { 5 }
+        if page_crossed {
+            6
+        } else {
+            5
+        }
     }
 
     #[inline]
@@ -471,7 +501,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_y_addr(bus);
         let value = bus.read(addr);
         self.and(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -479,7 +513,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_x_addr(bus);
         let value = bus.read(addr);
         self.and(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -505,7 +543,8 @@ impl Cpu {
         let status = self.pull(bus);
         // Restore status flags properly - keep UNUSED always set, clear BREAK flag
         // BREAK flag should never be restored from stack during RTI
-        self.status = StatusFlags::from_bits_truncate(status & !StatusFlags::BREAK.bits()) | StatusFlags::UNUSED;
+        self.status = StatusFlags::from_bits_truncate(status & !StatusFlags::BREAK.bits())
+            | StatusFlags::UNUSED;
 
         // Pull return address from stack
         let low = self.pull(bus) as u16;
@@ -610,7 +649,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_indirect_indexed_addr(bus);
         let value = bus.read(addr);
         self.eor(value);
-        if page_crossed { 6 } else { 5 }
+        if page_crossed {
+            6
+        } else {
+            5
+        }
     }
 
     #[inline]
@@ -639,7 +682,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_y_addr(bus);
         let value = bus.read(addr);
         self.eor(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -647,7 +694,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_x_addr(bus);
         let value = bus.read(addr);
         self.eor(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -685,7 +736,11 @@ impl Cpu {
     // ROR instructions
     #[inline]
     pub(super) fn ror(&mut self, value: u8) -> u8 {
-        let carry = if self.status.contains(StatusFlags::CARRY) { 0x80 } else { 0 };
+        let carry = if self.status.contains(StatusFlags::CARRY) {
+            0x80
+        } else {
+            0
+        };
         self.status.set(StatusFlags::CARRY, value & 0x01 != 0);
         let result = (value >> 1) | carry;
         self.set_zero_negative_flags(result);
@@ -748,7 +803,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_indirect_indexed_addr(bus);
         let value = bus.read(addr);
         self.adc(value);
-        if page_crossed { 6 } else { 5 }
+        if page_crossed {
+            6
+        } else {
+            5
+        }
     }
 
     #[inline]
@@ -777,7 +836,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_y_addr(bus);
         let value = bus.read(addr);
         self.adc(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -785,7 +848,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_x_addr(bus);
         let value = bus.read(addr);
         self.adc(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -977,7 +1044,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_indirect_indexed_addr(bus);
         self.a = bus.read(addr);
         self.set_zero_negative_flags(self.a);
-        if page_crossed { 6 } else { 5 }
+        if page_crossed {
+            6
+        } else {
+            5
+        }
     }
 
     #[inline]
@@ -1013,7 +1084,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_y_addr(bus);
         self.a = bus.read(addr);
         self.set_zero_negative_flags(self.a);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
     #[inline]
     pub(super) fn tsx(&mut self) -> u8 {
@@ -1026,7 +1101,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_x_addr(bus);
         self.y = bus.read(addr);
         self.set_zero_negative_flags(self.y);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -1034,7 +1113,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_x_addr(bus);
         self.a = bus.read(addr);
         self.set_zero_negative_flags(self.a);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -1042,7 +1125,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_y_addr(bus);
         self.x = bus.read(addr);
         self.set_zero_negative_flags(self.x);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
     // Compare instructions
     #[inline]
@@ -1145,7 +1232,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_indirect_indexed_addr(bus);
         let value = bus.read(addr);
         self.compare(self.a, value);
-        if page_crossed { 6 } else { 5 }
+        if page_crossed {
+            6
+        } else {
+            5
+        }
     }
 
     #[inline]
@@ -1175,7 +1266,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_y_addr(bus);
         let value = bus.read(addr);
         self.compare(self.a, value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -1183,7 +1278,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_x_addr(bus);
         let value = bus.read(addr);
         self.compare(self.a, value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -1289,7 +1388,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_indirect_indexed_addr(bus);
         let value = bus.read(addr);
         self.sbc(value);
-        if page_crossed { 6 } else { 5 }
+        if page_crossed {
+            6
+        } else {
+            5
+        }
     }
 
     #[inline]
@@ -1319,7 +1422,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_y_addr(bus);
         let value = bus.read(addr);
         self.sbc(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]
@@ -1327,7 +1434,11 @@ impl Cpu {
         let (addr, page_crossed) = self.get_absolute_x_addr(bus);
         let value = bus.read(addr);
         self.sbc(value);
-        if page_crossed { 5 } else { 4 }
+        if page_crossed {
+            5
+        } else {
+            4
+        }
     }
 
     #[inline]

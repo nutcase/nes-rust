@@ -1,8 +1,8 @@
 use bitflags::bitflags;
 
+mod instructions;
 #[cfg(test)]
 mod tests;
-mod instructions;
 mod tick;
 
 bitflags! {
@@ -20,14 +20,14 @@ bitflags! {
 }
 
 pub struct Cpu {
-    pub a: u8,      // Accumulator
-    pub x: u8,      // X register
-    pub y: u8,      // Y register
-    pub sp: u8,     // Stack pointer
-    pub pc: u16,    // Program counter
+    pub a: u8,   // Accumulator
+    pub x: u8,   // X register
+    pub y: u8,   // Y register
+    pub sp: u8,  // Stack pointer
+    pub pc: u16, // Program counter
     pub status: StatusFlags,
     cycles: u64,
-    rts_count: u32, // Counter for consecutive RTS calls at same PC
+    rts_count: u32,   // Counter for consecutive RTS calls at same PC
     last_rts_pc: u16, // Last PC where RTS was executed
 }
 
@@ -52,7 +52,7 @@ impl Cpu {
         self.y = 0;
         self.sp = 0xFD;
         self.status = StatusFlags::from_bits_truncate(0x24);
-        
+
         let low = bus.read(0xFFFC) as u16;
         let high = bus.read(0xFFFD) as u16;
         self.pc = (high << 8) | low;
@@ -64,14 +64,14 @@ impl Cpu {
 
         // Increment PC for most instructions - special ones handle it themselves
         self.pc = self.pc.wrapping_add(1);
-        
+
         let cycles = self.execute_instruction(opcode, bus);
-        
+
         // Safety check: ensure we're making progress
         if cycles == 0 {
             return 2; // Return minimum cycles to prevent infinite loop
         }
-        
+
         self.cycles += cycles as u64;
         cycles
     }
@@ -80,9 +80,9 @@ impl Cpu {
         self.push(bus, (self.pc >> 8) as u8);
         self.push(bus, self.pc as u8);
         self.push(bus, self.status.bits() & !StatusFlags::BREAK.bits());
-        
+
         self.status.insert(StatusFlags::INTERRUPT_DISABLE);
-        
+
         let low = bus.read(0xFFFA) as u16;
         let high = bus.read(0xFFFB) as u16;
         let nmi_vector = (high << 8) | low;
@@ -90,24 +90,24 @@ impl Cpu {
 
         self.cycles += 7;
     }
-    
+
     pub fn irq(&mut self, bus: &mut dyn CpuBus) {
         // IRQ is maskable - check interrupt disable flag
         if self.status.contains(StatusFlags::INTERRUPT_DISABLE) {
             return;
         }
-        
+
         self.push(bus, (self.pc >> 8) as u8);
         self.push(bus, self.pc as u8);
         self.push(bus, self.status.bits() & !StatusFlags::BREAK.bits());
-        
+
         self.status.insert(StatusFlags::INTERRUPT_DISABLE);
-        
+
         // IRQ vector at $FFFE-$FFFF
         let low = bus.read(0xFFFE) as u16;
         let high = bus.read(0xFFFF) as u16;
         let irq_vector = (high << 8) | low;
-        
+
         self.pc = irq_vector;
 
         self.cycles += 7;
@@ -124,7 +124,7 @@ impl Cpu {
             0x0A => self.asl_accumulator(),
             0x0D => self.ora_absolute(bus),
             0x0E => self.asl_absolute(bus),
-            
+
             0x10 => self.bpl(bus),
             0x11 => self.ora_indirect_indexed(bus),
             0x15 => self.ora_zero_page_x(bus),
@@ -133,7 +133,7 @@ impl Cpu {
             0x19 => self.ora_absolute_y(bus),
             0x1D => self.ora_absolute_x(bus),
             0x1E => self.asl_absolute_x(bus),
-            
+
             0x20 => self.jsr(bus),
             0x21 => self.and_indexed_indirect(bus),
             0x24 => self.bit_zero_page(bus),
@@ -145,7 +145,7 @@ impl Cpu {
             0x2C => self.bit_absolute(bus),
             0x2D => self.and_absolute(bus),
             0x2E => self.rol_absolute(bus),
-            
+
             0x30 => self.bmi(bus),
             0x31 => self.and_indirect_indexed(bus),
             0x35 => self.and_zero_page_x(bus),
@@ -154,7 +154,7 @@ impl Cpu {
             0x39 => self.and_absolute_y(bus),
             0x3D => self.and_absolute_x(bus),
             0x3E => self.rol_absolute_x(bus),
-            
+
             0x40 => self.rti(bus),
             0x41 => self.eor_indexed_indirect(bus),
             0x45 => self.eor_zero_page(bus),
@@ -176,7 +176,7 @@ impl Cpu {
             0x4C => self.jmp_absolute(bus),
             0x4D => self.eor_absolute(bus),
             0x4E => self.lsr_absolute(bus),
-            
+
             0x50 => self.bvc(bus),
             0x51 => self.eor_indirect_indexed(bus),
             0x55 => self.eor_zero_page_x(bus),
@@ -185,7 +185,7 @@ impl Cpu {
             0x59 => self.eor_absolute_y(bus),
             0x5D => self.eor_absolute_x(bus),
             0x5E => self.lsr_absolute_x(bus),
-            
+
             0x60 => self.rts(bus),
             0x61 => self.adc_indexed_indirect(bus),
             0x65 => self.adc_zero_page(bus),
@@ -196,7 +196,7 @@ impl Cpu {
             0x6C => self.jmp_indirect(bus),
             0x6D => self.adc_absolute(bus),
             0x6E => self.ror_absolute(bus),
-            
+
             0x70 => self.bvs(bus),
             0x71 => self.adc_indirect_indexed(bus),
             0x75 => self.adc_zero_page_x(bus),
@@ -205,7 +205,7 @@ impl Cpu {
             0x79 => self.adc_absolute_y(bus),
             0x7D => self.adc_absolute_x(bus),
             0x7E => self.ror_absolute_x(bus),
-            
+
             0x81 => self.sta_indexed_indirect(bus),
             0x83 => self.sax_indexed_indirect(bus),
             0x84 => self.sty_zero_page(bus),
@@ -216,7 +216,7 @@ impl Cpu {
             0x8C => self.sty_absolute(bus),
             0x8D => self.sta_absolute(bus),
             0x8E => self.stx_absolute(bus),
-            
+
             0x90 => self.bcc(bus),
             0x91 => self.sta_indirect_indexed(bus),
             0x94 => self.sty_zero_page_x(bus),
@@ -226,7 +226,7 @@ impl Cpu {
             0x99 => self.sta_absolute_y(bus),
             0x9A => self.txs(),
             0x9D => self.sta_absolute_x(bus),
-            
+
             0xA0 => self.ldy_immediate(bus),
             0xA1 => self.lda_indexed_indirect(bus),
             0xA2 => self.ldx_immediate(bus),
@@ -239,7 +239,7 @@ impl Cpu {
             0xAC => self.ldy_absolute(bus),
             0xAD => self.lda_absolute(bus),
             0xAE => self.ldx_absolute(bus),
-            
+
             0xB0 => self.bcs(bus),
             0xB1 => self.lda_indirect_indexed(bus),
             0xB4 => self.ldy_zero_page_x(bus),
@@ -251,7 +251,7 @@ impl Cpu {
             0xBC => self.ldy_absolute_x(bus),
             0xBD => self.lda_absolute_x(bus),
             0xBE => self.ldx_absolute_y(bus),
-            
+
             0xC0 => self.cpy_immediate(bus),
             0xC1 => self.cmp_indexed_indirect(bus),
             0xC4 => self.cpy_zero_page(bus),
@@ -263,7 +263,7 @@ impl Cpu {
             0xCC => self.cpy_absolute(bus),
             0xCD => self.cmp_absolute(bus),
             0xCE => self.dec_absolute(bus),
-            
+
             0xD0 => self.bne(bus),
             0xD1 => self.cmp_indirect_indexed(bus),
             0xD5 => self.cmp_zero_page_x(bus),
@@ -272,7 +272,7 @@ impl Cpu {
             0xD9 => self.cmp_absolute_y(bus),
             0xDD => self.cmp_absolute_x(bus),
             0xDE => self.dec_absolute_x(bus),
-            
+
             0xE0 => self.cpx_immediate(bus),
             0xE1 => self.sbc_indexed_indirect(bus),
             0xE4 => self.cpx_zero_page(bus),
@@ -284,7 +284,7 @@ impl Cpu {
             0xEC => self.cpx_absolute(bus),
             0xED => self.sbc_absolute(bus),
             0xEE => self.inc_absolute(bus),
-            
+
             0xF0 => self.beq(bus),
             0xF1 => self.sbc_indirect_indexed(bus),
             0xF5 => self.sbc_zero_page_x(bus),
@@ -293,7 +293,7 @@ impl Cpu {
             0xF9 => self.sbc_absolute_y(bus),
             0xFD => self.sbc_absolute_x(bus),
             0xFE => self.inc_absolute_x(bus),
-            
+
             _ => {
                 // Some games use unofficial opcodes, try to continue
                 match opcode {
@@ -336,7 +336,10 @@ impl Cpu {
                         let value = self.read_byte(bus);
                         self.a &= value;
                         self.set_zero_negative_flags(self.a);
-                        self.status.set(StatusFlags::CARRY, self.status.contains(StatusFlags::NEGATIVE));
+                        self.status.set(
+                            StatusFlags::CARRY,
+                            self.status.contains(StatusFlags::NEGATIVE),
+                        );
                         2
                     }
                     0x03 => {
@@ -366,7 +369,11 @@ impl Cpu {
                         let addr = self.read_word(bus);
                         let effective_addr = addr.wrapping_add(self.x as u16);
                         let value = bus.read(effective_addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            1
+                        } else {
+                            0
+                        };
                         let new_carry = value & 0x01;
                         let rotated = (value >> 1) | (carry << 7);
                         bus.write(effective_addr, rotated);
@@ -530,12 +537,13 @@ impl Cpu {
                                 self.set_zero_negative_flags(value);
                                 5
                             }
-                            _ => 2
+                            _ => 2,
                         }
                     }
                     // SHY unofficial opcode
                     // JAM/KIL opcodes - These should halt the CPU but we treat as NOP for compatibility
-                    0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2 | 0xD2 | 0xF2 => {
+                    0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2 | 0xD2
+                    | 0xF2 => {
                         // JAM/KIL - Officially halt CPU, but treat as NOP for game compatibility
                         1 // 1 cycle minimal operation
                     }
@@ -586,7 +594,11 @@ impl Cpu {
                         // RLA (indirect,X) - Rotate Left, AND
                         let addr = self.get_indexed_indirect_addr(bus);
                         let value = bus.read(addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            1
+                        } else {
+                            0
+                        };
                         let rotated = (value << 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x80 != 0);
                         bus.write(addr, rotated);
@@ -598,7 +610,11 @@ impl Cpu {
                         // RLA zero page - Rotate Left, AND
                         let addr = self.read_byte(bus) as u16;
                         let value = bus.read(addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            1
+                        } else {
+                            0
+                        };
                         let rotated = (value << 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x80 != 0);
                         bus.write(addr, rotated);
@@ -611,14 +627,21 @@ impl Cpu {
                         let value = self.read_byte(bus);
                         self.a &= value;
                         self.set_zero_negative_flags(self.a);
-                        self.status.set(StatusFlags::CARRY, self.status.contains(StatusFlags::NEGATIVE));
+                        self.status.set(
+                            StatusFlags::CARRY,
+                            self.status.contains(StatusFlags::NEGATIVE),
+                        );
                         2
                     }
                     0x2F => {
                         // RLA absolute - Rotate Left, AND
                         let addr = self.read_word(bus);
                         let value = bus.read(addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            1
+                        } else {
+                            0
+                        };
                         let rotated = (value << 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x80 != 0);
                         bus.write(addr, rotated);
@@ -630,7 +653,11 @@ impl Cpu {
                         // RLA (indirect),Y - Rotate Left, AND
                         let (addr, _page_crossed) = self.get_indirect_indexed_addr(bus);
                         let value = bus.read(addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            1
+                        } else {
+                            0
+                        };
                         let rotated = (value << 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x80 != 0);
                         bus.write(addr, rotated);
@@ -642,7 +669,11 @@ impl Cpu {
                         // RLA zero page,X - Rotate Left, AND
                         let addr = self.get_zero_page_x_addr(bus);
                         let value = bus.read(addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            1
+                        } else {
+                            0
+                        };
                         let rotated = (value << 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x80 != 0);
                         bus.write(addr, rotated);
@@ -655,7 +686,11 @@ impl Cpu {
                         let addr = self.read_word(bus);
                         let effective_addr = addr.wrapping_add(self.y as u16);
                         let value = bus.read(effective_addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            1
+                        } else {
+                            0
+                        };
                         let rotated = (value << 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x80 != 0);
                         bus.write(effective_addr, rotated);
@@ -667,10 +702,17 @@ impl Cpu {
                         // ARR immediate - AND with accumulator, then rotate right
                         let value = self.read_byte(bus);
                         self.a &= value;
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 0x80 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            0x80
+                        } else {
+                            0
+                        };
                         let result = (self.a >> 1) | carry;
                         self.status.set(StatusFlags::CARRY, self.a & 0x01 != 0);
-                        self.status.set(StatusFlags::OVERFLOW, ((result ^ (result << 1)) & 0x40) != 0);
+                        self.status.set(
+                            StatusFlags::OVERFLOW,
+                            ((result ^ (result << 1)) & 0x40) != 0,
+                        );
                         self.a = result;
                         self.set_zero_negative_flags(self.a);
                         2
@@ -679,7 +721,11 @@ impl Cpu {
                         // RRA (indirect),Y - Rotate Right, Add
                         let (addr, _page_crossed) = self.get_indirect_indexed_addr(bus);
                         let value = bus.read(addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 0x80 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            0x80
+                        } else {
+                            0
+                        };
                         let rotated = (value >> 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x01 != 0);
                         bus.write(addr, rotated);
@@ -691,7 +737,11 @@ impl Cpu {
                         let addr = self.read_word(bus);
                         let effective_addr = addr.wrapping_add(self.y as u16);
                         let value = bus.read(effective_addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 0x80 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            0x80
+                        } else {
+                            0
+                        };
                         let rotated = (value >> 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x01 != 0);
                         bus.write(effective_addr, rotated);
@@ -751,7 +801,11 @@ impl Cpu {
                         let addr = self.read_word(bus);
                         let effective_addr = addr.wrapping_add(self.x as u16);
                         let value = bus.read(effective_addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 1 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            1
+                        } else {
+                            0
+                        };
                         let rotated = (value << 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x80 != 0);
                         bus.write(effective_addr, rotated);
@@ -772,7 +826,11 @@ impl Cpu {
                         // RRA zero page,X - Rotate Right, Add
                         let addr = self.get_zero_page_x_addr(bus);
                         let value = bus.read(addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 0x80 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            0x80
+                        } else {
+                            0
+                        };
                         let rotated = (value >> 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x01 != 0);
                         bus.write(addr, rotated);
@@ -904,9 +962,14 @@ impl Cpu {
                         let base = self.read_byte(bus) as u16;
                         let addr_low = (base.wrapping_add(self.x as u16)) & 0xFF;
                         let addr_high = (addr_low + 1) & 0xFF;
-                        let effective_addr = bus.read(addr_low) as u16 | ((bus.read(addr_high) as u16) << 8);
+                        let effective_addr =
+                            bus.read(addr_low) as u16 | ((bus.read(addr_high) as u16) << 8);
                         let value = bus.read(effective_addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 0x80 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            0x80
+                        } else {
+                            0
+                        };
                         let rotated = (value >> 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x01 != 0);
                         bus.write(effective_addr, rotated);
@@ -917,7 +980,11 @@ impl Cpu {
                         // RRA zero page - Rotate Right, Add
                         let addr = self.read_byte(bus) as u16;
                         let value = bus.read(addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 0x80 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            0x80
+                        } else {
+                            0
+                        };
                         let rotated = (value >> 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x01 != 0);
                         bus.write(addr, rotated);
@@ -928,7 +995,11 @@ impl Cpu {
                         // RRA absolute - Rotate Right, Add
                         let addr = self.read_word(bus);
                         let value = bus.read(addr);
-                        let carry = if self.status.contains(StatusFlags::CARRY) { 0x80 } else { 0 };
+                        let carry = if self.status.contains(StatusFlags::CARRY) {
+                            0x80
+                        } else {
+                            0
+                        };
                         let rotated = (value >> 1) | carry;
                         self.status.set(StatusFlags::CARRY, value & 0x01 != 0);
                         bus.write(addr, rotated);
@@ -996,7 +1067,11 @@ impl Cpu {
                         8
                     }
                     _ => {
-                        log::error!("Halting on truly unknown opcode: 0x{:02X} at PC: 0x{:04X}", opcode, self.pc.wrapping_sub(1));
+                        log::error!(
+                            "Halting on truly unknown opcode: 0x{:02X} at PC: 0x{:04X}",
+                            opcode,
+                            self.pc.wrapping_sub(1)
+                        );
                         1 // Minimal cycles to avoid complete freeze
                     }
                 }
@@ -1048,31 +1123,44 @@ impl Cpu {
         let offset = self.read_byte(bus) as i8;
         if condition {
             let new_pc = self.pc.wrapping_add(offset as u16);
-            
+
             // Page crossing check should use the branch instruction PC vs destination PC
-            let cycles = if (branch_pc & 0xFF00) != (new_pc & 0xFF00) { 4 } else { 3 };
+            let cycles = if (branch_pc & 0xFF00) != (new_pc & 0xFF00) {
+                4
+            } else {
+                3
+            };
             self.pc = new_pc;
             cycles
         } else {
             2
         }
     }
-
 }
 
 pub trait CpuBus {
     fn read(&mut self, addr: u16) -> u8;
     fn write(&mut self, addr: u16, data: u8);
-    
+
     // Game-specific protection methods (with default implementations)
-    fn check_game_specific_cpu_protection(&self, _pc: u16, _sp: u8, _cycles: u64) -> Option<(u16, u8)> {
+    fn check_game_specific_cpu_protection(
+        &self,
+        _pc: u16,
+        _sp: u8,
+        _cycles: u64,
+    ) -> Option<(u16, u8)> {
         None
     }
-    
-    fn check_game_specific_brk_protection(&self, _pc: u16, _sp: u8, _cycles: u64) -> Option<(u16, u8)> {
+
+    fn check_game_specific_brk_protection(
+        &self,
+        _pc: u16,
+        _sp: u8,
+        _cycles: u64,
+    ) -> Option<(u16, u8)> {
         None
     }
-    
+
     fn is_goonies(&self) -> bool {
         false
     }

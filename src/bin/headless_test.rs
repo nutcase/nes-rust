@@ -1,6 +1,6 @@
+use nes_emulator::Nes;
 use std::collections::HashMap;
 use std::io::Write;
-use nes_emulator::Nes;
 
 struct Args {
     rom_path: String,

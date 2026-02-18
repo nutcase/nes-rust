@@ -8,9 +8,9 @@ pub struct Apu {
     cycle_count: u64,
 
     // Frame counter control
-    frame_mode: bool,        // false = 4-step, true = 5-step
-    irq_disable: bool,       // IRQ inhibit flag
-    frame_irq: bool,         // Frame IRQ flag
+    frame_mode: bool,  // false = 4-step, true = 5-step
+    irq_disable: bool, // IRQ inhibit flag
+    frame_irq: bool,   // Frame IRQ flag
 
     // Status register
     pulse1_enabled: bool,
@@ -28,9 +28,9 @@ pub struct Apu {
     sample_counter: f32,
 
     // NES hardware audio filters (nesdev wiki)
-    high_pass_90hz: HighPassFilter,   // AC coupling capacitor (~90 Hz)
-    high_pass_440hz: HighPassFilter,  // Amplifier feedback (~440 Hz)
-    low_pass_14khz: LowPassFilter,    // Amplifier bandwidth (~14 kHz)
+    high_pass_90hz: HighPassFilter,  // AC coupling capacitor (~90 Hz)
+    high_pass_440hz: HighPassFilter, // Amplifier feedback (~440 Hz)
+    low_pass_14khz: LowPassFilter,   // Amplifier bandwidth (~14 kHz)
 }
 
 struct PulseChannel {
@@ -176,9 +176,15 @@ impl Apu {
 
         // Pulse and Noise: clocked every 2 CPU cycles
         if self.cycle_count % 2 == 0 {
-            if self.pulse1_enabled { self.pulse1.step(); }
-            if self.pulse2_enabled { self.pulse2.step(); }
-            if self.noise_enabled { self.noise.step(); }
+            if self.pulse1_enabled {
+                self.pulse1.step();
+            }
+            if self.pulse2_enabled {
+                self.pulse2.step();
+            }
+            if self.noise_enabled {
+                self.noise.step();
+            }
         }
 
         // Frame sequencer with proper 4-step/5-step timing
@@ -245,16 +251,24 @@ impl Apu {
     fn mix_output(&mut self) -> f32 {
         let pulse1_out = if self.pulse1_enabled && self.pulse1.length_counter > 0 {
             self.pulse1.output()
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let pulse2_out = if self.pulse2_enabled && self.pulse2.length_counter > 0 {
             self.pulse2.output()
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let triangle_out = if self.triangle_enabled && self.triangle.length_counter > 0 {
             self.triangle.output()
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let noise_out = if self.noise_enabled && self.noise.length_counter > 0 {
             self.noise.output()
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         // Non-linear mixer (nesdev wiki) - models the NES resistor DAC
         // Channel outputs are 0.0-15.0. Mixer naturally outputs 0.0-~1.0.
@@ -300,11 +314,21 @@ impl Apu {
         match addr {
             0x4015 => {
                 let mut status = 0;
-                if self.pulse1_enabled && self.pulse1.length_counter > 0 { status |= 0x01; }
-                if self.pulse2_enabled && self.pulse2.length_counter > 0 { status |= 0x02; }
-                if self.triangle_enabled && self.triangle.length_counter > 0 { status |= 0x04; }
-                if self.noise_enabled && self.noise.length_counter > 0 { status |= 0x08; }
-                if self.dmc_enabled { status |= 0x10; }
+                if self.pulse1_enabled && self.pulse1.length_counter > 0 {
+                    status |= 0x01;
+                }
+                if self.pulse2_enabled && self.pulse2.length_counter > 0 {
+                    status |= 0x02;
+                }
+                if self.triangle_enabled && self.triangle.length_counter > 0 {
+                    status |= 0x04;
+                }
+                if self.noise_enabled && self.noise.length_counter > 0 {
+                    status |= 0x08;
+                }
+                if self.dmc_enabled {
+                    status |= 0x10;
+                }
 
                 if self.frame_irq {
                     status |= 0x40;
@@ -314,7 +338,7 @@ impl Apu {
                 self.frame_irq = false;
 
                 status
-            },
+            }
             _ => 0,
         }
     }
@@ -335,18 +359,18 @@ impl Apu {
 
             // Triangle
             0x4008 => self.triangle.write_control(data),
-            0x4009 => {},
+            0x4009 => {}
             0x400A => self.triangle.write_timer_low(data),
             0x400B => self.triangle.write_timer_high(data),
 
             // Noise
             0x400C => self.noise.write_control(data),
-            0x400D => {},
+            0x400D => {}
             0x400E => self.noise.write_period(data),
             0x400F => self.noise.write_length(data),
 
             // DMC (not implemented)
-            0x4010..=0x4013 => {},
+            0x4010..=0x4013 => {}
 
             // Status
             0x4015 => {
@@ -356,11 +380,19 @@ impl Apu {
                 self.noise_enabled = data & 0x08 != 0;
                 self.dmc_enabled = data & 0x10 != 0;
 
-                if !self.pulse1_enabled { self.pulse1.length_counter = 0; }
-                if !self.pulse2_enabled { self.pulse2.length_counter = 0; }
-                if !self.triangle_enabled { self.triangle.length_counter = 0; }
-                if !self.noise_enabled { self.noise.length_counter = 0; }
-            },
+                if !self.pulse1_enabled {
+                    self.pulse1.length_counter = 0;
+                }
+                if !self.pulse2_enabled {
+                    self.pulse2.length_counter = 0;
+                }
+                if !self.triangle_enabled {
+                    self.triangle.length_counter = 0;
+                }
+                if !self.noise_enabled {
+                    self.noise.length_counter = 0;
+                }
+            }
 
             // Frame counter
             0x4017 => {
@@ -374,21 +406,21 @@ impl Apu {
                 if self.frame_mode {
                     self.clock_half_frame();
                 }
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
 }
 
 // Length counter lookup table
 const LENGTH_TABLE: [u8; 32] = [
-    10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14,
-    12, 16, 24, 18, 48, 20, 96, 22, 192, 24, 72, 26, 16, 28, 32, 30
+    10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
+    192, 24, 72, 26, 16, 28, 32, 30,
 ];
 
 // Noise period lookup table
 const NOISE_PERIOD_TABLE: [u16; 16] = [
-    4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068
+    4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
 ];
 
 impl PulseChannel {
@@ -481,7 +513,7 @@ impl PulseChannel {
             if self.is_pulse1 {
                 current - change - 1 // Pulse 1: one's complement (extra -1)
             } else {
-                current - change     // Pulse 2: two's complement
+                current - change // Pulse 2: two's complement
             }
         } else {
             current + change
@@ -500,7 +532,11 @@ impl PulseChannel {
             let old_divider = self.sweep_divider;
             self.sweep_divider = self.sweep_period;
             self.sweep_reload = false;
-            if old_divider == 0 && self.sweep_enabled && self.sweep_shift > 0 && !self.is_sweep_muting() {
+            if old_divider == 0
+                && self.sweep_enabled
+                && self.sweep_shift > 0
+                && !self.is_sweep_muting()
+            {
                 let target = self.sweep_target_period();
                 if target >= 0 {
                     self.timer_reload = target as u16;
@@ -618,8 +654,8 @@ impl TriangleChannel {
         }
 
         const TRIANGLE_SEQUENCE: [u8; 32] = [
-            15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+            15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+            11, 12, 13, 14, 15,
         ];
 
         TRIANGLE_SEQUENCE[self.sequence_counter as usize] as f32

@@ -15,7 +15,7 @@ impl Cpu {
         self.pc = self.pc.wrapping_add(1);
 
         let cycles = match opcode {
-            0xEA => 2, // NOP
+            0xEA => 2,                            // NOP
             0xA9 => self.lda_immediate_tick(bus), // LDA immediate
             0xAD => self.lda_absolute_tick(bus),  // LDA absolute
             0x2C => self.bit_absolute_tick(bus),  // BIT absolute
@@ -99,7 +99,11 @@ impl Cpu {
         if condition {
             let old_pc = self.pc;
             let new_pc = self.pc.wrapping_add(offset as u16);
-            let cycles = if (old_pc & 0xFF00) != (new_pc & 0xFF00) { 4 } else { 3 };
+            let cycles = if (old_pc & 0xFF00) != (new_pc & 0xFF00) {
+                4
+            } else {
+                3
+            };
             self.pc = new_pc;
             cycles
         } else {

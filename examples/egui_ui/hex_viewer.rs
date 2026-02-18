@@ -1,5 +1,5 @@
-use egui::{self, Color32, FontId};
 use egui::text::LayoutJob;
+use egui::{self, Color32, FontId};
 
 const BYTES_PER_ROW: usize = 16;
 const COLOR_ADDR: Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
@@ -38,9 +38,8 @@ impl HexViewerState {
         // Toolbar: goto + edit
         ui.horizontal(|ui| {
             ui.label("Go to:");
-            let goto_resp = ui.add(
-                egui::TextEdit::singleline(&mut self.goto_addr).desired_width(50.0),
-            );
+            let goto_resp =
+                ui.add(egui::TextEdit::singleline(&mut self.goto_addr).desired_width(50.0));
             if (goto_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                 || ui.button("Go").clicked()
             {
@@ -53,9 +52,8 @@ impl HexViewerState {
             ui.label("Edit:");
             ui.add(egui::TextEdit::singleline(&mut self.edit_addr).desired_width(40.0));
             ui.label("=");
-            let val_resp = ui.add(
-                egui::TextEdit::singleline(&mut self.edit_val).desired_width(25.0),
-            );
+            let val_resp =
+                ui.add(egui::TextEdit::singleline(&mut self.edit_val).desired_width(25.0));
             if (val_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                 || ui.button("Set").clicked()
             {
@@ -110,14 +108,22 @@ impl HexViewerState {
                         append_text(&mut job, " ", &mono, COLOR_ASCII);
                     } else {
                         let b = ram[addr];
-                        let ch = if (0x20..=0x7E).contains(&b) { b as char } else { '.' };
+                        let ch = if (0x20..=0x7E).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        };
                         let mut buf = [0u8; 1];
                         ch.encode_utf8(&mut buf);
                         append_text(
                             &mut job,
                             std::str::from_utf8(&buf[..ch.len_utf8()]).unwrap_or("."),
                             &mono,
-                            if addr < end { COLOR_ASCII } else { COLOR_NORMAL },
+                            if addr < end {
+                                COLOR_ASCII
+                            } else {
+                                COLOR_NORMAL
+                            },
                         );
                     }
                 }
@@ -129,14 +135,22 @@ impl HexViewerState {
 }
 
 fn append_text(job: &mut LayoutJob, text: &str, font: &FontId, color: Color32) {
-    job.append(text, 0.0, egui::TextFormat {
-        font_id: font.clone(),
-        color,
-        ..Default::default()
-    });
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color,
+            ..Default::default()
+        },
+    );
 }
 
 fn parse_hex(s: &str) -> Result<usize, std::num::ParseIntError> {
-    let s = s.trim().trim_start_matches("0x").trim_start_matches("0X").trim_start_matches('$');
+    let s = s
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .trim_start_matches('$');
     usize::from_str_radix(s, 16)
 }

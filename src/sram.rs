@@ -1,5 +1,5 @@
-use std::fs::{File, create_dir_all};
-use std::io::{Read, Write, Result};
+use std::fs::{create_dir_all, File};
+use std::io::{Read, Result, Write};
 use std::path::{Path, PathBuf};
 
 pub fn get_save_file_path(rom_path: &str) -> PathBuf {

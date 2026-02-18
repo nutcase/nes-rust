@@ -4,9 +4,7 @@ pub struct Memory {
 
 impl Memory {
     pub fn new() -> Self {
-        Memory {
-            ram: [0; 0x800],
-        }
+        Memory { ram: [0; 0x800] }
     }
 
     pub fn read(&self, addr: u16) -> u8 {
@@ -20,8 +18,8 @@ impl Memory {
         match addr {
             0x0000..=0x1FFF => {
                 self.ram[(addr & 0x7FF) as usize] = data;
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
 

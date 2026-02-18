@@ -182,8 +182,8 @@ mod tests {
 
         // Place sprite 0 at a visible position
         ppu.oam[0] = 100; // Y position
-        ppu.oam[1] = 0;   // Tile index
-        ppu.oam[2] = 0;   // Attributes
+        ppu.oam[1] = 0; // Tile index
+        ppu.oam[2] = 0; // Attributes
         ppu.oam[3] = 100; // X position
 
         // Sprite 0 hit flag should be set during rendering
@@ -231,5 +231,4 @@ mod tests {
         // Check buffer format (actual initial values may vary)
         assert!(buffer.len() > 0);
     }
-
 }
