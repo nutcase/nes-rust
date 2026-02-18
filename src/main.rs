@@ -1,16 +1,26 @@
-use std::time::{Duration, Instant};
-use std::sync::Arc;
-use nes_emulator::Nes;
 use nes_emulator::audio_ring::SpscRingBuffer;
-use sdl2::pixels::PixelFormatEnum;
+use nes_emulator::Nes;
+use sdl2::audio::AudioCallback;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
-use sdl2::audio::AudioCallback;
+use sdl2::pixels::PixelFormatEnum;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+fn state_slot_from_key(code: Keycode) -> Option<u8> {
+    match code {
+        Keycode::Num1 | Keycode::Kp1 => Some(1),
+        Keycode::Num2 | Keycode::Kp2 => Some(2),
+        Keycode::Num3 | Keycode::Kp3 => Some(3),
+        Keycode::Num4 | Keycode::Kp4 => Some(4),
+        _ => None,
+    }
+}
 
 fn show_rom_selection() -> Result<String, Box<dyn std::error::Error>> {
     use std::fs;
-    use std::path::Path;
     use std::io::{self, Write};
+    use std::path::Path;
 
     // Scan roms directory for .nes files
     let roms_path = Path::new("roms");
@@ -25,7 +35,10 @@ fn show_rom_selection() -> Result<String, Box<dyn std::error::Error>> {
                     if extension == "nes" {
                         if let Some(file_name) = path.file_name() {
                             if let Some(name_str) = file_name.to_str() {
-                                rom_files.push((name_str.to_string(), path.to_string_lossy().to_string()));
+                                rom_files.push((
+                                    name_str.to_string(),
+                                    path.to_string_lossy().to_string(),
+                                ));
                             }
                         }
                     }
@@ -59,7 +72,6 @@ fn show_rom_selection() -> Result<String, Box<dyn std::error::Error>> {
         }
     }
 }
-
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_default_env()
@@ -104,25 +116,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     canvas.set_draw_color(sdl2::pixels::Color::RGB(5, 5, 5));
     let texture_creator = canvas.texture_creator();
 
-    let mut texture = texture_creator
-        .create_texture_streaming(PixelFormatEnum::RGB24, 256, 240)?;
+    let mut texture = texture_creator.create_texture_streaming(PixelFormatEnum::RGB24, 256, 240)?;
 
     // Set up audio
     let desired_spec = sdl2::audio::AudioSpecDesired {
         freq: Some(44100),
-        channels: Some(1), // mono
+        channels: Some(1),   // mono
         samples: Some(1024), // smaller buffer for lower latency
     };
 
     let audio_ring: Arc<SpscRingBuffer> = Arc::new(SpscRingBuffer::new(8192));
     let audio_ring_clone = audio_ring.clone();
 
-    let audio_device = audio_subsystem.open_playback(None, &desired_spec, |_spec| {
-        NesAudioCallback {
+    let audio_device =
+        audio_subsystem.open_playback(None, &desired_spec, |_spec| NesAudioCallback {
             ring: audio_ring_clone,
             phase: 0.0,
-        }
-    })?;
+        })?;
 
     audio_device.resume();
 
@@ -138,54 +148,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Handle events
         for event in event_pump.poll_iter() {
             match event {
-                Event::Quit { .. } | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => {
                     // Save SRAM before quitting
                     if let Err(e) = nes.save_sram() {
                         eprintln!("Failed to save SRAM: {}", e);
                     }
                     break 'running;
                 }
-                Event::KeyDown { keycode: Some(key), keymod, .. } => {
-                    if keymod.contains(sdl2::keyboard::Mod::LCTRLMOD) || keymod.contains(sdl2::keyboard::Mod::RCTRLMOD) {
-                        // Ctrl + number keys for save states
-                        match key {
-                            Keycode::Num1 => {
-                                let _ = nes.save_state(1, "current_rom");
+                Event::KeyDown {
+                    keycode: Some(key),
+                    keymod,
+                    ..
+                } => {
+                    if let Some(slot) = state_slot_from_key(key) {
+                        let ctrl = keymod.intersects(
+                            sdl2::keyboard::Mod::LCTRLMOD | sdl2::keyboard::Mod::RCTRLMOD,
+                        );
+                        if ctrl {
+                            if let Err(e) = nes.save_state(slot, "current_rom") {
+                                eprintln!("Failed to save state slot {}: {}", slot, e);
                             }
-                            Keycode::Num2 => {
-                                let _ = nes.save_state(2, "current_rom");
-                            }
-                            Keycode::Num3 => {
-                                let _ = nes.save_state(3, "current_rom");
-                            }
-                            Keycode::Num4 => {
-                                let _ = nes.save_state(4, "current_rom");
-                            }
-                            _ => {}
+                        } else if let Err(e) = nes.load_state(slot) {
+                            eprintln!("Failed to load state slot {}: {}", slot, e);
                         }
-                    } else {
-                        // Number keys without Ctrl for load states
-                        match key {
-                            Keycode::Num1 => {
-                                let _ = nes.load_state(1);
-                            }
-                            Keycode::Num2 => {
-                                let _ = nes.load_state(2);
-                            }
-                            Keycode::Num3 => {
-                                let _ = nes.load_state(3);
-                            }
-                            Keycode::Num4 => {
-                                let _ = nes.load_state(4);
-                            }
-                            _ => {
-                                let controller = map_key_to_controller(key, nes.get_controller());
-                                nes.set_controller(controller);
-                            }
-                        }
+                        continue;
                     }
+
+                    let controller = map_key_to_controller(key, nes.get_controller());
+                    nes.set_controller(controller);
                 }
-                Event::KeyUp { keycode: Some(key), .. } => {
+                Event::KeyUp {
+                    keycode: Some(key), ..
+                } => {
                     let controller = unmap_key_from_controller(key, nes.get_controller());
                     nes.set_controller(controller);
                 }
@@ -202,7 +200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             step_count += 1;
 
-            if step_count > 50000 { // Normal limit for frame completion
+            if step_count > 50000 {
+                // Normal limit for frame completion
                 break;
             }
         }
@@ -228,7 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             audio_ring.push_slice(&audio_samples);
         }
 
-        // Render
+        // Render the frame
         canvas.clear();
         canvas.copy(&texture, None, None)?;
         canvas.present();
@@ -240,6 +239,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(frame_duration - elapsed);
         }
         last_frame = Instant::now();
+    }
+
+    // Save SRAM before exit
+    if let Err(e) = nes.save_sram() {
+        eprintln!("Failed to save SRAM on exit: {}", e);
     }
 
     Ok(())

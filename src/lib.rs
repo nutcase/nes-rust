@@ -1,18 +1,18 @@
-pub mod cpu;
-pub mod ppu;
 pub mod apu;
-pub mod memory;
-pub mod cartridge;
+pub mod audio_ring;
 pub mod bus;
+pub mod cartridge;
+pub mod cheat;
+pub mod cpu;
+pub mod memory;
+pub mod ppu;
 pub mod save_state;
 pub mod sram;
-pub mod cheat;
-pub mod audio_ring;
 
-pub use cpu::Cpu;
-pub use cpu::StatusFlags;
 pub use bus::Bus;
 pub use cartridge::Cartridge;
+pub use cpu::Cpu;
+pub use cpu::StatusFlags;
 
 pub const CPU_CYCLES_PER_FRAME: u32 = 29830;
 
@@ -105,7 +105,6 @@ impl Nes {
             self.cpu.irq(&mut self.bus);
         }
 
-
         // APU runs at CPU clock rate
         for _ in 0..total_cycles {
             self.bus.step_apu();
@@ -127,7 +126,11 @@ impl Nes {
         self.bus.set_controller(controller);
     }
 
-    pub fn save_state(&self, slot: u8, rom_filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save_state(
+        &self,
+        slot: u8,
+        rom_filename: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (ppu_control, ppu_mask, ppu_status, ppu_oam_addr) = self.bus.get_ppu_state();
         let (ppu_v, ppu_t, ppu_x, ppu_w, ppu_scanline, ppu_cycle, ppu_frame, ppu_data_buffer) =
             self.bus.get_ppu_registers();
@@ -161,6 +164,7 @@ impl Nes {
             ram: self.bus.get_ram_flat(),
             cartridge_prg_bank: self.bus.get_cartridge_prg_bank(),
             cartridge_chr_bank: self.bus.get_cartridge_chr_bank(),
+            cartridge_state: self.bus.get_cartridge_state(),
             apu_frame_counter: 0,
             apu_frame_interrupt: false,
             rom_filename: rom_filename.to_string(),
@@ -207,6 +211,9 @@ impl Nes {
                 save_state.ppu_data_buffer,
             )),
         )?;
+        if let Some(ref state) = save_state.cartridge_state {
+            self.bus.restore_cartridge_state(state);
+        }
 
         Ok(())
     }

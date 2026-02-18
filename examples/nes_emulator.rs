@@ -2,6 +2,7 @@ mod egui_ui;
 
 use egui_ui::gl_game::GlGameRenderer;
 use egui_ui::CheatToolUi;
+use nes_emulator::audio_ring::SpscRingBuffer;
 use nes_emulator::Nes;
 use sdl2::audio::{AudioCallback, AudioSpecDesired};
 use sdl2::event::Event;
@@ -9,7 +10,6 @@ use sdl2::keyboard::Keycode;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use nes_emulator::audio_ring::SpscRingBuffer;
 use std::time::{Duration, Instant};
 
 use egui_sdl2_gl::gl;
@@ -21,6 +21,16 @@ const GAME_W: u32 = 256 * SCALE;
 const GAME_H: u32 = 240 * SCALE;
 const PANEL_WIDTH_DEFAULT: f32 = 420.0;
 const PANEL_WIDTH_MIN: f32 = 300.0;
+
+fn state_slot_from_key(code: Keycode) -> Option<u8> {
+    match code {
+        Keycode::Num1 | Keycode::Kp1 => Some(1),
+        Keycode::Num2 | Keycode::Kp2 => Some(2),
+        Keycode::Num3 | Keycode::Kp3 => Some(3),
+        Keycode::Num4 | Keycode::Kp4 => Some(4),
+        _ => None,
+    }
+}
 
 fn main() -> Result<(), String> {
     let rom_path = match std::env::args().nth(1) {
@@ -36,6 +46,10 @@ fn main() -> Result<(), String> {
         .map_err(|e| format!("Failed to load ROM: {}", e))?;
 
     let sdl = sdl2::init().map_err(|e| e.to_string())?;
+    // Keep IME native UI disabled so shortcut keys remain reliable while the
+    // cheat panel is open.
+    sdl2::hint::set("SDL_IME_SHOW_UI", "0");
+    sdl2::hint::set("SDL_IME_INTERNAL_EDITING", "0");
     let audio_subsystem = sdl.audio().map_err(|e| e.to_string())?;
     let video = sdl.video().map_err(|e| e.to_string())?;
     video.text_input().stop();
@@ -108,13 +122,20 @@ fn main() -> Result<(), String> {
                 .as_secs_f64(),
         );
 
-        let egui_wants_kb = cheat_ui.panel_visible && egui_ctx.wants_keyboard_input();
-
         for event in event_pump.poll_iter() {
             // Forward to egui first when panel is visible
             if cheat_ui.panel_visible {
-                egui_state.process_input(&window, event.clone(), &mut painter);
+                let should_block_ime = match &event {
+                    // Disallow IME composition UI/events in the cheat panel.
+                    Event::TextEditing { .. } => true,
+                    Event::TextInput { text, .. } => !text.is_ascii(),
+                    _ => false,
+                };
+                if !should_block_ime {
+                    egui_state.process_input(&window, event.clone(), &mut painter);
+                }
             }
+            let egui_wants_kb_now = cheat_ui.panel_visible && egui_ctx.wants_keyboard_input();
 
             match &event {
                 Event::Quit { .. } => {
@@ -129,6 +150,8 @@ fn main() -> Result<(), String> {
                 } => {
                     let code = *code;
                     let keymod = *keymod;
+                    let ctrl = keymod
+                        .intersects(sdl2::keyboard::Mod::LCTRLMOD | sdl2::keyboard::Mod::RCTRLMOD);
 
                     if code == Keycode::Tab {
                         cheat_ui.panel_visible = !cheat_ui.panel_visible;
@@ -141,62 +164,32 @@ fn main() -> Result<(), String> {
                         continue;
                     }
 
-                    // Skip game hotkeys when egui text fields have focus
-                    if egui_wants_kb {
+                    // When a text field in the cheat panel has focus, never
+                    // forward keyboard input to emulator controls/hotkeys.
+                    if egui_wants_kb_now {
+                        pressed.clear();
                         continue;
                     }
 
-                    let ctrl = keymod
-                        .intersects(sdl2::keyboard::Mod::LCTRLMOD | sdl2::keyboard::Mod::RCTRLMOD);
-
-                    if ctrl {
-                        // Ctrl+1-4: save state
-                        match code {
-                            Keycode::Num1 => {
-                                let _ = nes.save_state(1, "current_rom");
+                    if let Some(slot) = state_slot_from_key(code) {
+                        if ctrl {
+                            if let Err(e) = nes.save_state(slot, "current_rom") {
+                                eprintln!("Failed to save state slot {}: {}", slot, e);
                             }
-                            Keycode::Num2 => {
-                                let _ = nes.save_state(2, "current_rom");
-                            }
-                            Keycode::Num3 => {
-                                let _ = nes.save_state(3, "current_rom");
-                            }
-                            Keycode::Num4 => {
-                                let _ = nes.save_state(4, "current_rom");
-                            }
-                            _ => {
-                                pressed.insert(code);
-                            }
+                        } else if let Err(e) = nes.load_state(slot) {
+                            eprintln!("Failed to load state slot {}: {}", slot, e);
                         }
-                    } else {
-                        // Number keys without Ctrl: load state
-                        match code {
-                            Keycode::Num1 => {
-                                let _ = nes.load_state(1);
-                            }
-                            Keycode::Num2 => {
-                                let _ = nes.load_state(2);
-                            }
-                            Keycode::Num3 => {
-                                let _ = nes.load_state(3);
-                            }
-                            Keycode::Num4 => {
-                                let _ = nes.load_state(4);
-                            }
-                            _ => {
-                                pressed.insert(code);
-                            }
-                        }
+                        continue;
                     }
+
+                    pressed.insert(code);
                 }
                 Event::KeyUp {
                     keycode: Some(code),
                     repeat: false,
                     ..
                 } => {
-                    if !egui_wants_kb {
-                        pressed.remove(code);
-                    }
+                    pressed.remove(code);
                 }
                 _ => {}
             }
@@ -205,7 +198,10 @@ fn main() -> Result<(), String> {
         // Resize window on panel toggle
         if cheat_ui.panel_visible != prev_panel_visible {
             if cheat_ui.panel_visible {
+                video.text_input().start();
                 cheat_ui.refresh(nes.ram());
+            } else {
+                video.text_input().stop();
             }
             let new_w = if cheat_ui.panel_visible {
                 GAME_W + panel_width_px
@@ -309,11 +305,7 @@ fn main() -> Result<(), String> {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                cheat_ui.show_panel(
-                                    ui,
-                                    &mut ram_writes,
-                                    Some(&cheat_path),
-                                );
+                                cheat_ui.show_panel(ui, &mut ram_writes, Some(&cheat_path));
                             });
                     });
                 let actual_w = panel_resp.response.rect.width() as u32;

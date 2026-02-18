@@ -1,8 +1,8 @@
+use crate::apu::Apu;
+use crate::cartridge::{Cartridge, CartridgeState};
 use crate::cpu::CpuBus;
 use crate::memory::Memory;
 use crate::ppu::Ppu;
-use crate::apu::Apu;
-use crate::cartridge::Cartridge;
 
 pub struct Bus {
     memory: Memory,
@@ -11,8 +11,8 @@ pub struct Bus {
     cartridge: Option<Cartridge>,
     pub controller: u8,
     controller_state: u16,
-    strobe: bool, // Controller strobe mode
-    dma_cycles: u32, // Cycles to add due to DMA operations
+    strobe: bool,          // Controller strobe mode
+    dma_cycles: u32,       // Cycles to add due to DMA operations
     dma_in_progress: bool, // Flag to indicate DMA is in progress
 }
 
@@ -77,7 +77,11 @@ impl Bus {
             self.controller_state = self.controller as u16;
             return self.controller as u8 & 0x01;
         }
-        let value = if self.controller_state & 0x01 != 0 { 0x01 } else { 0x00 };
+        let value = if self.controller_state & 0x01 != 0 {
+            0x01
+        } else {
+            0x00
+        };
         self.controller_state >>= 1;
         value
     }
@@ -149,15 +153,24 @@ impl Bus {
 }
 
 impl CpuBus for Bus {
-    fn check_game_specific_cpu_protection(&self, pc: u16, sp: u8, cycles: u64) -> Option<(u16, u8)> {
+    fn check_game_specific_cpu_protection(
+        &self,
+        pc: u16,
+        sp: u8,
+        cycles: u64,
+    ) -> Option<(u16, u8)> {
         if let Some(ref cartridge) = self.cartridge {
-            if let Some(_result) = cartridge.goonies_check_ce7x_loop(pc, sp, cycles) {
-            }
+            if let Some(_result) = cartridge.goonies_check_ce7x_loop(pc, sp, cycles) {}
         }
         None
     }
 
-    fn check_game_specific_brk_protection(&self, pc: u16, sp: u8, cycles: u64) -> Option<(u16, u8)> {
+    fn check_game_specific_brk_protection(
+        &self,
+        pc: u16,
+        sp: u8,
+        cycles: u64,
+    ) -> Option<(u16, u8)> {
         if let Some(ref cartridge) = self.cartridge {
             cartridge.goonies_check_abnormal_brk(pc, sp, cycles)
         } else {
@@ -175,19 +188,13 @@ impl CpuBus for Bus {
 
     fn read(&mut self, addr: u16) -> u8 {
         match addr {
-            0x0000..=0x1FFF => {
-                self.memory.read(addr)
-            },
+            0x0000..=0x1FFF => self.memory.read(addr),
             0x2000..=0x3FFF => {
                 let mirrored = 0x2000 + (addr & 0x07);
                 self.ppu.read_register(mirrored, self.cartridge.as_ref())
             }
-            0x4000..=0x4013 | 0x4015 => {
-                self.apu.read_register(addr)
-            },
-            0x4016 => {
-                self.read_controller()
-            }
+            0x4000..=0x4013 | 0x4015 => self.apu.read_register(addr),
+            0x4016 => self.read_controller(),
             0x4017 => 0,
             0x6000..=0x7FFF => {
                 if let Some(ref cartridge) = self.cartridge {
@@ -195,14 +202,14 @@ impl CpuBus for Bus {
                 } else {
                     0
                 }
-            },
+            }
             0x8000..=0xFFFF => {
                 if let Some(ref cartridge) = self.cartridge {
                     cartridge.read_prg(addr)
                 } else {
                     0
                 }
-            },
+            }
             _ => 0,
         }
     }
@@ -211,18 +218,21 @@ impl CpuBus for Bus {
         match addr {
             0x0000..=0x1FFF => {
                 self.memory.write(addr, data);
-            },
+            }
             0x2000..=0x3FFF => {
                 let mirrored = 0x2000 + (addr & 0x07);
-                if let Some((chr_addr, chr_data)) = self.ppu.write_register(mirrored, data, self.cartridge.as_ref()) {
+                if let Some((chr_addr, chr_data)) =
+                    self.ppu
+                        .write_register(mirrored, data, self.cartridge.as_ref())
+                {
                     if let Some(ref mut cartridge) = self.cartridge {
                         cartridge.write_chr(chr_addr, chr_data);
                     }
                 }
-            },
+            }
             0x4000..=0x4013 | 0x4015 | 0x4017 => {
                 self.apu.write_register(addr, data);
-            },
+            }
             0x4014 => {
                 // OAM DMA: Copy 256 bytes from CPU page to PPU OAM
                 let base = (data as u16) << 8;
@@ -237,14 +247,14 @@ impl CpuBus for Bus {
                             } else {
                                 0
                             }
-                        },
+                        }
                         0x8000..=0xFFFF => {
                             if let Some(ref cartridge) = self.cartridge {
                                 cartridge.read_prg(src)
                             } else {
                                 0
                             }
-                        },
+                        }
                         _ => 0,
                     };
                     let oam_dst = oam_addr.wrapping_add(i as u8);
@@ -252,7 +262,7 @@ impl CpuBus for Bus {
                 }
                 self.dma_in_progress = true;
                 self.dma_cycles = 513;
-            },
+            }
             0x4016 => {
                 // Controller strobe
                 let new_strobe = (data & 0x01) != 0;
@@ -261,21 +271,21 @@ impl CpuBus for Bus {
                     self.controller_state = self.controller as u16;
                 }
                 self.strobe = new_strobe;
-            },
+            }
             0x4020..=0xFFFF => {
                 if let Some(ref mut cartridge) = self.cartridge {
                     match addr {
                         0x6000..=0x7FFF => {
                             cartridge.write_prg_ram(addr, data);
-                        },
+                        }
                         0x8000..=0xFFFF => {
                             cartridge.write_prg(addr, data);
-                        },
+                        }
                         _ => {}
                     }
                 }
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
 }
@@ -348,6 +358,16 @@ impl Bus {
         }
     }
 
+    pub fn get_cartridge_state(&self) -> Option<CartridgeState> {
+        self.cartridge.as_ref().map(|c| c.snapshot_state())
+    }
+
+    pub fn restore_cartridge_state(&mut self, state: &CartridgeState) {
+        if let Some(ref mut cartridge) = self.cartridge {
+            cartridge.restore_state(state);
+        }
+    }
+
     pub fn restore_state_flat(
         &mut self,
         palette: impl AsRef<[u8]>,
@@ -393,8 +413,24 @@ impl Bus {
         }
 
         // Restore PPU registers
-        if let Some((control, mask, status, oam_addr, v, t, x, w, scanline, cycle, frame, read_buf)) = ppu_regs {
-            self.ppu.restore_registers(control, mask, status, oam_addr, v, t, x, w, scanline, cycle, frame, read_buf);
+        if let Some((
+            control,
+            mask,
+            status,
+            oam_addr,
+            v,
+            t,
+            x,
+            w,
+            scanline,
+            cycle,
+            frame,
+            read_buf,
+        )) = ppu_regs
+        {
+            self.ppu.restore_registers(
+                control, mask, status, oam_addr, v, t, x, w, scanline, cycle, frame, read_buf,
+            );
         }
 
         // Restore cartridge bank state

@@ -1,14 +1,15 @@
 mod mapper;
 
 use mapper::Mmc1;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Result};
 
 pub struct Cartridge {
     prg_rom: Vec<u8>,
     chr_rom: Vec<u8>,
-    chr_ram: Vec<u8>,  // CHR-RAM for MMC1 and other mappers
-    prg_ram: Vec<u8>,  // Battery-backed SRAM for save data
+    chr_ram: Vec<u8>, // CHR-RAM for MMC1 and other mappers
+    prg_ram: Vec<u8>, // Battery-backed SRAM for save data
     has_valid_save_data: bool,
     mapper: u8,
     mirroring: Mirroring,
@@ -19,7 +20,7 @@ pub struct Cartridge {
     mmc1: Option<Mmc1>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Mirroring {
     Horizontal,
     Vertical,
@@ -28,8 +29,30 @@ pub enum Mirroring {
     OneScreenUpper,
 }
 
-impl Cartridge {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mmc1State {
+    pub shift_register: u8,
+    pub shift_count: u8,
+    pub control: u8,
+    pub chr_bank_0: u8,
+    pub chr_bank_1: u8,
+    pub prg_bank: u8,
+    pub prg_ram_disable: bool,
+}
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CartridgeState {
+    pub mapper: u8,
+    pub mirroring: Mirroring,
+    pub prg_bank: u8,
+    pub chr_bank: u8,
+    pub prg_ram: Vec<u8>,
+    pub chr_ram: Vec<u8>,
+    pub has_valid_save_data: bool,
+    pub mmc1: Option<Mmc1State>,
+}
+
+impl Cartridge {
     pub fn load(path: &str) -> Result<Self> {
         let mut file = File::open(path)?;
         let mut data = Vec::new();
@@ -71,15 +94,10 @@ impl Cartridge {
         };
 
         // Detect Goonies by ROM size and mapper
-        let is_goonies = (mapper == 3 || mapper == 87) &&
-                         prg_rom.len() == 32768 &&
-                         chr_rom.len() == 16384;
+        let is_goonies =
+            (mapper == 3 || mapper == 87) && prg_rom.len() == 32768 && chr_rom.len() == 16384;
 
-        let mmc1 = if mapper == 1 {
-            Some(Mmc1::new())
-        } else {
-            None
-        };
+        let mmc1 = if mapper == 1 { Some(Mmc1::new()) } else { None };
 
         // Initialize PRG-RAM for mappers that support it
         let prg_ram = if mapper == 1 {
@@ -217,19 +235,34 @@ impl Cartridge {
     }
 
     pub fn get_prg_bank(&self) -> u8 {
-        self.prg_bank
+        if let Some(ref mmc1) = self.mmc1 {
+            mmc1.prg_bank
+        } else {
+            self.prg_bank
+        }
     }
 
     pub fn get_chr_bank(&self) -> u8 {
-        self.chr_bank
+        if let Some(ref mmc1) = self.mmc1 {
+            mmc1.chr_bank_0
+        } else {
+            self.chr_bank
+        }
     }
 
     pub fn set_prg_bank(&mut self, bank: u8) {
         self.prg_bank = bank;
+        if let Some(ref mut mmc1) = self.mmc1 {
+            mmc1.prg_bank = bank & 0x0F;
+        }
     }
 
     pub fn set_chr_bank(&mut self, bank: u8) {
         self.chr_bank = bank;
+        if let Some(ref mut mmc1) = self.mmc1 {
+            mmc1.chr_bank_0 = bank;
+            mmc1.chr_bank_1 = bank;
+        }
     }
 
     pub fn has_battery_save(&self) -> bool {
@@ -267,5 +300,142 @@ impl Cartridge {
         } else {
             Some(&mut self.prg_ram)
         }
+    }
+
+    pub fn snapshot_state(&self) -> CartridgeState {
+        let mmc1 = self.mmc1.as_ref().map(|m| Mmc1State {
+            shift_register: m.shift_register,
+            shift_count: m.shift_count,
+            control: m.control,
+            chr_bank_0: m.chr_bank_0,
+            chr_bank_1: m.chr_bank_1,
+            prg_bank: m.prg_bank,
+            prg_ram_disable: m.prg_ram_disable,
+        });
+
+        CartridgeState {
+            mapper: self.mapper,
+            mirroring: self.mirroring,
+            prg_bank: self.get_prg_bank(),
+            chr_bank: self.get_chr_bank(),
+            prg_ram: self.prg_ram.clone(),
+            chr_ram: self.chr_ram.clone(),
+            has_valid_save_data: self.has_valid_save_data,
+            mmc1,
+        }
+    }
+
+    pub fn restore_state(&mut self, state: &CartridgeState) {
+        if state.mapper != self.mapper {
+            return;
+        }
+
+        self.mirroring = state.mirroring;
+        self.set_prg_bank(state.prg_bank);
+        self.set_chr_bank(state.chr_bank);
+        self.has_valid_save_data = state.has_valid_save_data;
+
+        let prg_len = self.prg_ram.len().min(state.prg_ram.len());
+        if prg_len > 0 {
+            self.prg_ram[..prg_len].copy_from_slice(&state.prg_ram[..prg_len]);
+        }
+
+        let chr_len = self.chr_ram.len().min(state.chr_ram.len());
+        if chr_len > 0 {
+            self.chr_ram[..chr_len].copy_from_slice(&state.chr_ram[..chr_len]);
+        }
+
+        if let (Some(ref mut mmc1), Some(saved)) = (self.mmc1.as_mut(), state.mmc1.as_ref()) {
+            mmc1.shift_register = saved.shift_register;
+            mmc1.shift_count = saved.shift_count;
+            mmc1.control = saved.control;
+            mmc1.chr_bank_0 = saved.chr_bank_0;
+            mmc1.chr_bank_1 = saved.chr_bank_1;
+            mmc1.prg_bank = saved.prg_bank;
+            mmc1.prg_ram_disable = saved.prg_ram_disable;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_mmc1_cart() -> Cartridge {
+        Cartridge {
+            prg_rom: vec![0; 0x8000],
+            chr_rom: vec![0; 0x2000],
+            chr_ram: vec![0; 0x2000],
+            prg_ram: vec![0; 0x2000],
+            has_valid_save_data: true,
+            mapper: 1,
+            mirroring: Mirroring::Vertical,
+            has_battery: true,
+            chr_bank: 0,
+            prg_bank: 0,
+            is_goonies: false,
+            mmc1: Some(Mmc1::new()),
+        }
+    }
+
+    #[test]
+    fn snapshot_and_restore_keeps_mmc1_and_ram_state() {
+        let mut cart = make_mmc1_cart();
+        {
+            let mmc1 = cart.mmc1.as_mut().unwrap();
+            mmc1.shift_register = 0x1B;
+            mmc1.shift_count = 3;
+            mmc1.control = 0x12;
+            mmc1.chr_bank_0 = 7;
+            mmc1.chr_bank_1 = 9;
+            mmc1.prg_bank = 5;
+            mmc1.prg_ram_disable = true;
+        }
+        cart.prg_ram[0x10] = 0xAA;
+        cart.chr_ram[0x20] = 0x55;
+
+        let snapshot = cart.snapshot_state();
+
+        cart.mirroring = Mirroring::Horizontal;
+        cart.has_valid_save_data = false;
+        cart.prg_ram.fill(0);
+        cart.chr_ram.fill(0);
+        {
+            let mmc1 = cart.mmc1.as_mut().unwrap();
+            mmc1.shift_register = 0x10;
+            mmc1.shift_count = 0;
+            mmc1.control = 0x0C;
+            mmc1.chr_bank_0 = 0;
+            mmc1.chr_bank_1 = 0;
+            mmc1.prg_bank = 0;
+            mmc1.prg_ram_disable = false;
+        }
+
+        cart.restore_state(&snapshot);
+
+        assert_eq!(cart.mirroring, Mirroring::Vertical);
+        assert!(cart.has_valid_save_data);
+        assert_eq!(cart.prg_ram[0x10], 0xAA);
+        assert_eq!(cart.chr_ram[0x20], 0x55);
+
+        let mmc1 = cart.mmc1.as_ref().unwrap();
+        assert_eq!(mmc1.shift_register, 0x1B);
+        assert_eq!(mmc1.shift_count, 3);
+        assert_eq!(mmc1.control, 0x12);
+        assert_eq!(mmc1.chr_bank_0, 7);
+        assert_eq!(mmc1.chr_bank_1, 9);
+        assert_eq!(mmc1.prg_bank, 5);
+        assert!(mmc1.prg_ram_disable);
+    }
+
+    #[test]
+    fn restore_state_ignores_mapper_mismatch() {
+        let mut cart = make_mmc1_cart();
+        let mut state = cart.snapshot_state();
+        state.mapper = 2;
+
+        cart.prg_ram[0] = 0x11;
+        cart.restore_state(&state);
+        assert_eq!(cart.prg_ram[0], 0x11);
     }
 }

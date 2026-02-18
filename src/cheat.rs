@@ -7,9 +7,7 @@ pub struct RamSnapshot {
 
 impl RamSnapshot {
     pub fn capture(ram: &[u8]) -> Self {
-        Self {
-            data: ram.to_vec(),
-        }
+        Self { data: ram.to_vec() }
     }
 
     pub fn get(&self, addr: u32) -> u8 {
@@ -107,14 +105,18 @@ impl CheatSearch {
     }
 
     pub fn apply_filter(&mut self, filter: SearchFilter, current_ram: &[u8]) {
+        if current_ram.len() != self.ram_size {
+            self.resize(current_ram.len());
+        }
+
         // BCD search: replace candidates with matching start addresses
         if let SearchFilter::BcdEqual(value) = filter {
             let digits = SearchFilter::bcd_digits(value);
             let num_digits = digits.len();
-            let mut matches = Vec::new();
+            let mut matches = Vec::with_capacity(self.candidates.len());
             let ram_len = current_ram.len();
             let candidates = std::mem::take(&mut self.candidates);
-            for &addr in &candidates {
+            for addr in candidates {
                 let a = addr as usize;
                 if a + num_digits > ram_len {
                     continue;
@@ -132,39 +134,52 @@ impl CheatSearch {
             return;
         }
 
-        let snap = match &self.snapshot {
-            Some(s) if filter.needs_snapshot() => s,
-            _ if filter.needs_snapshot() => return,
-            _ => {
-                self.candidates.retain(|&addr| {
+        if filter.needs_snapshot() {
+            let mut next = Vec::with_capacity(self.candidates.len());
+            {
+                let snap = match self.snapshot.as_ref() {
+                    Some(s) => s,
+                    None => return,
+                };
+                let candidates = std::mem::take(&mut self.candidates);
+                for addr in candidates {
                     let cur = current_ram.get(addr as usize).copied().unwrap_or(0);
-                    match filter {
-                        SearchFilter::Equal(v) => cur == v,
-                        SearchFilter::NotEqual(v) => cur != v,
-                        SearchFilter::GreaterThan(v) => cur > v,
-                        SearchFilter::LessThan(v) => cur < v,
+                    let prev = snap.get(addr);
+                    let keep = match filter {
+                        SearchFilter::Increased => cur > prev,
+                        SearchFilter::Decreased => cur < prev,
+                        SearchFilter::Changed => cur != prev,
+                        SearchFilter::Unchanged => cur == prev,
+                        SearchFilter::IncreasedBy(d) => cur == prev.wrapping_add(d),
+                        SearchFilter::DecreasedBy(d) => cur == prev.wrapping_sub(d),
                         _ => unreachable!(),
+                    };
+                    if keep {
+                        next.push(addr);
                     }
-                });
-                self.snapshot = Some(RamSnapshot::capture(current_ram));
-                return;
+                }
             }
-        };
+            self.candidates = next;
+            self.snapshot = Some(RamSnapshot::capture(current_ram));
+            return;
+        }
 
-        let snap_clone = snap.clone();
-        self.candidates.retain(|&addr| {
+        let candidates = std::mem::take(&mut self.candidates);
+        let mut next = Vec::with_capacity(candidates.len());
+        for addr in candidates {
             let cur = current_ram.get(addr as usize).copied().unwrap_or(0);
-            let prev = snap_clone.get(addr);
-            match filter {
-                SearchFilter::Increased => cur > prev,
-                SearchFilter::Decreased => cur < prev,
-                SearchFilter::Changed => cur != prev,
-                SearchFilter::Unchanged => cur == prev,
-                SearchFilter::IncreasedBy(d) => cur == prev.wrapping_add(d),
-                SearchFilter::DecreasedBy(d) => cur == prev.wrapping_sub(d),
+            let keep = match filter {
+                SearchFilter::Equal(v) => cur == v,
+                SearchFilter::NotEqual(v) => cur != v,
+                SearchFilter::GreaterThan(v) => cur > v,
+                SearchFilter::LessThan(v) => cur < v,
                 _ => unreachable!(),
+            };
+            if keep {
+                next.push(addr);
             }
-        });
+        }
+        self.candidates = next;
         self.snapshot = Some(RamSnapshot::capture(current_ram));
     }
 
@@ -368,6 +383,20 @@ mod tests {
         search.apply_filter(SearchFilter::Equal(42), &ram);
         assert_eq!(search.candidate_count(), 1);
         assert_eq!(search.candidates()[0], 0x900);
+    }
+
+    #[test]
+    fn test_apply_filter_resizes_automatically() {
+        let size = WORK_RAM_SIZE + 0x2000;
+        let mut ram = vec![0u8; size];
+        ram[0xA10] = 77;
+
+        let mut search = CheatSearch::new();
+        search.apply_filter(SearchFilter::Equal(77), &ram);
+
+        assert_eq!(search.ram_size(), size);
+        assert_eq!(search.candidate_count(), 1);
+        assert_eq!(search.candidates()[0], 0xA10);
     }
 
     #[test]
