@@ -2,6 +2,7 @@ use egui::{self, Color32, RichText};
 use nes_emulator::cheat::{CheatManager, CheatSearch, SearchFilter, WORK_RAM_SIZE};
 
 const RESULT_ROW_HEIGHT: f32 = 18.0;
+const CHEAT_ENTRY_ROW_HEIGHT: f32 = 18.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FilterKind {
@@ -329,29 +330,32 @@ impl CheatSearchUi {
         });
 
         let mut remove_idx = None;
+        let entry_count = self.manager.entries.len();
         egui::ScrollArea::vertical()
             .id_salt("cheat_entries")
             .max_height(120.0)
-            .show(ui, |ui| {
+            .show_rows(ui, CHEAT_ENTRY_ROW_HEIGHT, entry_count, |ui, row_range| {
                 ui.style_mut().override_font_id = Some(egui::FontId::monospace(12.0));
-                for (i, entry) in self.manager.entries.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut entry.enabled, "");
-                        ui.label(format_addr(entry.address, wram_size));
-                        ui.label("=");
-                        let mut val_str = format!("{:02X}", entry.value);
-                        let resp =
-                            ui.add(egui::TextEdit::singleline(&mut val_str).desired_width(25.0));
-                        if resp.changed() {
-                            if let Some(v) = parse_u8_value(&val_str) {
-                                entry.value = v;
+                for i in row_range {
+                    if let Some(entry) = self.manager.entries.get_mut(i) {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut entry.enabled, "");
+                            ui.label(format_addr(entry.address, wram_size));
+                            ui.label("=");
+                            let mut val_str = format!("{:02X}", entry.value);
+                            let resp = ui
+                                .add(egui::TextEdit::singleline(&mut val_str).desired_width(25.0));
+                            if resp.changed() {
+                                if let Some(v) = parse_u8_value(&val_str) {
+                                    entry.value = v;
+                                }
                             }
-                        }
-                        ui.text_edit_singleline(&mut entry.label);
-                        if ui.small_button("X").clicked() {
-                            remove_idx = Some(i);
-                        }
-                    });
+                            ui.text_edit_singleline(&mut entry.label);
+                            if ui.small_button("X").clicked() {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    }
                 }
             });
 
