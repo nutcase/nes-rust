@@ -86,4 +86,4 @@ The emulator follows the NES hardware architecture:
 
 ## License
 
-MIT
+This project is for educational purposes.
