@@ -67,7 +67,6 @@ impl Nes {
             }
         } else {
             // Normal CPU execution
-            self.bus.set_debug_pc(self.cpu.pc);
             let cpu_cycles = self.cpu.step(&mut self.bus);
 
             // Safety check for zero cycles

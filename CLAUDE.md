@@ -49,8 +49,8 @@ Nes (main.rs)  ──>  Bus (bus.rs)  ──>  CPU, PPU, APU, Memory, Cartridge
 - **CPU** (`src/cpu/mod.rs`): 6502 processor with all official + unofficial opcodes. ~2600 lines. Uses `CpuBus` trait (defined at bottom of file) for memory access. Status flags use `bitflags!` crate (`StatusFlags`).
 - **PPU** (`src/ppu/mod.rs`): Monolithic implementation with Loopy scrolling registers (`v`, `t`, `x`, `w`). The `ppu/` directory also contains an unused refactored version split into submodules (`registers.rs`, `memory.rs`, `background.rs`, `sprites.rs`, `renderer.rs`) via `new_mod.rs`/`complex_mod.rs` — the active code is all in `mod.rs`. Fields are `pub` under `#[cfg(test)]` for test access.
 - **APU** (`src/apu/mod.rs`): Pulse (x2), triangle, noise channels. Outputs at 44.1kHz with high-pass and low-pass filters. Audio is buffered and consumed by SDL2 callback via `Arc<Mutex<Vec<f32>>>`.
-- **Bus** (`src/bus.rs`): Central interconnect implementing `CpuBus` trait. Handles memory-mapped I/O routing, OAM DMA, and controller reads. Contains game-specific debug/monitoring code (DQ3, Goonies).
-- **Cartridge** (`src/cartridge/mod.rs`): iNES ROM loading and mapper implementations (0/NROM, 1/MMC1, 2/UxROM, 3/CNROM, 87). MMC1 state tracked in `Mmc1` struct (shift register, bank registers). Game detection via ROM analysis (e.g., `is_goonies()`, `is_dq3_detected()`).
+- **Bus** (`src/bus.rs`): Central interconnect implementing `CpuBus` trait. Handles memory-mapped I/O routing, OAM DMA, and controller reads.
+- **Cartridge** (`src/cartridge/mod.rs`): iNES ROM loading with thin dispatch methods. Mapper implementations live in `src/cartridge/mapper/` (nrom.rs, mmc1.rs, uxrom.rs, cnrom.rs). Supports mappers 0/NROM, 1/MMC1, 2/UxROM, 3/CNROM, 87.
 - **Memory** (`src/memory/mod.rs`): 2KB RAM with mirroring. Simple read/write with address masking (`addr & 0x7FF`).
 
 ### Key Traits

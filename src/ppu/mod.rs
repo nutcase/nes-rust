@@ -190,30 +190,6 @@ impl Ppu {
             frame_complete: false,
         };
         
-        // Standard palette initialization
-        ppu.palette[0] = 0x0F;  // Black background color (DQ3 expects this)
-        
-        // DQ3 title screen palette initialization (common color scheme)
-        ppu.palette[1] = 0x30;  // White (for text)
-        ppu.palette[2] = 0x16;  // Red
-        ppu.palette[3] = 0x27;  // Orange
-        
-        
-        // Sprite palette 0 (for cursor)
-        ppu.palette[17] = 0x30; // White
-        ppu.palette[18] = 0x16; // Red
-        ppu.palette[19] = 0x27; // Orange
-        
-        // Initialize buffer to black background (normal NES behavior)
-        for pixel in ppu.buffer.chunks_mut(3) {
-            pixel[0] = 5;   // Dark gray (NES color 0x0F)
-            pixel[1] = 5;   
-            pixel[2] = 5;   
-        }
-        
-        // Initialize DQ3 title screen nametable
-        // RE-ENABLED: DQ3 may not set up title screen naturally
-        
         ppu
     }
 
@@ -335,72 +311,43 @@ impl Ppu {
     }
 
     pub fn force_full_render(&mut self, cartridge: Option<&crate::cartridge::Cartridge>) {
-        // Force complete nametable rendering like reference implementation
-        
         if let Some(cart) = cartridge {
-            // Render the main nametable ($2000-$23BF)
-            for tile_y in 0..30 { // 30 rows of tiles
-                for tile_x in 0..32 { // 32 columns of tiles
+            for tile_y in 0..30 {
+                for tile_x in 0..32 {
                     let nametable_offset = tile_y * 32 + tile_x;
-                    let tile_index = self.nametable[0][nametable_offset]; // Use nametable 0
-                    
-                    // Get pattern table address (background uses $0000 or $1000)
+                    let tile_index = self.nametable[0][nametable_offset];
+
                     let pattern_table_base = if self.control.contains(PpuControl::BG_PATTERN) { 0x1000 } else { 0x0000 };
                     let tile_addr = pattern_table_base + (tile_index as u16) * 16;
-                    
-                    // Debug: Check if reading DQ3 title text tiles
-                    if cart.is_dq3_detected() && (tile_index == 0x44 || tile_index == 0x52 || tile_index == 0x41) {
-                        static mut DQ3_TITLE_DEBUG: u32 = 0;
-                        unsafe {
-                            DQ3_TITLE_DEBUG += 1;
-                            if DQ3_TITLE_DEBUG <= 10 {
-                            }
-                        }
-                    }
-                    
-                    // Read tile data from CHR
+
                     let mut tile_data = [0u8; 16];
                     for i in 0..16 {
                         tile_data[i] = cart.read_chr(tile_addr + i as u16);
                     }
-                    
-                    // Debug: Check first byte of important tiles
-                    if cart.is_dq3_detected() && (tile_index == 0x44 || tile_index == 0x52 || tile_index == 0x41) {
-                        static mut DQ3_CHR_DEBUG: u32 = 0;
-                        unsafe {
-                            DQ3_CHR_DEBUG += 1;
-                            if DQ3_CHR_DEBUG <= 10 {
-                            }
-                        }
-                    }
-                    
-                    // Convert tile to 8x8 pixels
+
                     for pixel_y in 0..8 {
                         let low_byte = tile_data[pixel_y];
                         let high_byte = tile_data[pixel_y + 8];
-                        
+
                         for pixel_x in 0..8 {
                             let bit = 7 - pixel_x;
                             let low_bit = (low_byte >> bit) & 1;
                             let high_bit = (high_byte >> bit) & 1;
                             let pixel_value = (high_bit << 1) | low_bit;
-                            
-                            // Always draw pixels (including background color when pixel_value is 0)
+
                             let screen_x = tile_x * 8 + pixel_x;
                             let screen_y = tile_y * 8 + pixel_y;
-                            
+
                             if screen_x < 256 && screen_y < 240 {
                                 let buffer_index = (screen_y * 256 + screen_x) * 3;
                                 if buffer_index + 2 < self.buffer.len() {
-                                    // Get color from palette - use palette 0 for background
-                                    // For simplicity in forced rendering, use palette 0
                                     let palette_index = if pixel_value == 0 {
-                                        self.palette[0] // Background color
+                                        self.palette[0]
                                     } else {
-                                        self.palette[pixel_value as usize] // Foreground colors
+                                        self.palette[pixel_value as usize]
                                     };
                                     let color = PALETTE_COLORS[palette_index as usize];
-                                        
+
                                     self.buffer[buffer_index] = color.0;
                                     self.buffer[buffer_index + 1] = color.1;
                                     self.buffer[buffer_index + 2] = color.2;
@@ -411,86 +358,8 @@ impl Ppu {
                 }
             }
         }
-        
-        // Set flag to prevent this frame from being overwritten
+
         self.force_rendered_frame = true;
-        
-    }
-    
-    pub fn force_test_display(&mut self) {
-        // Force a visible test pattern directly to frame buffer to verify screen display
-        
-        // DISABLED: Fill screen with dark blue background for adventure book
-        // This was overwriting the title screen, so it's disabled for DQ3
-        /*
-        for y in 0..240 {
-            for x in 0..256 {
-                let offset = (y * 256 + x) * 3;
-                if offset + 2 < self.buffer.len() {
-                    self.buffer[offset] = 0;       // Red
-                    self.buffer[offset + 1] = 0;   // Green
-                    self.buffer[offset + 2] = 64;  // Blue (dark blue background)
-                }
-            }
-        }
-        */
-        
-        // Write title "ぼうけんのしょ" (Adventure Book) 
-        let title_x = 80;
-        let title_y = 80;
-        
-        // Draw title bar
-        for y in title_y..title_y + 24 {
-            for x in title_x..title_x + 96 {
-                let offset = (y * 256 + x) * 3;
-                if offset + 2 < self.buffer.len() {
-                    self.buffer[offset] = 255;     // White
-                    self.buffer[offset + 1] = 255;
-                    self.buffer[offset + 2] = 255;
-                }
-            }
-        }
-        
-        // Draw "ぼうけんのしょ" using simple pixel art
-        let adventure_text_x = 84;
-        let adventure_text_y = 84;
-        
-        // Simple representation of Japanese characters
-        for y in adventure_text_y..adventure_text_y + 16 {
-            for x in adventure_text_x..adventure_text_x + 88 {
-                let offset = (y * 256 + x) * 3;
-                if offset + 2 < self.buffer.len() {
-                    // Create simple pattern for "冒険の書"
-                    if (x - adventure_text_x) % 8 < 6 && (y - adventure_text_y) % 4 < 2 {
-                        self.buffer[offset] = 0;       // Black text
-                        self.buffer[offset + 1] = 0;
-                        self.buffer[offset + 2] = 0;
-                    }
-                }
-            }
-        }
-        
-        // Add selection options (fake save slots)
-        for slot in 0..3 {
-            let slot_y = 130 + slot * 30;
-            let slot_x = 64;
-            
-            // Draw slot background
-            for y in slot_y..slot_y + 20 {
-                for x in slot_x..slot_x + 128 {
-                    let offset = (y * 256 + x) * 3;
-                    if offset + 2 < self.buffer.len() {
-                        self.buffer[offset] = 200;     // Light gray
-                        self.buffer[offset + 1] = 200;
-                        self.buffer[offset + 2] = 200;
-                    }
-                }
-            }
-        }
-        
-        // Set flag to prevent this frame from being overwritten
-        self.force_rendered_frame = true;
-        
     }
 
     fn rendering_enabled(&self) -> bool {
@@ -1018,33 +887,6 @@ impl Ppu {
     }
 }
 
-fn get_nes_color(index: u8) -> (u8, u8, u8) {
-    let palette = [
-        (0x80, 0x80, 0x80), (0x00, 0x3D, 0xA6), (0x00, 0x12, 0xB0), (0x44, 0x00, 0x96),
-        (0xA1, 0x00, 0x5E), (0xC7, 0x00, 0x28), (0xBA, 0x06, 0x00), (0x8C, 0x17, 0x00),
-        (0x5C, 0x2F, 0x00), (0x10, 0x45, 0x00), (0x05, 0x4A, 0x00), (0x00, 0x47, 0x2E),
-        (0x00, 0x41, 0x66), (0x00, 0x00, 0x00), (0x05, 0x05, 0x05), (0x05, 0x05, 0x05),
-        (0xC7, 0xC7, 0xC7), (0x00, 0x77, 0xFF), (0x21, 0x55, 0xFF), (0x82, 0x37, 0xFA),
-        (0xEB, 0x2F, 0xB5), (0xFF, 0x29, 0x50), (0xFF, 0x22, 0x00), (0xD6, 0x32, 0x00),
-        (0xC4, 0x62, 0x00), (0x35, 0x80, 0x00), (0x05, 0x8F, 0x00), (0x00, 0x8A, 0x55),
-        (0x00, 0x99, 0xCC), (0x21, 0x21, 0x21), (0x09, 0x09, 0x09), (0x09, 0x09, 0x09),
-        (0xFF, 0xFF, 0xFF), (0x0F, 0xD7, 0xFF), (0x69, 0xA2, 0xFF), (0xD4, 0x80, 0xFF),
-        (0xFF, 0x45, 0xF3), (0xFF, 0x61, 0x8B), (0xFF, 0x88, 0x33), (0xFF, 0x9C, 0x12),
-        (0xFA, 0xBC, 0x20), (0x9F, 0xE3, 0x0E), (0x2B, 0xF0, 0x35), (0x0C, 0xF0, 0xA4),
-        (0x05, 0xFB, 0xFF), (0x5E, 0x5E, 0x5E), (0x0D, 0x0D, 0x0D), (0x0D, 0x0D, 0x0D),
-        (0xFF, 0xFF, 0xFF), (0xA6, 0xFC, 0xFF), (0xB3, 0xEC, 0xFF), (0xDA, 0xAB, 0xEB),
-        (0xFF, 0xA8, 0xF9), (0xFF, 0xAB, 0xB3), (0xFF, 0xD2, 0xB0), (0xFF, 0xEF, 0xA6),
-        (0xFF, 0xF7, 0x9C), (0xD7, 0xFF, 0xB3), (0xC6, 0xFF, 0xC2), (0xC6, 0xFF, 0xD7),
-        (0xC4, 0xFF, 0xFF), (0xB9, 0xB9, 0xB9), (0xA4, 0xA4, 0xA4), (0xA4, 0xA4, 0xA4),
-    ];
-    
-    // NES palette is mirrored: 0x30 maps to 0x10, 0x20 maps to 0x00, etc.
-    let actual_index = (index & 0x3F) as usize;
-    
-    // Use standard NES palette lookup
-    palette.get(actual_index).copied().unwrap_or((0, 0, 0))
-}
-
 impl Ppu {
     // Save state getters
     pub fn get_control(&self) -> PpuControl {
@@ -1136,41 +978,6 @@ impl Ppu {
         } else {
             0
         }
-    }
-    
-    fn setup_dq3_title_screen(&mut self) {
-        
-        // Clear nametable
-        for nt in 0..2 {
-            for addr in 0..1024 {
-                self.nametable[nt][addr] = 0x00;
-            }
-        }
-        
-        // Set up "DRAGON QUEST III" title text
-        // Position title at row 10, starting at column 6
-        let title_row = 10;
-        let start_col = 6;
-        
-        // "DRAGON QUEST III" in tile IDs
-        let title_tiles = [
-            0x44, 0x52, 0x41, 0x47, 0x4F, 0x4E, 0x20, // "DRAGON "
-            0x51, 0x55, 0x45, 0x53, 0x54, 0x20,       // "QUEST "
-            0x49, 0x49, 0x49                          // "III"
-        ];
-        
-        for (i, &tile_id) in title_tiles.iter().enumerate() {
-            let col = start_col + i;
-            if col < 32 {
-                let addr = title_row * 32 + col;
-                self.nametable[0][addr] = tile_id;
-                if i <= 5 {  // Only log first few tiles
-                }
-            }
-        }
-        
-        // Let DQ3 set its own palette colors
-        
     }
     
 }
