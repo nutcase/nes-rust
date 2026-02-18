@@ -6,6 +6,7 @@ pub mod cartridge;
 pub mod bus;
 pub mod save_state;
 pub mod sram;
+pub mod cheat;
 
 pub use cpu::Cpu;
 pub use cpu::StatusFlags;
@@ -193,5 +194,25 @@ impl Nes {
 
     pub fn get_controller(&self) -> u8 {
         self.bus.controller
+    }
+
+    /// Direct reference to CPU RAM (2KB).
+    pub fn ram(&self) -> &[u8] {
+        self.bus.ram_ref()
+    }
+
+    /// Mutable reference to CPU RAM (2KB).
+    pub fn ram_mut(&mut self) -> &mut [u8] {
+        self.bus.ram_mut()
+    }
+
+    /// Direct reference to PRG-RAM / SRAM (mapper-dependent, may be None).
+    pub fn prg_ram(&self) -> Option<&[u8]> {
+        self.bus.prg_ram_ref()
+    }
+
+    /// Mutable reference to PRG-RAM / SRAM.
+    pub fn prg_ram_mut(&mut self) -> Option<&mut [u8]> {
+        self.bus.prg_ram_mut()
     }
 }

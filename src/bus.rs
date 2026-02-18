@@ -399,4 +399,24 @@ impl Bus {
             0
         }
     }
+
+    /// Direct reference to CPU RAM (2KB).
+    pub fn ram_ref(&self) -> &[u8] {
+        &self.memory.ram
+    }
+
+    /// Mutable reference to CPU RAM (2KB).
+    pub fn ram_mut(&mut self) -> &mut [u8] {
+        &mut self.memory.ram
+    }
+
+    /// Direct reference to PRG-RAM / SRAM (mapper-dependent).
+    pub fn prg_ram_ref(&self) -> Option<&[u8]> {
+        self.cartridge.as_ref().and_then(|c| c.prg_ram_ref())
+    }
+
+    /// Mutable reference to PRG-RAM / SRAM.
+    pub fn prg_ram_mut(&mut self) -> Option<&mut [u8]> {
+        self.cartridge.as_mut().and_then(|c| c.prg_ram_mut())
+    }
 }

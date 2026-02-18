@@ -10,6 +10,7 @@ A cycle-accurate NES (Nintendo Entertainment System / Famicom) emulator written 
 - Save states (4 slots)
 - Battery-backed SRAM persistence
 - SDL2-based graphics and audio
+- Cheat tool with memory search, hex viewer, and egui side panel
 
 ## Requirements
 
@@ -37,10 +38,14 @@ cargo build --release
 ## Running
 
 ```bash
-# Using the run script (macOS)
+# Using the run script (macOS, cheat UI enabled)
 ./run.sh
 
-# Direct execution
+# With a specific ROM
+./run.sh roms/game.nes
+
+# Without cheat UI (plain SDL2 version)
+cargo build --release
 ./target/release/nes-emulator <path-to-rom.nes>
 ```
 
@@ -58,6 +63,18 @@ cargo build --release
 
 - **Save**: Ctrl + 1/2/3/4
 - **Load**: 1/2/3/4
+
+### Cheat Panel
+
+- **Toggle panel**: Tab
+- **Pause emulation**: Pause checkbox in panel
+
+The cheat panel provides two tabs:
+
+- **Hex Viewer** — Browse and edit CPU RAM / SRAM in real time
+- **Cheat Search** — Snapshot-based memory search to find and freeze values (lives, health, etc.)
+
+Cheats are saved/loaded as JSON in the `cheats/` directory.
 
 ## Supported Mappers
 

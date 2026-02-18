@@ -3,6 +3,10 @@ name = "nes-emulator"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+cheat-ui = ["egui", "egui_sdl2_gl", "serde_json"]
+
 [dependencies]
 bitflags = "2.4"
 log = "0.4"
@@ -10,7 +14,15 @@ env_logger = "0.11"
 sdl2 = "0.36"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
+egui = { version = "0.31", optional = true }
+egui_sdl2_gl = { version = "0.31", optional = true, default-features = false }
+serde_json = { version = "1", optional = true }
 
 [[bin]]
 name = "headless_test"
 path = "src/bin/headless_test.rs"
+
+[[example]]
+name = "nes_emulator"
+path = "examples/nes_emulator.rs"
+required-features = ["cheat-ui"]

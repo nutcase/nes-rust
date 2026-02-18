@@ -249,4 +249,22 @@ impl Cartridge {
             self.has_valid_save_data = true;
         }
     }
+
+    /// Direct reference to PRG-RAM (returns None if empty).
+    pub fn prg_ram_ref(&self) -> Option<&[u8]> {
+        if self.prg_ram.is_empty() {
+            None
+        } else {
+            Some(&self.prg_ram)
+        }
+    }
+
+    /// Mutable reference to PRG-RAM (returns None if empty).
+    pub fn prg_ram_mut(&mut self) -> Option<&mut [u8]> {
+        if self.prg_ram.is_empty() {
+            None
+        } else {
+            Some(&mut self.prg_ram)
+        }
+    }
 }

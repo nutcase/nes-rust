@@ -8,8 +8,8 @@ export LANG=C
 export LC_ALL=C
 export SDL_DISABLE_IMMINTRIN_H=1
 
-# Build the project first
-cargo build --release
+# Build the cheat-ui example
+cargo build --release --example nes_emulator --features cheat-ui
 
-# Run with ROM selection
-./target/release/nes-emulator
+# Run with ROM selection (pass any arguments through)
+./target/release/examples/nes_emulator "$@"
