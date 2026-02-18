@@ -180,7 +180,7 @@ impl Apu {
         }
 
         // Pulse and Noise: clocked every 2 CPU cycles
-        if self.cycle_count % 2 == 0 {
+        if self.cycle_count & 1 == 0 {
             if self.pulse1_enabled {
                 self.pulse1.step();
             }

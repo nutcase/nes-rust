@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let desired_spec = sdl2::audio::AudioSpecDesired {
         freq: Some(44100),
         channels: Some(1),  // mono
-        samples: Some(512), // small buffer for low latency
+        samples: Some(256), // small buffer for low latency
     };
 
     let audio_ring: Arc<SpscRingBuffer> = Arc::new(SpscRingBuffer::new(8192));
@@ -137,9 +137,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             phase: 0.0,
         })?;
 
-    // Pre-buffer a few frames of audio before starting playback to prevent
-    // initial underruns.
-    for _ in 0..3 {
+    // Pre-buffer 1 frame of audio before starting playback (~735 samples)
+    {
         let mut step_count = 0;
         loop {
             if nes.step() { break; }
@@ -151,7 +150,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut event_pump = sdl_context.event_pump()?;
 
-    let frame_duration = Duration::from_nanos(16_666_667); // 60 FPS (1000ms / 60fps)
+    // NTSC NES frame rate: 5369318.18 Hz PPU / (341*262-0.5) = 60.0988 Hz
+    let frame_duration = Duration::from_nanos(16_639_267);
     let mut last_frame = Instant::now();
     let mut _frame_count = 0;
     let _start_time = Instant::now();
@@ -230,7 +230,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             buffer.copy_from_slice(frame_buffer);
         })?;
 
-        // (Audio samples are pushed directly by APU during emulation)
+        // Safety net: discard only on extreme drift (OS clock vs audio hardware clock).
+        // With NTSC-accurate frame timing, this should essentially never fire.
+        {
+            let buffered = audio_ring.len();
+            if buffered > 4096 {
+                audio_ring.discard(buffered - 2048);
+            }
+        }
 
         // Render the frame
         canvas.clear();

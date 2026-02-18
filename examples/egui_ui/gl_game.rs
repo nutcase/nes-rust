@@ -41,7 +41,6 @@ pub struct GlGameRenderer {
     texture: GLuint,
     tex_w: usize,
     tex_h: usize,
-    rgba_buf: Vec<u8>,
 }
 
 impl GlGameRenderer {
@@ -119,42 +118,28 @@ impl GlGameRenderer {
                 texture,
                 tex_w: 0,
                 tex_h: 0,
-                rgba_buf: Vec::new(),
             }
         }
     }
 
     /// Upload an RGB24 frame buffer (NES format: 256x240x3 bytes).
+    /// Uploads directly as GL_RGB without CPU-side RGBA conversion.
     pub fn upload_frame_rgb24(&mut self, frame: &[u8], w: usize, h: usize) {
-        let pixel_count = w * h;
-        let rgba_len = pixel_count * 4;
-        // Allocate only once; subsequent frames reuse the same buffer
-        if self.rgba_buf.len() != rgba_len {
-            self.rgba_buf.resize(rgba_len, 0xFF);
-        }
-        // Bounds are guaranteed: frame.len() == pixel_count * 3, rgba_buf.len() == pixel_count * 4
-        for i in 0..pixel_count {
-            let src = i * 3;
-            let dst = i * 4;
-            self.rgba_buf[dst] = frame[src];
-            self.rgba_buf[dst + 1] = frame[src + 1];
-            self.rgba_buf[dst + 2] = frame[src + 2];
-            // alpha stays 0xFF from initial resize
-        }
-
         unsafe {
             gl::BindTexture(gl::TEXTURE_2D, self.texture);
+            // Align to byte boundary for RGB (3 bytes per pixel)
+            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
             if w != self.tex_w || h != self.tex_h {
                 gl::TexImage2D(
                     gl::TEXTURE_2D,
                     0,
-                    gl::RGBA8 as GLint,
+                    gl::RGB8 as GLint,
                     w as GLsizei,
                     h as GLsizei,
                     0,
-                    gl::RGBA,
+                    gl::RGB,
                     gl::UNSIGNED_BYTE,
-                    self.rgba_buf.as_ptr() as *const _,
+                    frame.as_ptr() as *const _,
                 );
                 self.tex_w = w;
                 self.tex_h = h;
@@ -166,9 +151,9 @@ impl GlGameRenderer {
                     0,
                     w as GLsizei,
                     h as GLsizei,
-                    gl::RGBA,
+                    gl::RGB,
                     gl::UNSIGNED_BYTE,
-                    self.rgba_buf.as_ptr() as *const _,
+                    frame.as_ptr() as *const _,
                 );
             }
             gl::BindTexture(gl::TEXTURE_2D, 0);

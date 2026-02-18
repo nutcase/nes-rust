@@ -202,6 +202,25 @@ pub struct Ppu {
     // Per-scanline sprite cache: (sprite_num, y, tile_id, attributes, x)
     scanline_sprites: [(u8, u8, u8, u8, u8); 8],
     scanline_sprite_count: u8,
+
+    // Cached background tile CHR data — reused for 8 consecutive pixels
+    cached_tile_addr: u16,
+    cached_tile_low: u8,
+    cached_tile_high: u8,
+
+    // Cached nametable mirroring map: logical NT 0-3 → physical NT 0-1
+    cached_nt_map: [u8; 4],
+
+    // Scanline-cached mask flags (updated at cycle 0 of each visible scanline)
+    scanline_bg_enable: bool,
+    scanline_sprite_enable: bool,
+    scanline_bg_left: bool,
+    scanline_sprite_left: bool,
+    scanline_grayscale: bool,
+
+    // Scanline-cached sprite control registers
+    cached_sprite_size: u8,
+    cached_sprite_pattern_table: u16,
 }
 
 impl Ppu {
@@ -246,6 +265,17 @@ impl Ppu {
             rendering_enabled: false,
             scanline_sprites: [(0, 0, 0, 0, 0); 8],
             scanline_sprite_count: 0,
+            cached_tile_addr: 0xFFFF,
+            cached_tile_low: 0,
+            cached_tile_high: 0,
+            cached_nt_map: [0, 1, 0, 1],
+            scanline_bg_enable: false,
+            scanline_sprite_enable: false,
+            scanline_bg_left: false,
+            scanline_sprite_left: false,
+            scanline_grayscale: false,
+            cached_sprite_size: 8,
+            cached_sprite_pattern_table: 0,
         };
 
         ppu
@@ -495,26 +525,21 @@ impl Ppu {
             return;
         }
 
-        let mut bg_color = self.palette[0]; // Default background color
-        let mut bg_pixel = 0u8; // Background pixel value (0 = transparent, 1-3 = palette entries)
+        let mut bg_color = self.palette[0];
+        let mut bg_pixel = 0u8;
 
-        // Render background if enabled
-        if self.mask.contains(PpuMask::BG_ENABLE) {
-            // Left column clipping
-            if !self.mask.contains(PpuMask::BG_LEFT_ENABLE) && x < 8 {
+        if self.scanline_bg_enable {
+            if !self.scanline_bg_left && x < 8 {
                 // bg_color stays palette[0], bg_pixel stays 0
             } else if let Some(cart) = cartridge {
-                // Extract scroll state from v register
                 let fine_y = ((self.v >> 12) & 7) as u16;
                 let coarse_y = ((self.v >> 5) & 0x1F) as usize;
                 let logical_nt = ((self.v >> 10) & 3) as usize;
                 let coarse_x = (self.v & 0x1F) as usize;
 
-                // Calculate which tile column pixel to render using fine X scroll
                 let pixel_col = (x & 7) as u8;
                 let scrolled_col = pixel_col + self.x;
                 let (tile_cx, tile_nt, tile_fx) = if scrolled_col >= 8 {
-                    // Need the next tile
                     let next_cx = if coarse_x == 31 { 0 } else { coarse_x + 1 };
                     let next_nt = if coarse_x == 31 {
                         logical_nt ^ 1
@@ -526,7 +551,7 @@ impl Ppu {
                     (coarse_x, logical_nt, scrolled_col)
                 };
 
-                let physical_nt = self.resolve_nametable(tile_nt, cartridge);
+                let physical_nt = self.cached_nt_map[tile_nt & 3] as usize;
                 let nt_addr = coarse_y * 32 + tile_cx;
                 let tile_id = if nt_addr < 1024 {
                     self.nametable[physical_nt][nt_addr]
@@ -542,8 +567,16 @@ impl Ppu {
                 let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
 
                 if tile_addr < 0x2000 {
-                    let low_byte = cart.read_chr(tile_addr);
-                    let high_byte = cart.read_chr(tile_addr + 8);
+                    let (low_byte, high_byte) = if tile_addr == self.cached_tile_addr {
+                        (self.cached_tile_low, self.cached_tile_high)
+                    } else {
+                        let low = cart.read_chr(tile_addr);
+                        let high = cart.read_chr(tile_addr + 8);
+                        self.cached_tile_addr = tile_addr;
+                        self.cached_tile_low = low;
+                        self.cached_tile_high = high;
+                        (low, high)
+                    };
                     let pixel_bit = 7 - tile_fx;
                     let low_bit = (low_byte >> pixel_bit) & 1;
                     let high_bit = (high_byte >> pixel_bit) & 1;
@@ -552,10 +585,9 @@ impl Ppu {
                     bg_pixel = pixel_value;
 
                     if pixel_value != 0 {
-                        // Attribute table lookup using scroll coordinates
                         let attr_x = tile_cx >> 2;
                         let attr_y = coarse_y >> 2;
-                        let attr_offset = 960 + attr_y * 8 + attr_x;
+                        let attr_offset = 960 + (attr_y << 3) + attr_x;
                         let attr_byte = if attr_offset < 1024 {
                             self.nametable[physical_nt][attr_offset]
                         } else {
@@ -568,33 +600,27 @@ impl Ppu {
                         let palette_num = (attr_byte >> shift) & 0x03;
 
                         let palette_idx = (palette_num as usize * 4) + pixel_value as usize;
-                        if palette_idx < 16 {
-                            bg_color = self.palette[palette_idx];
-                        }
+                        bg_color = self.palette[palette_idx];
                     }
                 }
             }
         }
 
-        // Check for sprite rendering
         let mut sprite_result = None;
         let mut sprite_0_hit = false;
 
-        if self.mask.contains(PpuMask::SPRITE_ENABLE) {
-            // Left column clipping for sprites
-            if !self.mask.contains(PpuMask::SPRITE_LEFT_ENABLE) && x < 8 {
+        if self.scanline_sprite_enable {
+            if !self.scanline_sprite_left && x < 8 {
                 // Skip sprite rendering in left 8 pixels
             } else {
                 sprite_result = self.render_sprites(x as u8, y as u8, cartridge, &mut sprite_0_hit);
 
-                // Set sprite 0 hit flag if needed
                 if sprite_0_hit && bg_pixel != 0 {
                     self.status.insert(PpuStatus::SPRITE_0_HIT);
                 }
             }
         }
 
-        // Determine final pixel color
         let final_color = if let Some((sprite_color, priority_behind_bg)) = sprite_result {
             if priority_behind_bg && bg_pixel != 0 {
                 bg_color
@@ -608,7 +634,7 @@ impl Ppu {
         let pixel_index = ((y as usize * 256) + x as usize) * 3;
 
         let mut masked_color = final_color & 0x3F;
-        if self.mask.contains(PpuMask::GRAYSCALE) {
+        if self.scanline_grayscale {
             masked_color &= 0x30;
         }
         let color = PALETTE_COLORS[masked_color as usize];
@@ -625,11 +651,32 @@ impl Ppu {
             return;
         }
 
-        let sprite_height: u16 = if self.control.contains(PpuControl::SPRITE_SIZE) {
-            16
-        } else {
-            8
-        };
+        // Update scanline-cached mask flags
+        self.scanline_bg_enable = self.mask.contains(PpuMask::BG_ENABLE);
+        self.scanline_sprite_enable = self.mask.contains(PpuMask::SPRITE_ENABLE);
+        self.scanline_bg_left = self.mask.contains(PpuMask::BG_LEFT_ENABLE);
+        self.scanline_sprite_left = self.mask.contains(PpuMask::SPRITE_LEFT_ENABLE);
+        self.scanline_grayscale = self.mask.contains(PpuMask::GRAYSCALE);
+
+        // Cache sprite control registers
+        self.cached_sprite_size = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
+        self.cached_sprite_pattern_table = if self.control.contains(PpuControl::SPRITE_PATTERN) { 0x1000 } else { 0x0000 };
+
+        // Cache nametable mirroring map
+        if let Some(cart) = _cartridge {
+            match cart.mirroring() {
+                crate::cartridge::Mirroring::Vertical => self.cached_nt_map = [0, 1, 0, 1],
+                crate::cartridge::Mirroring::Horizontal => self.cached_nt_map = [0, 0, 1, 1],
+                crate::cartridge::Mirroring::FourScreen => self.cached_nt_map = [0, 1, 0, 1],
+                crate::cartridge::Mirroring::OneScreenLower => self.cached_nt_map = [0, 0, 0, 0],
+                crate::cartridge::Mirroring::OneScreenUpper => self.cached_nt_map = [1, 1, 1, 1],
+            }
+        }
+
+        // Invalidate tile cache for new scanline
+        self.cached_tile_addr = 0xFFFF;
+
+        let sprite_height: u16 = self.cached_sprite_size as u16;
         let current_scanline = self.scanline as u16;
 
         for sprite_num in 0u8..64 {
@@ -670,11 +717,7 @@ impl Ppu {
         sprite_0_hit: &mut bool,
     ) -> Option<(u8, bool)> {
         if let Some(cart) = cartridge {
-            let sprite_size: u8 = if self.control.contains(PpuControl::SPRITE_SIZE) {
-                16
-            } else {
-                8
-            };
+            let sprite_size = self.cached_sprite_size;
             let count = self.scanline_sprite_count as usize;
 
             for i in 0..count {
@@ -706,12 +749,7 @@ impl Ppu {
                     let actual_tile_id = tile_id & 0xFE;
                     (pattern_table, actual_tile_id)
                 } else {
-                    let pattern_table: u16 = if self.control.contains(PpuControl::SPRITE_PATTERN) {
-                        0x1000
-                    } else {
-                        0x0000
-                    };
-                    (pattern_table, tile_id)
+                    (self.cached_sprite_pattern_table, tile_id)
                 };
 
                 // For 8x16 sprites, select top or bottom half
@@ -739,13 +777,8 @@ impl Ppu {
                         }
 
                         let palette_num = attributes & 0x03;
-                        let palette_idx = 16 + palette_num * 4 + pixel_value;
-
-                        let color_index = if (palette_idx as usize) < 32 {
-                            self.palette[palette_idx as usize]
-                        } else {
-                            self.palette[16]
-                        };
+                        let palette_idx = (16 + palette_num * 4 + pixel_value) as usize;
+                        let color_index = self.palette[palette_idx];
 
                         let priority_behind_bg = (attributes & 0x20) != 0;
                         return Some((color_index, priority_behind_bg));
@@ -1111,6 +1144,15 @@ impl Ppu {
         self.cycle = cycle;
         self.frame = frame;
         self.read_buffer = read_buffer;
+        // Reset scanline caches so they are refreshed on next visible scanline
+        self.cached_tile_addr = 0xFFFF;
+        self.scanline_bg_enable = self.mask.contains(PpuMask::BG_ENABLE);
+        self.scanline_sprite_enable = self.mask.contains(PpuMask::SPRITE_ENABLE);
+        self.scanline_bg_left = self.mask.contains(PpuMask::BG_LEFT_ENABLE);
+        self.scanline_sprite_left = self.mask.contains(PpuMask::SPRITE_LEFT_ENABLE);
+        self.scanline_grayscale = self.mask.contains(PpuMask::GRAYSCALE);
+        self.cached_sprite_size = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
+        self.cached_sprite_pattern_table = if self.control.contains(PpuControl::SPRITE_PATTERN) { 0x1000 } else { 0x0000 };
     }
 
     pub fn write_oam_data(&mut self, addr: u8, data: u8) {

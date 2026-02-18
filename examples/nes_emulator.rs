@@ -86,7 +86,7 @@ fn main() -> Result<(), String> {
     let desired_audio = AudioSpecDesired {
         freq: Some(44_100),
         channels: Some(1),
-        samples: Some(512),
+        samples: Some(256),
     };
 
     let audio_ring: Arc<SpscRingBuffer> = Arc::new(SpscRingBuffer::new(8192));
@@ -101,8 +101,8 @@ fn main() -> Result<(), String> {
             phase: 0.0,
         })
         .map_err(|e| e.to_string())?;
-    // Pre-buffer a few frames of audio before starting playback
-    for _ in 0..3 {
+    // Pre-buffer 1 frame of audio before starting playback (~735 samples)
+    {
         let mut step_count = 0;
         loop {
             if nes.step() { break; }
@@ -123,7 +123,9 @@ fn main() -> Result<(), String> {
 
     let cheat_path = cheat_file_path(&rom_path);
 
-    let frame_duration = Duration::from_nanos(16_666_667);
+    // NTSC NES frame rate: 5369318.18 Hz PPU / (341*262-0.5) = 60.0988 Hz
+    // Using exact NTSC timing eliminates audio drift between APU production and SDL consumption.
+    let frame_duration = Duration::from_nanos(16_639_267);
     let mut last_frame = Instant::now();
     let mut frames_since_save = 0u32;
 
@@ -264,7 +266,14 @@ fn main() -> Result<(), String> {
             }
         }
 
-        // (Audio samples are pushed directly by APU during emulation)
+        // Safety net: discard only on extreme drift (OS clock vs audio hardware clock).
+        // With NTSC-accurate frame timing, this should essentially never fire.
+        {
+            let buffered = audio_ring.len();
+            if buffered > 4096 {
+                audio_ring.discard(buffered - 2048);
+            }
+        }
 
         // Upload game frame to GL texture
         let frame_buf = nes.get_frame_buffer();
