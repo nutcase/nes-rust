@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use nes_emulator::Nes;
+use nes_emulator::audio_ring::SpscRingBuffer;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
@@ -114,12 +114,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples: Some(1024), // smaller buffer for lower latency
     };
 
-    let audio_buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let audio_buffer_clone = audio_buffer.clone();
+    let audio_ring: Arc<SpscRingBuffer> = Arc::new(SpscRingBuffer::new(8192));
+    let audio_ring_clone = audio_ring.clone();
 
     let audio_device = audio_subsystem.open_playback(None, &desired_spec, |_spec| {
         NesAudioCallback {
-            audio_buffer: audio_buffer_clone,
+            ring: audio_ring_clone,
             phase: 0.0,
         }
     })?;
@@ -222,18 +222,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             buffer.copy_from_slice(frame_buffer);
         })?;
 
-        // Update audio buffer
+        // Feed audio into lock-free ring buffer
         let audio_samples = nes.get_audio_buffer();
         if !audio_samples.is_empty() {
-            if let Ok(mut buffer) = audio_buffer.lock() {
-                buffer.extend(audio_samples.iter());
-                // Keep buffer bounded: discard oldest samples beyond target
-                const MAX_BUFFER: usize = 4096;
-                if buffer.len() > MAX_BUFFER {
-                    let excess = buffer.len() - MAX_BUFFER;
-                    drop(buffer.drain(..excess));
-                }
-            }
+            audio_ring.push_slice(&audio_samples);
         }
 
         // Render
@@ -282,7 +274,7 @@ fn unmap_key_from_controller(key: Keycode, current: u8) -> u8 {
 }
 
 struct NesAudioCallback {
-    audio_buffer: Arc<Mutex<VecDeque<f32>>>,
+    ring: Arc<SpscRingBuffer>,
     phase: f32,
 }
 
@@ -290,26 +282,14 @@ impl AudioCallback for NesAudioCallback {
     type Channel = f32;
 
     fn callback(&mut self, out: &mut [f32]) {
-        if let Ok(mut buffer) = self.audio_buffer.lock() {
-            // Bulk drain into a local slice to release the lock quickly
-            let available = buffer.len().min(out.len());
-            for (i, sample) in out[..available].iter_mut().enumerate() {
-                let audio_sample = buffer[i];
-                *sample = audio_sample;
-                self.phase = audio_sample;
-            }
-            drop(buffer.drain(..available));
-
-            // Fill remaining with smooth decay (underrun)
-            for sample in out[available..].iter_mut() {
-                self.phase *= 0.995;
-                *sample = self.phase;
-            }
-        } else {
-            for sample in out.iter_mut() {
-                self.phase *= 0.995;
-                *sample = self.phase;
-            }
+        let read = self.ring.pop_slice(out);
+        if read > 0 {
+            self.phase = out[read - 1];
+        }
+        // Underrun: smooth decay for remaining samples
+        for sample in out[read..].iter_mut() {
+            self.phase *= 0.995;
+            *sample = self.phase;
         }
     }
 }

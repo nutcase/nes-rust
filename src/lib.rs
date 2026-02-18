@@ -7,6 +7,7 @@ pub mod bus;
 pub mod save_state;
 pub mod sram;
 pub mod cheat;
+pub mod audio_ring;
 
 pub use cpu::Cpu;
 pub use cpu::StatusFlags;
