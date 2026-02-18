@@ -324,7 +324,9 @@ fn main() -> Result<(), String> {
                 }
             });
 
-            if cheat_ui.refresh_requested {
+            if cheat_ui.refresh_requested
+                || (cheat_ui.auto_refresh && cheat_ui.active_tab == egui_ui::ActiveTab::HexViewer)
+            {
                 cheat_ui.refresh(nes.ram());
                 cheat_ui.refresh_requested = false;
             }

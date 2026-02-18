@@ -22,6 +22,8 @@ pub struct CheatToolUi {
     pub refresh_requested: bool,
     /// When true, emulation is paused (no ticks).
     pub paused: bool,
+    /// When true, hex viewer updates from live RAM every frame.
+    pub auto_refresh: bool,
     /// Reusable combined RAM buffer (cpu_ram ++ prg_ram) to avoid per-frame allocation.
     pub combined_ram: Vec<u8>,
 }
@@ -36,6 +38,7 @@ impl CheatToolUi {
             ram_snapshot: vec![0u8; 0x800],
             refresh_requested: false,
             paused: false,
+            auto_refresh: false,
             combined_ram: Vec::new(),
         }
     }
@@ -80,7 +83,7 @@ impl CheatToolUi {
                     if ui.button("Refresh").clicked() {
                         self.refresh_requested = true;
                     }
-                    ui.label("(Update hex display from live RAM)");
+                    ui.checkbox(&mut self.auto_refresh, "Auto");
                 });
                 ui.separator();
                 let snap = &self.ram_snapshot;
