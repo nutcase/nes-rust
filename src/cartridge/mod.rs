@@ -1008,6 +1008,12 @@ impl Cartridge {
     }
     
     pub fn write_prg_ram(&mut self, addr: u16, data: u8) {
+        // Mapper 87 uses $6000-$7FFF as a CHR bank switching register
+        if self.mapper == 87 {
+            self.chr_bank = ((data & 0x01) << 1) | ((data & 0x02) >> 1);
+            return;
+        }
+
         if self.mapper == 1 && !self.prg_ram.is_empty() {
             // DQ3 compatibility: allow PRG-RAM writes with relaxed protection
             if let Some(ref mmc1) = self.mmc1 {

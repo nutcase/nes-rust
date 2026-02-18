@@ -134,10 +134,15 @@ pub struct Ppu {
     
     // NMI suppression for race condition handling
     nmi_suppressed: bool,
-    
+
     // VBlank flag management
     vblank_flag_set_this_frame: bool,
-    
+
+    // Pending NMI from edge-triggered NMI_ENABLE write during VBlank
+    pending_nmi: bool,
+
+    // Set to true when the PPU completes a full frame (scanline wraps from 260 to -1)
+    pub frame_complete: bool,
 }
 
 impl Ppu {
@@ -181,6 +186,8 @@ impl Ppu {
             read_buffer: 0,
             nmi_suppressed: false,
             vblank_flag_set_this_frame: false,
+            pending_nmi: false,
+            frame_complete: false,
         };
         
         // Standard palette initialization
@@ -212,52 +219,33 @@ impl Ppu {
 
     pub fn step(&mut self, cartridge: Option<&crate::cartridge::Cartridge>) -> bool {
         let mut nmi = false;
-        
-        // Debug PPU state with simpler output
-        static mut PPU_STEP_COUNT: u32 = 0;
-        // PPU step processing (debug reduced)
-        
-        // Normal PPU operation without forced rendering
-        
-        // PPU step processing
-        
 
-        // Handle scanline processing
-        
-        // Handle scanline 241
+        // Check for edge-triggered NMI from $2000 write
+        if self.pending_nmi {
+            self.pending_nmi = false;
+            nmi = true;
+        }
 
         match self.scanline {
             -1 => {
-                // Pre-render scanline - clear flags at appropriate cycles
+                // Pre-render scanline - clear flags at cycle 1
                 if self.cycle == 1 {
-                    // For Goonies compatibility: Delay VBlank clear to give game time to read it
-                    static mut VBLANK_CLEAR_COUNT: u32 = 0;
-                    static mut GOONIES_VBLANK_DELAY: bool = false;
-                    
-                    unsafe {
-                        VBLANK_CLEAR_COUNT += 1;
-                        
-                        // Check if this is Goonies running - we can't access cartridge here, 
-                        // so we use a heuristic: if VBlank was set, delay the clear
-                        if self.status.contains(PpuStatus::VBLANK) && !GOONIES_VBLANK_DELAY {
-                            GOONIES_VBLANK_DELAY = true;
-                            if VBLANK_CLEAR_COUNT <= 3 {
-                            }
-                            return nmi; // Don't clear VBlank this cycle
-                        } else {
-                            GOONIES_VBLANK_DELAY = false;
-                        }
-                        
-                        // VBlank cleared (debug reduced)
-                    }
                     self.vblank_flag_set_this_frame = false;
                     self.status.remove(PpuStatus::VBLANK);
+                    self.status.remove(PpuStatus::SPRITE_0_HIT);
+                    self.status.remove(PpuStatus::SPRITE_OVERFLOW);
                 }
                 
+                // Copy horizontal scroll bits from t to v at cycle 257
+                if self.cycle == 257 && self.rendering_enabled() {
+                    self.v = (self.v & !0x041F) | (self.t & 0x041F);
+                }
+
                 // Update vertical scroll during pre-render scanline
                 if self.cycle >= 280 && self.cycle <= 304 {
-                    if self.mask.contains(PpuMask::BG_ENABLE) || self.mask.contains(PpuMask::SPRITE_ENABLE) {
+                    if self.rendering_enabled() {
                         // Copy vertical scroll bits from t to v
+                        self.v = (self.v & !0x7BE0) | (self.t & 0x7BE0);
                     }
                 }
             }
@@ -272,18 +260,23 @@ impl Ppu {
                 if self.cycle == 1 {
                 }
                 
-                // Update horizontal scroll at end of visible pixels
-                if self.cycle == 257 && (self.mask.contains(PpuMask::BG_ENABLE) || self.mask.contains(PpuMask::SPRITE_ENABLE)) {
-                    // Copy horizontal scroll bits from t to v
-                }
-                
                 if self.cycle >= 1 && self.cycle <= 256 {
-                    // Visible pixel processing (minimal logging)
-                    static mut VISIBLE_PIXEL_COUNT: u32 = 0;
-                    // Visible pixel processing (debug reduced)
-                    
-                    // CRITICAL FIX: Actually call render_pixel function
                     self.render_pixel(cartridge);
+
+                    // Increment coarse X every 8 pixels
+                    if self.cycle % 8 == 0 {
+                        self.increment_coarse_x();
+                    }
+                }
+
+                // Increment Y at cycle 256
+                if self.cycle == 256 {
+                    self.increment_y();
+                }
+
+                // Copy horizontal scroll bits from t to v at cycle 257
+                if self.cycle == 257 && self.rendering_enabled() {
+                    self.v = (self.v & !0x041F) | (self.t & 0x041F);
                 }
                 
                 // Removed automatic force rendering to fix frame synchronization issues
@@ -293,72 +286,15 @@ impl Ppu {
                 // Sprite evaluation is now done at the start of each visible scanline
             }
             241 => {
-                // Precise NMI timing: VBlank flag AND NMI trigger simultaneously at cycle 1
                 if self.cycle == 1 {
-                    // Debug: Log VBlank setting
-                    static mut VBLANK_SET_COUNT: u32 = 0;
-                    unsafe {
-                        VBLANK_SET_COUNT += 1;
-                        if VBLANK_SET_COUNT <= 10 {
-                            println!("PPU: Setting VBlank flag #{} at scanline 241, cycle 1", VBLANK_SET_COUNT);
-                        }
-                    }
-                    
-                    // Set VBlank flag at cycle 1
                     self.vblank_flag_set_this_frame = true;
                     self.status.insert(PpuStatus::VBLANK);
-                    
-                    // Trigger NMI immediately if enabled (simultaneous with VBlank flag)
+
                     if self.control.contains(PpuControl::NMI_ENABLE) && !self.nmi_suppressed {
                         nmi = true;
-                        static mut NMI_LOG_COUNT: u32 = 0;
-                        unsafe {
-                            NMI_LOG_COUNT += 1;
-                            if NMI_LOG_COUNT <= 5 {
-                                println!("PPU: NMI triggered #{}, control=0x{:02X}", NMI_LOG_COUNT, self.control.bits());
-                                
-                                // DQ3 specific debugging
-                                if let Some(cartridge) = cartridge {
-                                    if cartridge.is_dq3_detected() {
-                                        println!("  -> DQ3: NMI successfully triggered! Game should advance past initialization.");
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        // Debug: Log why NMI was not triggered - enhanced for DQ3
-                        static mut NO_NMI_LOG_COUNT: u32 = 0;
-                        unsafe {
-                            NO_NMI_LOG_COUNT += 1;
-                            if NO_NMI_LOG_COUNT <= 10 {
-                                println!("PPU: NMI not triggered #{}, NMI_ENABLE={}, suppressed={}", 
-                                    NO_NMI_LOG_COUNT, 
-                                    self.control.contains(PpuControl::NMI_ENABLE),
-                                    self.nmi_suppressed);
-                                    
-                                // DQ3 specific debugging
-                                if let Some(cartridge) = cartridge {
-                                    if cartridge.is_dq3_detected() {
-                                        println!("  -> DQ3: NMI NOT triggered! This explains why game is stuck in initialization.");
-                                        println!("     PPU control written: 0x{:02X}", self.control.bits());
-                                        if !self.control.contains(PpuControl::NMI_ENABLE) {
-                                            println!("     PROBLEM: NMI_ENABLE bit not set in PPU control register!");
-                                        }
-                                        if self.nmi_suppressed {
-                                            println!("     PROBLEM: NMI suppressed due to $2002 read timing conflict!");
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
-                    
-                    // Reset suppression flag for next frame
+
                     self.nmi_suppressed = false;
-                    
-                    // Debug: Log VBlank flag setting
-                    static mut VBLANK_LOG_COUNT: u32 = 0;
-                    // VBlank flag set (debug reduced)
                 }
             }
             242..=260 => {
@@ -369,23 +305,29 @@ impl Ppu {
         }
 
         self.cycle += 1;
-        if self.cycle >= 341 {
+
+        // Odd-frame cycle skip: on pre-render scanline of odd frames,
+        // skip the last cycle (340) when rendering is enabled
+        let cycle_limit = if self.scanline == -1
+            && self.rendering_enabled()
+            && (self.frame & 1) == 1
+        {
+            340
+        } else {
+            341
+        };
+
+        if self.cycle >= cycle_limit {
             self.cycle = 0;
             self.scanline += 1;
-            
-            // Debug scanline progression
-            static mut SCANLINE_DEBUG_COUNT: u32 = 0;
-            // Scanline advanced (debug reduced)
-            
-            // Handle frame completion 
+
             if self.scanline >= 261 {
                 self.scanline = -1;
                 self.frame += 1;
-                
+                self.frame_complete = true;
+
                 // Reset force rendering flag for next frame
                 self.force_rendered_frame = false;
-                
-                // Don't reset scroll_change_line here - let the frame counter handle it
             }
         }
 
@@ -551,148 +493,162 @@ impl Ppu {
         
     }
 
+    fn rendering_enabled(&self) -> bool {
+        self.mask.contains(PpuMask::BG_ENABLE) || self.mask.contains(PpuMask::SPRITE_ENABLE)
+    }
+
+    fn resolve_nametable(&self, logical_nt: usize, cartridge: Option<&crate::cartridge::Cartridge>) -> usize {
+        if let Some(cart) = cartridge {
+            match cart.mirroring() {
+                crate::cartridge::Mirroring::Vertical => match logical_nt & 3 {
+                    0 | 2 => 0,
+                    1 | 3 => 1,
+                    _ => 0,
+                },
+                crate::cartridge::Mirroring::Horizontal => match logical_nt & 3 {
+                    0 | 1 => 0,
+                    2 | 3 => 1,
+                    _ => 0,
+                },
+                crate::cartridge::Mirroring::FourScreen => (logical_nt & 3) % 2,
+                crate::cartridge::Mirroring::OneScreenLower => 0,
+                crate::cartridge::Mirroring::OneScreenUpper => 1,
+            }
+        } else {
+            (logical_nt & 3) % 2
+        }
+    }
+
+    fn increment_coarse_x(&mut self) {
+        if !self.rendering_enabled() { return; }
+        if (self.v & 0x001F) == 31 {
+            self.v &= !0x001F;   // coarse X = 0
+            self.v ^= 0x0400;    // toggle horizontal nametable
+        } else {
+            self.v += 1;
+        }
+    }
+
+    fn increment_y(&mut self) {
+        if !self.rendering_enabled() { return; }
+        if (self.v & 0x7000) != 0x7000 {
+            // fine Y < 7, just increment
+            self.v += 0x1000;
+        } else {
+            // fine Y overflow
+            self.v &= !0x7000; // fine Y = 0
+            let mut coarse_y = (self.v & 0x03E0) >> 5;
+            if coarse_y == 29 {
+                coarse_y = 0;
+                self.v ^= 0x0800; // toggle vertical nametable
+            } else if coarse_y == 31 {
+                coarse_y = 0; // wrap without NT toggle
+            } else {
+                coarse_y += 1;
+            }
+            self.v = (self.v & !0x03E0) | (coarse_y << 5);
+        }
+    }
+
     fn render_pixel(&mut self, cartridge: Option<&crate::cartridge::Cartridge>) {
         let x = self.cycle - 1;
         let y = self.scanline;
-        
-        static mut DQ3_PIXEL_COUNT: u32 = 0;
-        static mut DQ3_SCANLINE_DEBUG_COUNT: u32 = 0;
-        
-        // Minimal debug tracking
-        unsafe {
-            DQ3_PIXEL_COUNT += 1;
-            
-            // Only log critical render events
-            if DQ3_PIXEL_COUNT == 1000 || DQ3_PIXEL_COUNT == 50000 {
-            }
-        }
-        
+
         if x >= 256 || y < 0 || y >= 240 {
             return;
         }
-        
+
         let mut bg_color = self.palette[0]; // Default background color
         let mut bg_pixel = 0u8; // Background pixel value (0 = transparent, 1-3 = palette entries)
-        
-        // Check background rendering normally (no DQ3 forcing)
-        
-        // Track PPU mask changes only
-        if cartridge.is_some() && cartridge.unwrap().is_dq3_detected() {
-            unsafe {
-                static mut MASK_DEBUG_COUNT: u32 = 0;
-                static mut LAST_MASK: u8 = 0xFF;
-                MASK_DEBUG_COUNT += 1;
-                if self.mask.bits() != LAST_MASK {
-                }
-            }
-        }
-        
-        // Debug: Check if background rendering is enabled
-        static mut BG_ENABLE_DEBUG_COUNT: u32 = 0;
-        unsafe {
-            BG_ENABLE_DEBUG_COUNT += 1;
-            if BG_ENABLE_DEBUG_COUNT <= 10 {
-                if cartridge.is_some() && cartridge.unwrap().is_dq3_detected() {
-                    println!("DQ3 PPU: BG_ENABLE={}, mask=0x{:02X}", self.mask.contains(PpuMask::BG_ENABLE), self.mask.bits());
-                }
-            }
-        }
-        
+
         // Render background if enabled
         if self.mask.contains(PpuMask::BG_ENABLE) {
-            // Simple non-scrolled background rendering
-            let tile_x = (x / 8) as usize;
-            let tile_y = (y / 8) as usize;
-            let fine_x = (x % 8) as u8;
-            let fine_y = (y % 8) as u8;
-            
-            if tile_x < 32 && tile_y < 30 {
-                let nametable_addr = tile_y * 32 + tile_x;
-                let tile_id = self.nametable[0][nametable_addr]; // Always use nametable 0
-                
-                // Debug: Log non-zero tiles for DQ3
-                if cartridge.is_some() && cartridge.unwrap().is_dq3_detected() && tile_id != 0 {
-                    static mut NON_ZERO_TILE_COUNT: u32 = 0;
-                    unsafe {
-                        NON_ZERO_TILE_COUNT += 1;
-                        if NON_ZERO_TILE_COUNT <= 20 {
-                            println!("DQ3 PPU: Non-zero tile at ({},{}) = 0x{:02X}", tile_x, tile_y, tile_id);
-                        }
-                    }
-                }
-                
-                if let Some(cart) = cartridge {
-                    let pattern_table = if self.control.contains(PpuControl::BG_PATTERN) { 0x1000 } else { 0x0000 };
-                    let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y as u16;
-                    
-                    if tile_addr < 0x2000 {
-                        let low_byte = cart.read_chr(tile_addr);
-                        let high_byte = cart.read_chr(tile_addr + 8);
-                        let pixel_bit = 7 - fine_x;
-                        let low_bit = (low_byte >> pixel_bit) & 1;
-                        let high_bit = (high_byte >> pixel_bit) & 1;
-                        let pixel_value = (high_bit << 1) | low_bit;
-                        
-                        bg_pixel = pixel_value;
-                        
-                        // Debug title area tile information
-                        if y >= 80 && y <= 87 && x >= 48 && x <= 55 && tile_id >= 0x44 && tile_id <= 0x4F {
-                            unsafe {
-                                static mut TITLE_TILE_DEBUG_COUNT: u32 = 0;
-                                TITLE_TILE_DEBUG_COUNT += 1;
-                                if TITLE_TILE_DEBUG_COUNT <= 20 {
-                                }
-                            }
-                        }
-                        
-                        if pixel_value != 0 {
-                            // Get attribute byte for palette selection
-                            let attr_x = tile_x / 4;
-                            let attr_y = tile_y / 4;
-                            let attr_offset = 960 + attr_y * 8 + attr_x;
-                            let attr_byte = if attr_offset < 1024 {
-                                self.nametable[0][attr_offset]
-                            } else {
-                                0
-                            };
-                            
-                            // Determine which 2x2 block within the 4x4 area
-                            let block_x = (tile_x % 4) / 2;
-                            let block_y = (tile_y % 4) / 2;
-                            let shift = (block_y * 2 + block_x) * 2;
-                            let palette_num = (attr_byte >> shift) & 0x03;
-                            
-                            // Background palette index: palette_num * 4 + pixel_value
-                            let palette_idx = (palette_num as usize * 4) + pixel_value as usize;
-                            if palette_idx < 16 {
-                                bg_color = self.palette[palette_idx];
-                            }
-                            
-                            // Debug title area palette information
-                            if y >= 80 && y <= 87 && x >= 48 && x <= 55 && tile_id >= 0x44 && tile_id <= 0x4F {
-                                // Title palette debug (reduced)
-                            }
+            // Left column clipping
+            if !self.mask.contains(PpuMask::BG_LEFT_ENABLE) && x < 8 {
+                // bg_color stays palette[0], bg_pixel stays 0
+            } else if let Some(cart) = cartridge {
+                // Extract scroll state from v register
+                let fine_y = ((self.v >> 12) & 7) as u16;
+                let coarse_y = ((self.v >> 5) & 0x1F) as usize;
+                let logical_nt = ((self.v >> 10) & 3) as usize;
+                let coarse_x = (self.v & 0x1F) as usize;
+
+                // Calculate which tile column pixel to render using fine X scroll
+                let pixel_col = (x % 8) as u8;
+                let scrolled_col = pixel_col + self.x;
+                let (tile_cx, tile_nt, tile_fx) = if scrolled_col >= 8 {
+                    // Need the next tile
+                    let next_cx = if coarse_x == 31 { 0 } else { coarse_x + 1 };
+                    let next_nt = if coarse_x == 31 { logical_nt ^ 1 } else { logical_nt };
+                    (next_cx, next_nt, scrolled_col - 8)
+                } else {
+                    (coarse_x, logical_nt, scrolled_col)
+                };
+
+                let physical_nt = self.resolve_nametable(tile_nt, cartridge);
+                let nt_addr = coarse_y * 32 + tile_cx;
+                let tile_id = if nt_addr < 1024 {
+                    self.nametable[physical_nt][nt_addr]
+                } else {
+                    0
+                };
+
+                let pattern_table = if self.control.contains(PpuControl::BG_PATTERN) { 0x1000u16 } else { 0x0000u16 };
+                let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
+
+                if tile_addr < 0x2000 {
+                    let low_byte = cart.read_chr(tile_addr);
+                    let high_byte = cart.read_chr(tile_addr + 8);
+                    let pixel_bit = 7 - tile_fx;
+                    let low_bit = (low_byte >> pixel_bit) & 1;
+                    let high_bit = (high_byte >> pixel_bit) & 1;
+                    let pixel_value = (high_bit << 1) | low_bit;
+
+                    bg_pixel = pixel_value;
+
+                    if pixel_value != 0 {
+                        // Attribute table lookup using scroll coordinates
+                        let attr_x = tile_cx / 4;
+                        let attr_y = coarse_y / 4;
+                        let attr_offset = 960 + attr_y * 8 + attr_x;
+                        let attr_byte = if attr_offset < 1024 {
+                            self.nametable[physical_nt][attr_offset]
+                        } else {
+                            0
+                        };
+
+                        let block_x = (tile_cx % 4) / 2;
+                        let block_y = (coarse_y % 4) / 2;
+                        let shift = (block_y * 2 + block_x) * 2;
+                        let palette_num = (attr_byte >> shift) & 0x03;
+
+                        let palette_idx = (palette_num as usize * 4) + pixel_value as usize;
+                        if palette_idx < 16 {
+                            bg_color = self.palette[palette_idx];
                         }
                     }
                 }
             }
         }
-        
-        // No forced rendering - let DQ3 draw its own title screen through normal PPU operations
-        
+
         // Check for sprite rendering
         let mut sprite_result = None;
         let mut sprite_0_hit = false;
-        
+
         if self.mask.contains(PpuMask::SPRITE_ENABLE) {
-            sprite_result = self.render_sprites(x as u8, y as u8, cartridge, &mut sprite_0_hit);
-            
-            // Set sprite 0 hit flag if needed
-            if sprite_0_hit && bg_pixel != 0 {
-                self.status.insert(PpuStatus::SPRITE_0_HIT);
+            // Left column clipping for sprites
+            if !self.mask.contains(PpuMask::SPRITE_LEFT_ENABLE) && x < 8 {
+                // Skip sprite rendering in left 8 pixels
+            } else {
+                sprite_result = self.render_sprites(x as u8, y as u8, cartridge, &mut sprite_0_hit);
+
+                // Set sprite 0 hit flag if needed
+                if sprite_0_hit && bg_pixel != 0 {
+                    self.status.insert(PpuStatus::SPRITE_0_HIT);
+                }
             }
         }
-        
+
         // Determine final pixel color
         let final_color = if let Some((sprite_color, priority_behind_bg)) = sprite_result {
             if priority_behind_bg && bg_pixel != 0 {
@@ -703,80 +659,49 @@ impl Ppu {
         } else {
             bg_color
         };
-        
+
         let pixel_index = ((y as usize * 256) + x as usize) * 3;
-        
+
         if pixel_index + 2 < self.buffer.len() {
-            // Debug: Check if we're actually writing non-default colors
-            // Color write debug (reduced)
-            
-            let color = PALETTE_COLORS[final_color as usize];
+            let mut masked_color = final_color & 0x3F;
+            if self.mask.contains(PpuMask::GRAYSCALE) {
+                masked_color &= 0x30;
+            }
+            let color = PALETTE_COLORS[masked_color as usize];
             self.buffer[pixel_index] = color.0;
             self.buffer[pixel_index + 1] = color.1;
             self.buffer[pixel_index + 2] = color.2;
-            
-            // Debug DQ3 rendering in title area
-            if let Some(cart) = cartridge {
-                if cart.is_dq3_detected() && y >= 80 && y <= 87 && x >= 48 && x <= 95 {
-                    static mut DQ3_TITLE_DEBUG_COUNT: u32 = 0;
-                    // DQ3 title debug (reduced)
-                }
-            }
-            
-            // Check if we're actually modifying red pixels that we set earlier
-            if y == 80 && x >= 48 && x <= 55 && bg_pixel != 0 {
-                // Title overwrite debug (reduced)
-            }
         }
     }
 
     fn evaluate_sprites(&mut self) {
-        // Clear overflow flag at start of evaluation
-        
-        // Don't evaluate sprites outside visible area
         if self.scanline < 0 || self.scanline >= 240 {
             return;
         }
-        
+
         let sprite_height = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
-        let current_scanline = self.scanline as u8;
+        let current_scanline = self.scanline as u16;
         let mut sprites_on_scanline = 0;
-        
-        // Evaluate all 64 sprites to find which ones are on the current scanline
+
         for sprite_idx in 0..64 {
             let oam_offset = sprite_idx * 4;
             let sprite_y = self.oam[oam_offset];
-            
-            // Skip sprites that are off-screen (Y >= 0xEF indicates off-screen)
+
             if sprite_y >= 0xEF {
                 continue;
             }
-            
-            // Check if sprite intersects with current scanline
-            if current_scanline >= sprite_y && current_scanline < sprite_y + sprite_height {
+
+            // OAM Y is scanline - 1
+            let sprite_top = sprite_y as u16 + 1;
+            let sprite_bottom = sprite_top + sprite_height as u16;
+
+            if current_scanline >= sprite_top && current_scanline < sprite_bottom {
                 sprites_on_scanline += 1;
-                
-                // NES hardware limitation: max 8 sprites per scanline
-                // If we find a 9th sprite, set the overflow flag
+
                 if sprites_on_scanline > 8 {
-                    
-                    // Debug log for verification
-                    static mut OVERFLOW_LOG_COUNT: u32 = 0;
-                    unsafe {
-                        OVERFLOW_LOG_COUNT += 1;
-                        if OVERFLOW_LOG_COUNT <= 5 {
-                        }
-                    }
-                    break; // Stop evaluation after overflow is detected
+                    self.status.insert(PpuStatus::SPRITE_OVERFLOW);
+                    break;
                 }
-            }
-        }
-        
-        // Debug: Log sprite counts for first few scanlines in Goonies
-        static mut SPRITE_EVAL_LOG_COUNT: u32 = 0;
-        unsafe {
-            SPRITE_EVAL_LOG_COUNT += 1;
-            if SPRITE_EVAL_LOG_COUNT <= 10 {
             }
         }
     }
@@ -788,31 +713,35 @@ impl Ppu {
             for sprite_num in 0..64 {
                 let base = sprite_num * 4;
                 if base + 3 >= 256 { break; }
-                
+
                 let sprite_y = self.oam[base];
                 let tile_id = self.oam[base + 1];
                 let attributes = self.oam[base + 2];
                 let sprite_x = self.oam[base + 3];
-                
+
                 // Skip off-screen sprites
                 if sprite_y >= 0xEF { continue; }
-                
+
                 let sprite_size = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
-                
+
+                // NES OAM Y is "scanline - 1": sprite with Y=N appears on scanline N+1
+                let sprite_top = sprite_y as u16 + 1;
+                let sprite_bottom = sprite_top + sprite_size as u16;
+
                 // Check if sprite is on current scanline
-                if y >= sprite_y && y < sprite_y + sprite_size {
+                if (y as u16) >= sprite_top && (y as u16) < sprite_bottom {
                     sprites_on_scanline += 1;
-                    
+
                     // NES hardware limit: max 8 sprites per scanline
                     if sprites_on_scanline > 8 {
                         break;
                     }
-                    
+
                     // Check if pixel is within sprite horizontal bounds
-                    if x >= sprite_x && x < sprite_x + 8 {
-                    
+                    if x >= sprite_x && (x as u16) < sprite_x as u16 + 8 {
+
                     let mut pixel_x = x - sprite_x;
-                    let mut pixel_y = y - sprite_y;
+                    let mut pixel_y = (y as u16 - sprite_top) as u8;
                     
                     // Handle horizontal flip
                     if attributes & 0x40 != 0 {
@@ -857,33 +786,21 @@ impl Ppu {
                         let pixel_value = (high_bit << 1) | low_bit;
                         
                         if pixel_value != 0 {
-                            if sprite_num == 0 {
+                            if sprite_num == 0 && x != 255 {
                                 *sprite_0_hit = true;
-                                
-                                // Normal sprite 0 rendering
-                                let palette_num = attributes & 0x03;
-                                let palette_idx = 16 + palette_num * 4 + pixel_value;
-                                
-                                let color_index = if (palette_idx as usize) < 32 {
-                                    self.palette[palette_idx as usize]
-                                } else {
-                                    self.palette[16]
-                                };
-                                
-                                let priority_behind_bg = (attributes & 0x20) != 0;
-                            } else {
-                                // Normal sprite rendering
-                                let palette_num = attributes & 0x03;
-                                let palette_idx = 16 + palette_num * 4 + pixel_value;
-                                
-                                let color_index = if (palette_idx as usize) < 32 {
-                                    self.palette[palette_idx as usize]
-                                } else {
-                                    self.palette[16]
-                                };
-                                
-                                let priority_behind_bg = (attributes & 0x20) != 0;
                             }
+
+                            let palette_num = attributes & 0x03;
+                            let palette_idx = 16 + palette_num * 4 + pixel_value;
+
+                            let color_index = if (palette_idx as usize) < 32 {
+                                self.palette[palette_idx as usize]
+                            } else {
+                                self.palette[16]
+                            };
+
+                            let priority_behind_bg = (attributes & 0x20) != 0;
+                            return Some((color_index, priority_behind_bg));
                         }
                     }
                     }
@@ -896,59 +813,19 @@ impl Ppu {
     pub fn read_register(&mut self, addr: u16, cartridge: Option<&crate::cartridge::Cartridge>) -> u8 {
         match addr {
             0x2002 => {
-                // Read the actual PPU status
                 let status = self.status.bits();
-                
-                // Debug DQ3 status reads
-                if let Some(cart) = cartridge {
-                    if cart.is_dq3_detected() {
-                        static mut DQ3_STATUS_READ_COUNT: u32 = 0;
-                        unsafe {
-                            DQ3_STATUS_READ_COUNT += 1;
-                            if DQ3_STATUS_READ_COUNT <= 20 || DQ3_STATUS_READ_COUNT % 1000 == 0 {
-                                println!("DQ3 PPU STATUS READ #{}: 0x{:02X} (VBlank={}, Sprite0Hit={}, SpriteOverflow={})", 
-                                    DQ3_STATUS_READ_COUNT, 
-                                    status, 
-                                    (status & 0x80) != 0,
-                                    (status & 0x40) != 0,
-                                    (status & 0x20) != 0);
-                            }
-                        }
-                    }
-                }
-                
-                // Clear VBlank flag after read (standard NES behavior)
+
+                // Clear VBlank flag after read
                 self.status.remove(PpuStatus::VBLANK);
-                
-                // Reset write toggle (w) register
+
+                // Reset write toggle
                 self.w = false;
-                
-                // Check for NMI suppression race condition
-                // If we're reading $2002 on the exact cycle VBlank is being set (scanline 241, cycle 1)
+
+                // NMI suppression: reading $2002 on the exact cycle VBlank is set
                 if self.scanline == 241 && self.cycle == 1 {
-                    // Suppress NMI for this frame
                     self.nmi_suppressed = true;
-                    static mut SUPPRESSION_COUNT: u32 = 0;
-                    unsafe {
-                        SUPPRESSION_COUNT += 1;
-                        if SUPPRESSION_COUNT <= 5 {
-                            println!("PPU: NMI SUPPRESSED #{} - $2002 read during VBlank flag set (scanline 241, cycle 1)", SUPPRESSION_COUNT);
-                            
-                            // DQ3 specific debugging
-                            if let Some(cartridge) = cartridge {
-                                if cartridge.is_dq3_detected() {
-                                    println!("  -> DQ3: This NMI suppression might be causing initialization hang!");
-                                }
-                            }
-                        }
-                    }
                 }
-                
-                // VBlank flag is already cleared above after the debug output
-                
-                // Note: Sprite overflow flag is NOT cleared on read (unlike VBlank)
-                // It remains set until the next frame's sprite evaluation
-                
+
                 status
             }
             0x2004 => self.oam[self.oam_addr as usize],
@@ -965,28 +842,45 @@ impl Ppu {
                         0x1C => 0x0C, // $3F1C mirrors $3F0C
                         _ => palette_addr & 0x1F
                     };
+                    // Also fill read_buffer with nametable data "underneath" the palette
+                    let nt_addr = (self.v & 0x2FFF) as usize;
+                    if nt_addr >= 0x2000 {
+                        let offset_in_nt = nt_addr - 0x2000;
+                        let logical_nt = (offset_in_nt / 0x400) % 4;
+                        let table = self.resolve_nametable(logical_nt, cartridge);
+                        let offset = offset_in_nt % 0x400;
+                        self.read_buffer = if offset < 1024 {
+                            self.nametable[table][offset]
+                        } else {
+                            0
+                        };
+                    }
                     self.palette[mirrored_addr]
                 } else {
                     // All other memory: Buffered read (crucial for SMB)
                     let old_buffer = self.read_buffer;
                     
                     // Update buffer with new data
-                    if self.v >= 0x2000 && self.v < 0x3000 {
-                        // Nametable read
-                        let addr = (self.v - 0x2000) as usize;
-                        let table = (addr / 0x400) % 2;
+                    let effective_v = if self.v >= 0x3000 && self.v < 0x3F00 {
+                        self.v - 0x1000 // $3000-$3EFF mirrors $2000-$2EFF
+                    } else {
+                        self.v
+                    };
+                    if effective_v >= 0x2000 && effective_v < 0x3000 {
+                        // Nametable read with proper mirroring
+                        let addr = (effective_v - 0x2000) as usize;
+                        let logical_nt = (addr / 0x400) % 4;
+                        let table = self.resolve_nametable(logical_nt, cartridge);
                         let offset = addr % 0x400;
                         self.read_buffer = if offset < 1024 {
                             self.nametable[table][offset]
                         } else {
                             0
                         };
-                    } else if self.v < 0x2000 {
-                        // CHR-ROM read (CRITICAL for Super Mario Bros title screen!)
-                        // This is what was missing - SMB reads title data from CHR-ROM
+                    } else if effective_v < 0x2000 {
+                        // CHR-ROM/CHR-RAM read
                         if let Some(cart) = cartridge {
-                            
-                            // CHR-ROM read successful
+                            self.read_buffer = cart.read_chr(effective_v);
                         } else {
                             self.read_buffer = 0;
                         }
@@ -997,9 +891,10 @@ impl Ppu {
                     old_buffer
                 };
                 
-                // CRITICAL: Increment VRAM address AFTER read (this was missing!)
+                // CRITICAL: Increment VRAM address AFTER read
                 let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) { 32 } else { 1 };
-                
+                self.v = self.v.wrapping_add(increment) & 0x3FFF;
+
                 data
             }
             _ => 0
@@ -1007,90 +902,22 @@ impl Ppu {
     }
 
     pub fn write_register(&mut self, addr: u16, data: u8, cartridge: Option<&crate::cartridge::Cartridge>) -> Option<(u16, u8)> {
-        // CRITICAL DEBUG: Monitor ALL PPU register writes for DQ3 to track activity
-        if let Some(cart) = cartridge {
-            if cart.is_dq3_detected() && addr >= 0x2000 && addr <= 0x2007 {
-                static mut ALL_PPU_WRITE_COUNT: u32 = 0;
-                unsafe {
-                    ALL_PPU_WRITE_COUNT += 1;
-                    if ALL_PPU_WRITE_COUNT <= 100 || ALL_PPU_WRITE_COUNT % 1000 == 0 {
-                        println!("DQ3 PPU REG #{}: ${:04X} = ${:02X}", ALL_PPU_WRITE_COUNT, addr, data);
-                    }
-                }
-            }
-        }
-        
         match addr {
             0x2000 => {
-                // PPU CONTROL register handling
                 let old_nmi_enable = self.control.contains(PpuControl::NMI_ENABLE);
                 self.control = PpuControl::from_bits_truncate(data);
+
+                // Update nametable select bits in t register
+                self.t = (self.t & 0xF3FF) | ((data as u16 & 0x03) << 10);
+
+                // NMI edge detection: 0->1 while VBlank is set triggers immediate NMI
                 let new_nmi_enable = self.control.contains(PpuControl::NMI_ENABLE);
-                
-                // Debug: Log PPU control writes for DQ3
-                if let Some(cartridge) = cartridge {
-                    if cartridge.is_dq3_detected() {
-                        static mut CONTROL_WRITE_COUNT: u32 = 0;
-                        unsafe {
-                            CONTROL_WRITE_COUNT += 1;
-                            if CONTROL_WRITE_COUNT <= 20 {
-                                println!("DQ3: PPU CONTROL write #{}: 0x{:02X} -> NMI_ENABLE={}, BG_ENABLE={}", 
-                                    CONTROL_WRITE_COUNT, data, new_nmi_enable, 
-                                    self.control.contains(PpuControl::BG_PATTERN));
-                            }
-                        }
-                    }
+                if !old_nmi_enable && new_nmi_enable && self.status.contains(PpuStatus::VBLANK) {
+                    self.pending_nmi = true;
                 }
-                
-                // Let DQ3 handle PPU control naturally - no forced NMI enable
-                
-                // NMI edge detection: If NMI_ENABLE transitions from 0->1 while VBlank is set, trigger immediate NMI
-                let final_nmi_enable = self.control.contains(PpuControl::NMI_ENABLE);
-                if !old_nmi_enable && final_nmi_enable && self.status.contains(PpuStatus::VBLANK) {
-                    // This should return an NMI signal, but write_register doesn't support that
-                    // For now, log this condition - this needs architectural change
-                    static mut EDGE_NMI_COUNT: u32 = 0;
-                    unsafe {
-                        EDGE_NMI_COUNT += 1;
-                        if EDGE_NMI_COUNT <= 5 {
-                            println!("PPU: Edge-triggered NMI #{}", EDGE_NMI_COUNT);
-                            if let Some(cartridge) = cartridge {
-                                if cartridge.is_dq3_detected() {
-                                    println!("  -> DQ3: This might help bootstrap the initialization!");
-                                }
-                            }
-                        }
-                    }
-                }
-                
+
             }
             0x2001 => {
-                // PPU MASK register handling
-                let old_mask = self.mask.bits();
-                
-                // Debug: Always log DQ3 PPU mask writes
-                if let Some(cartridge) = cartridge {
-                    if cartridge.is_dq3_detected() {
-                        static mut ALL_MASK_WRITES: u32 = 0;
-                        unsafe {
-                            ALL_MASK_WRITES += 1;
-                            println!("DQ3 PPU MASK WRITE #{}: old=0x{:02X} -> new=0x{:02X}", ALL_MASK_WRITES, old_mask, data);
-                            if data == 0x18 {
-                                println!("  -> ENABLING background+sprites!");
-                            } else if data == 0x08 {
-                                println!("  -> ENABLING sprites only!");
-                            } else if data == 0x10 {
-                                println!("  -> ENABLING background only!");
-                            } else if data == 0x00 {
-                                println!("  -> DISABLING all rendering!");
-                            }
-                            
-                            // No forced rendering - respect DQ3's mask register settings
-                        }
-                    }
-                }
-                
-                // CRITICAL FIX: Actually set the mask register!
                 self.mask = PpuMask::from_bits_truncate(data);
             }
             0x2003 => {
@@ -1098,187 +925,62 @@ impl Ppu {
             }
             0x2004 => {
                 self.oam[self.oam_addr as usize] = data;
+                self.oam_addr = self.oam_addr.wrapping_add(1);
             }
             0x2005 => {
-                static mut SCROLL_WRITE_COUNT: u32 = 0;
-                unsafe {
-                    SCROLL_WRITE_COUNT += 1;
-                    if cartridge.as_ref().map_or(false, |c| c.is_dq3_detected()) && SCROLL_WRITE_COUNT <= 10 {
-                        println!("DQ3 SCROLL WRITE #{}: data=${:02X}, w={}", SCROLL_WRITE_COUNT, data, self.w);
-                    }
-                }
-                
-                // Mid-frame scroll detection for split-screen effects
-                // Only detect during specific scanline ranges to avoid false positives
-                if self.scanline >= 10 && self.scanline <= 50 && self.scroll_change_line == -1 {
-                    self.scroll_change_line = self.scanline;
-                    // Set frame counter to maintain split detection for multiple frames
-                    self.frame_since_scroll_change = 120; // Keep split active for 2 seconds
-                }
-                
                 if !self.w {
                     self.x = data & 0x07;
+                    self.t = (self.t & 0xFFE0) | ((data as u16) >> 3);
                     self.w = true;
                 } else {
+                    self.t = (self.t & 0x8C1F) | (((data as u16) & 0x07) << 12) | (((data as u16) >> 3) << 5);
                     self.w = false;
                 }
             }
             0x2006 => {
-                static mut ADDR_WRITE_COUNT: u32 = 0;
-                unsafe {
-                    ADDR_WRITE_COUNT += 1;
-                    if cartridge.as_ref().map_or(false, |c| c.is_dq3_detected()) && ADDR_WRITE_COUNT <= 10 {
-                        println!("DQ3 ADDR WRITE #{}: data=${:02X}, w={}", ADDR_WRITE_COUNT, data, self.w);
-                    }
-                }
-                
                 if !self.w {
+                    self.t = (self.t & 0x00FF) | (((data & 0x3F) as u16) << 8);
                     self.w = true;
                 } else {
                     self.t = (self.t & 0xFF00) | data as u16;
                     self.v = self.t;
                     self.w = false;
-                    
                 }
             }
             0x2007 => {
-                // DQ3 Adventure book fix - replace ALL empty tiles when in specific banks
-                let mut actual_data = data;
-                if let Some(cartridge) = cartridge {
-                    if cartridge.is_dq3_detected() && self.v >= 0x2000 && self.v < 0x2800 {
-                        let current_bank = cartridge.get_current_prg_bank();
-                        
-                        // Monitor all nametable writes
-                        static mut ALL_NT_WRITE_COUNT: u32 = 0;
-                        static mut TITLE_SCREEN_WRITES: u32 = 0;
-                        unsafe {
-                            ALL_NT_WRITE_COUNT += 1;
-                            
-                            // Track title screen writes specifically
-                            if current_bank == 0 && data != 0x00 {
-                                TITLE_SCREEN_WRITES += 1;
-                                if TITLE_SCREEN_WRITES <= 50 {
-                                }
-                            }
-                            
-                            if ALL_NT_WRITE_COUNT <= 50 || (ALL_NT_WRITE_COUNT % 1000 == 0) {
-                                println!("DQ3 NT WRITE #{}: addr=0x{:04X}, data=0x{:02X}, bank={}", 
-                                    ALL_NT_WRITE_COUNT, self.v, data, current_bank);
-                            }
-                            
-                            // Log when we get a significant number of writes
-                            if ALL_NT_WRITE_COUNT == 100 {
-                            }
-                        }
-                        
-                        // DISABLED: Don't apply forced pattern generation - let game render naturally
-                        if false && data == 0x00 && current_bank == 0 && self.v >= 0x2000 && self.v < 0x2400 {
-                            // Only for nametable 0 in bank 0 (title screen)
-                            static mut PATTERN_GEN_COUNT: u32 = 0;
-                            unsafe {
-                                PATTERN_GEN_COUNT += 1;
-                                if PATTERN_GEN_COUNT > 50 {  // Start earlier for better visibility
-                                // Title screen: Generate Dragon Quest III title screen pattern
-                                let tile_x = (self.v % 32) as u8;
-                                let tile_y = ((self.v - 0x2000) / 32) as u8;
-                                
-                                // Dragon Quest III title pattern
-                                // Title appears around lines 8-12, centered
-                                if tile_y == 10 && tile_x >= 10 && tile_x <= 21 {
-                                    // Dragon Quest III text patterns
-                                    let title_patterns = [0x44, 0x52, 0x41, 0x47, 0x4F, 0x4E, 0x20, 0x51, 0x55, 0x45, 0x53, 0x54];
-                                    let index = (tile_x - 10) as usize;
-                                    if index < title_patterns.len() {
-                                        actual_data = title_patterns[index];
-                                    } else {
-                                        actual_data = 0x20;
-                                    }
-                                } else if tile_y == 11 && tile_x >= 14 && tile_x <= 17 {
-                                    // "III" text
-                                    actual_data = 0x49; // 'I' character
-                                } else if tile_y >= 8 && tile_y <= 13 && tile_x >= 8 && tile_x <= 23 {
-                                    // Title area border
-                                    if tile_x == 8 || tile_x == 23 || tile_y == 8 || tile_y == 13 {
-                                        actual_data = 0x2A; // Border pattern
-                                    } else {
-                                        actual_data = 0x20; // Space
-                                    }
-                                } else {
-                                    actual_data = 0x20; // Background
-                                }
-                                
-                                    
-                                    // Check if CHR pattern exists for this tile
-                                    if tile_x >= 10 && tile_x <= 21 && tile_y == 10 {
-                                        let pattern_addr = (actual_data as usize) * 16;
-                                    }
-                                }
-                            }
-                            
-                            static mut TILE_FIX_COUNT: u32 = 0;
-                            unsafe {
-                                TILE_FIX_COUNT += 1;
-                                if TILE_FIX_COUNT <= 5 {
-                                }
-                            }
-                        }
-                        // For other banks, use less aggressive replacement
-                        else if data == 0x00 && (current_bank >= 10 && current_bank <= 13) {
-                            // Use blank/space character for other screens
-                            actual_data = 0x00;  // Keep original for now
-                        }
-                    }
-                }
-                
-                if self.v >= 0x3F00 {
-                    let palette_addr = (self.v & 0x1F) as usize;
-                    // Proper NES palette mirroring
+                let write_v = if self.v >= 0x3000 && self.v < 0x3F00 {
+                    self.v - 0x1000
+                } else {
+                    self.v
+                };
+                if write_v >= 0x3F00 {
+                    // Palette write
+                    let palette_addr = (write_v & 0x1F) as usize;
                     let mirrored_addr = match palette_addr {
-                        0x10 => 0x00, // $3F10 mirrors $3F00
-                        0x14 => 0x04, // $3F14 mirrors $3F04
-                        0x18 => 0x08, // $3F18 mirrors $3F08
-                        0x1C => 0x0C, // $3F1C mirrors $3F0C
+                        0x10 => 0x00,
+                        0x14 => 0x04,
+                        0x18 => 0x08,
+                        0x1C => 0x0C,
                         _ => palette_addr & 0x1F
                     };
-                    
-                    // Standard palette write
                     self.palette[mirrored_addr] = data;
-                    
-                } else if self.v >= 0x2000 && self.v < 0x3000 {
-                    let addr = (self.v - 0x2000) as usize;
-                    // Proper nametable mirroring
-                    let nt_index = (addr / 0x400) % 4; // 0-3 for NT0-NT3
+                } else if write_v >= 0x2000 && write_v < 0x3000 {
+                    // Nametable write
+                    let addr = (write_v - 0x2000) as usize;
+                    let nt_index = (addr / 0x400) % 4;
                     let offset = addr % 0x400;
-                    
+
                     if offset < 1024 {
-                        // Debug DQ3 nametable clears (writing 0x00)
-                        if data == 0x00 && cartridge.is_some() && cartridge.unwrap().is_dq3_detected() {
-                            static mut NT_CLEAR_COUNT: u32 = 0;
-                            unsafe {
-                                NT_CLEAR_COUNT += 1;
-                                if NT_CLEAR_COUNT <= 10 || (NT_CLEAR_COUNT % 100 == 0) {
-                                }
-                            }
-                            
-                            // FIXED: Allow DQ3 to write to title screen area naturally
-                            // Previous code was blocking DQ3's actual title screen writes
-                        }
-                        
-                        // Map logical nametables to physical based on cartridge mirroring
                         let physical_nt = if let Some(cart) = cartridge {
                             match cart.mirroring() {
                                 crate::cartridge::Mirroring::Vertical => match nt_index {
-                                    0 => 0, // NT0 -> Physical NT0
-                                    1 => 1, // NT1 -> Physical NT1
-                                    2 => 0, // NT2 -> Physical NT0 (mirrors NT0)
-                                    3 => 1, // NT3 -> Physical NT1 (mirrors NT1)
+                                    0 | 2 => 0,
+                                    1 | 3 => 1,
                                     _ => 0,
                                 },
                                 crate::cartridge::Mirroring::Horizontal => match nt_index {
-                                    0 => 0, // NT0 -> Physical NT0
-                                    1 => 0, // NT1 -> Physical NT0 (mirrors NT0)
-                                    2 => 1, // NT2 -> Physical NT1
-                                    3 => 1, // NT3 -> Physical NT1 (mirrors NT2)
+                                    0 | 1 => 0,
+                                    2 | 3 => 1,
                                     _ => 0,
                                 },
                                 crate::cartridge::Mirroring::FourScreen => nt_index % 2,
@@ -1288,44 +990,19 @@ impl Ppu {
                         } else {
                             nt_index % 2
                         };
-                        
-                        // Write to nametable
-                        static mut NAMETABLE_WRITE_COUNT: u32 = 0;
-                        static mut NON_ZERO_NT_COUNT: u32 = 0;
-                        unsafe {
-                            NAMETABLE_WRITE_COUNT += 1;
-                            if cartridge.as_ref().map_or(false, |c| c.is_dq3_detected()) {
-                                if actual_data != 0 && NAMETABLE_WRITE_COUNT <= 20 {
-                                    println!("DQ3 NAMETABLE WRITE #{}: addr=${:04X} -> nt{}[${:03X}] = ${:02X}", 
-                                        NAMETABLE_WRITE_COUNT, self.v, physical_nt, offset, actual_data);
-                                }
-                            }
-                        }
-                        
-                        self.nametable[physical_nt][offset] = actual_data;
-                        
+
+                        self.nametable[physical_nt][offset] = data;
                     }
-                } else if self.v < 0x2000 {
-                    // CHR writes to cartridge (for CHR RAM)
-                    // IMPORTANT: Store address BEFORE incrementing
-                    let chr_addr = self.v;
-                    
-                    static mut CHR_WRITE_COUNT: u32 = 0;
-                    unsafe {
-                        CHR_WRITE_COUNT += 1;
-                        if cartridge.as_ref().map_or(false, |c| c.is_dq3_detected()) && CHR_WRITE_COUNT <= 20 {
-                            println!("DQ3 CHR WRITE #{}: addr=${:04X} = ${:02X}", CHR_WRITE_COUNT, chr_addr, actual_data);
-                        }
-                    }
-                    
-                    // Increment VRAM address after capturing the write address
+                } else if write_v < 0x2000 {
+                    // CHR write (for CHR RAM)
+                    let chr_addr = write_v;
                     let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) { 32 } else { 1 };
-                    
-                    // Return CHR write info for bus to handle
-                    return Some((chr_addr, actual_data));
+                    self.v = self.v.wrapping_add(increment) & 0x3FFF;
+                    return Some((chr_addr, data));
                 }
-                
+
                 let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) { 32 } else { 1 };
+                self.v = self.v.wrapping_add(increment) & 0x3FFF;
             }
             _ => {}
         }
@@ -1337,21 +1014,6 @@ impl Ppu {
     }
 
     pub fn get_buffer(&self) -> &[u8] {
-        // Debug: Check buffer contents
-        static mut BUFFER_GET_COUNT: u32 = 0;
-        unsafe {
-            BUFFER_GET_COUNT += 1;
-            if BUFFER_GET_COUNT <= 5 {
-                if self.buffer.len() >= 9 {
-                    // Buffer debug removed
-                    
-                    // Check if buffer is still red as expected
-                    if self.buffer[0] == 255 && self.buffer[1] == 0 && self.buffer[2] == 0 {
-                    } else {
-                    }
-                }
-            }
-        }
         &self.buffer
     }
 }
@@ -1459,6 +1121,10 @@ impl Ppu {
     
     pub fn set_oam(&mut self, oam: [u8; 256]) {
         self.oam = oam;
+    }
+
+    pub fn write_oam_data(&mut self, addr: u8, data: u8) {
+        self.oam[addr as usize] = data;
     }
     
     

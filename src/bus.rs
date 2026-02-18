@@ -22,6 +22,7 @@ pub struct Bus {
     cartridge: Option<Cartridge>,
     pub controller: u8,
     controller_state: u16,
+    strobe: bool, // Controller strobe mode
     dma_cycles: u32, // Cycles to add due to DMA operations
     dma_in_progress: bool, // Flag to indicate DMA is in progress
 }
@@ -35,6 +36,7 @@ impl Bus {
             cartridge: None,
             controller: 0,
             controller_state: 0,
+            strobe: false,
             dma_cycles: 0,
             dma_in_progress: false,
         }
@@ -90,12 +92,14 @@ impl Bus {
         
         // Step APU at CPU rate
         for _ in 0..cycles {
+            self.apu.step();
         }
         
         nmi_triggered
     }
 
     pub fn step_apu(&mut self) {
+        self.apu.step();
     }
 
     pub fn set_controller(&mut self, controller: u8) {
@@ -103,9 +107,22 @@ impl Bus {
     }
 
     fn read_controller(&mut self) -> u8 {
+        if self.strobe {
+            // While strobe is high, continuously reload and return bit 0 (A button)
+            self.controller_state = self.controller as u16;
+            return self.controller as u8 & 0x01;
+        }
         let value = if self.controller_state & 0x01 != 0 { 0x01 } else { 0x00 };
         self.controller_state >>= 1;
         value
+    }
+
+    pub fn ppu_frame_complete(&mut self) -> bool {
+        let complete = self.ppu.frame_complete;
+        if complete {
+            self.ppu.frame_complete = false;
+        }
+        complete
     }
 
     pub fn get_ppu_buffer(&self) -> &[u8] {
@@ -123,6 +140,7 @@ impl Bus {
     
     // Clear APU frame IRQ
     pub fn clear_apu_irq(&mut self) {
+        self.apu.clear_frame_irq();
     }
     
     pub fn get_dma_cycles(&mut self) -> u32 {
@@ -159,6 +177,14 @@ impl Bus {
     pub fn is_goonies(&self) -> bool {
         if let Some(ref cartridge) = self.cartridge {
             cartridge.is_goonies()
+        } else {
+            false
+        }
+    }
+
+    pub fn is_dq3_detected(&self) -> bool {
+        if let Some(ref cartridge) = self.cartridge {
+            cartridge.is_dq3_detected()
         } else {
             false
         }
@@ -204,22 +230,6 @@ impl CpuBus for Bus {
         }
     }
     
-    fn is_dq3_detected(&self) -> bool {
-        if let Some(ref cartridge) = self.cartridge {
-            cartridge.is_dq3_detected()
-        } else {
-            false
-        }
-    }
-    
-    fn get_compatibility_flags(&self) -> Option<crate::cartridge::CompatibilityFlags> {
-        if let Some(ref cartridge) = self.cartridge {
-            Some(cartridge.get_compatibility_flags())
-        } else {
-            None
-        }
-    }
-
     fn read(&mut self, addr: u16) -> u8 {
         let mut data = match addr {
             0x0000..=0x1FFF => {
@@ -313,8 +323,9 @@ impl CpuBus for Bus {
                 
                 original_data
             },
-            0x2000..=0x2007 => {
-                self.ppu.read_register(addr, self.cartridge.as_ref())
+            0x2000..=0x3FFF => {
+                let mirrored = 0x2000 + (addr & 0x07);
+                self.ppu.read_register(mirrored, self.cartridge.as_ref())
             }
             0x4000..=0x4013 | 0x4015 => {
                 self.apu.read_register(addr)
@@ -439,87 +450,7 @@ impl CpuBus for Bus {
             },
             0x8000..=0xFFFF => {
                 if let Some(ref cartridge) = self.cartridge {
-                    let data = cartridge.read_prg(addr);
-                    
-                    // Debug: Log reset vector reads with bank info
-                    if (addr == 0xFFFC || addr == 0xFFFD) && cartridge.is_dq3_detected() {
-                        static mut RESET_VECTOR_READ_COUNT: u32 = 0;
-                        unsafe {
-                            RESET_VECTOR_READ_COUNT += 1;
-                            if RESET_VECTOR_READ_COUNT <= 5 {
-                                println!("DQ3 BUS: Reading reset vector ${:04X} = 0x{:02X} (bank={})", 
-                                    addr, data, cartridge.get_current_prg_bank());
-                            }
-                        }
-                    }
-                    
-                    // Monitor DQ3 adventure book routine access
-                    if cartridge.is_dq3_detected() {
-                        // Monitor JSR to $8000 (adventure book routine)
-                        if addr >= 0x8000 && addr <= 0x8010 {
-                            static mut JSR_8000_COUNT: u32 = 0;
-                            unsafe {
-                                JSR_8000_COUNT += 1;
-                                if JSR_8000_COUNT <= 10 {
-                                }
-                            }
-                        }
-                        if addr == 0x8000 {
-                            static mut ADVENTURE_BOOK_ACCESS_COUNT: u32 = 0;
-                            unsafe {
-                                ADVENTURE_BOOK_ACCESS_COUNT += 1;
-                                if ADVENTURE_BOOK_ACCESS_COUNT <= 5 {
-                                    
-                                    // Check if this is a JMP instruction (expected $4C)
-                                    if data == 0x4C {
-                                    } else {
-                                    }
-                                }
-                            }
-                        } else if addr >= 0x8051 && addr <= 0x8060 && cartridge.get_current_prg_bank() == 1 {
-                            // Monitor critical adventure book display setup code
-                            static mut DISPLAY_SETUP_COUNT: u32 = 0;
-                            unsafe {
-                                DISPLAY_SETUP_COUNT += 1;
-                                if DISPLAY_SETUP_COUNT <= 10 {
-                                }
-                            }
-                        } else if addr == 0x8050 && cartridge.get_current_prg_bank() == 1 {
-                            // Monitor RTS that skips adventure book display
-                            static mut RTS_SKIP_COUNT: u32 = 0;
-                            unsafe {
-                                RTS_SKIP_COUNT += 1;
-                                if RTS_SKIP_COUNT <= 10 {
-                                }
-                            }
-                        } else if addr >= 0x803B && addr <= 0x8055 && cartridge.get_current_prg_bank() == 1 {
-                            static mut ADVENTURE_ROUTINE_ACCESS_COUNT: u32 = 0;
-                            unsafe {
-                                ADVENTURE_ROUTINE_ACCESS_COUNT += 1;
-                                if ADVENTURE_ROUTINE_ACCESS_COUNT <= 20 {
-                                }
-                            }
-                        } else if addr == 0x8049 && cartridge.get_current_prg_bank() == 1 {
-                            // This is the critical LDA $06F0 instruction - enable adventure book context
-                            static mut CRITICAL_LDA_COUNT: u32 = 0;
-                            unsafe {
-                                CRITICAL_LDA_COUNT += 1;
-                                if CRITICAL_LDA_COUNT <= 10 {
-                                    
-                                    if data == 0xAD {  // LDA absolute
-                                        
-                                        // Enable adventure book context for $06F0 forcing
-                                        // Set the shared variable to enable context
-                                        DQ3_ADVENTURE_BOOK_CONTEXT = true;
-                                        
-                                    } else {
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    data
+                    cartridge.read_prg(addr)
                 } else {
                     0
                 }
@@ -547,35 +478,67 @@ impl CpuBus for Bus {
                 // CRITICAL FIX: Actually write to memory!
                 self.memory.write(addr, data);
             },
-            0x2000..=0x2007 => {
-                // CRITICAL FIX: Actually call PPU write_register and handle CHR writes!
-                if let Some((chr_addr, chr_data)) = self.ppu.write_register(addr, data, self.cartridge.as_ref()) {
-                    // PPU signaled a CHR write - forward it to the cartridge
+            0x2000..=0x3FFF => {
+                let mirrored = 0x2000 + (addr & 0x07);
+                if let Some((chr_addr, chr_data)) = self.ppu.write_register(mirrored, data, self.cartridge.as_ref()) {
                     if let Some(ref mut cartridge) = self.cartridge {
                         cartridge.write_chr(chr_addr, chr_data);
-                        
-                        // Debug CHR writes for DQ3
-                        if cartridge.is_dq3_detected() {
-                            static mut CHR_WRITE_BUS_COUNT: u32 = 0;
-                            unsafe {
-                                CHR_WRITE_BUS_COUNT += 1;
-                                if CHR_WRITE_BUS_COUNT <= 20 {
-                                    println!("DQ3 BUS CHR WRITE #{}: ${:04X} = ${:02X} via PPU $2007", 
-                                        CHR_WRITE_BUS_COUNT, chr_addr, chr_data);
-                                }
-                            }
-                        }
                     }
                 }
-                
-                // Let DQ3 handle PPU registers naturally - no debug monitoring
             },
-            0x4000..=0x4017 => {
-                // APU register write (simplified)
+            0x4000..=0x4013 | 0x4015 | 0x4017 => {
+                self.apu.write_register(addr, data);
+            },
+            0x4014 => {
+                // OAM DMA: Copy 256 bytes from CPU page to PPU OAM
+                let base = (data as u16) << 8;
+                let oam_addr = self.ppu.get_oam_addr();
+                for i in 0u16..256 {
+                    let src = base + i;
+                    let byte = match src {
+                        0x0000..=0x1FFF => self.memory.read(src),
+                        0x6000..=0x7FFF => {
+                            if let Some(ref cartridge) = self.cartridge {
+                                cartridge.read_prg_ram(src)
+                            } else {
+                                0
+                            }
+                        },
+                        0x8000..=0xFFFF => {
+                            if let Some(ref cartridge) = self.cartridge {
+                                cartridge.read_prg(src)
+                            } else {
+                                0
+                            }
+                        },
+                        _ => 0,
+                    };
+                    let oam_dst = oam_addr.wrapping_add(i as u8);
+                    self.ppu.write_oam_data(oam_dst, byte);
+                }
+                self.dma_in_progress = true;
+                self.dma_cycles = 513;
+            },
+            0x4016 => {
+                // Controller strobe
+                let new_strobe = (data & 0x01) != 0;
+                if self.strobe && !new_strobe {
+                    // Falling edge: latch controller state
+                    self.controller_state = self.controller as u16;
+                }
+                self.strobe = new_strobe;
             },
             0x4020..=0xFFFF => {
-                // Cartridge space - let cartridge handle it
                 if let Some(ref mut cartridge) = self.cartridge {
+                    match addr {
+                        0x6000..=0x7FFF => {
+                            cartridge.write_prg_ram(addr, data);
+                        },
+                        0x8000..=0xFFFF => {
+                            cartridge.write_prg(addr, data);
+                        },
+                        _ => {}
+                    }
                 }
             },
             _ => {
@@ -596,7 +559,12 @@ impl Bus {
     }
     
     pub fn get_ppu_state(&self) -> (u8, u8, u8, u8) {
-        (0, 0, 0, 0) // Simplified - return dummy values
+        (
+            self.ppu.get_control_bits(),
+            self.ppu.get_mask_bits(),
+            self.ppu.get_status_bits(),
+            self.ppu.get_oam_addr(),
+        )
     }
     
     pub fn get_ppu_palette(&self) -> [u8; 32] {
@@ -604,8 +572,11 @@ impl Bus {
     }
     
     pub fn get_ppu_nametables_flat(&self) -> Vec<u8> {
-        // Return dummy data for nametables
-        vec![0; 2048]
+        let nt = self.ppu.get_nametable();
+        let mut data = Vec::with_capacity(2048);
+        data.extend_from_slice(&nt[0]);
+        data.extend_from_slice(&nt[1]);
+        data
     }
     
     pub fn get_ppu_oam_flat(&self) -> Vec<u8> {
@@ -634,26 +605,59 @@ impl Bus {
     
     pub fn restore_state_flat(
         &mut self,
-        _palette: Vec<u8>,
-        _nametables: Vec<u8>,
-        _oam: Vec<u8>,
-        ram: Vec<u8>,
-        _prg_bank: u8,
-        _chr_bank: u8,
+        palette: impl AsRef<[u8]>,
+        nametables: impl AsRef<[u8]>,
+        oam: impl AsRef<[u8]>,
+        ram: impl AsRef<[u8]>,
+        prg_bank: u8,
+        chr_bank: u8,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let ram = ram.as_ref();
+        let palette = palette.as_ref();
+        let nametables = nametables.as_ref();
+        let oam = oam.as_ref();
+
+        // Restore RAM
         if ram.len() >= 0x800 {
             let mut ram_array = [0u8; 0x800];
+            ram_array.copy_from_slice(&ram[..0x800]);
+            self.memory.set_ram(ram_array);
         }
+
+        // Restore PPU palette
+        if palette.len() >= 32 {
+            let mut pal = [0u8; 32];
+            pal.copy_from_slice(&palette[..32]);
+            self.ppu.set_palette(pal);
+        }
+
+        // Restore PPU nametables
+        if nametables.len() >= 2048 {
+            let mut nt = [[0u8; 1024]; 2];
+            nt[0].copy_from_slice(&nametables[..1024]);
+            nt[1].copy_from_slice(&nametables[1024..2048]);
+            self.ppu.set_nametable(nt);
+        }
+
+        // Restore PPU OAM
+        if oam.len() >= 256 {
+            let mut oam_array = [0u8; 256];
+            oam_array.copy_from_slice(&oam[..256]);
+            self.ppu.set_oam(oam_array);
+        }
+
+        // Restore cartridge bank state
+        if let Some(ref mut cartridge) = self.cartridge {
+            cartridge.set_prg_bank(prg_bank);
+            cartridge.set_chr_bank(chr_bank);
+        }
+
         Ok(())
     }
     
     // NMI handler analysis methods
-    pub fn analyze_nmi_handler(&self, cpu_addr: u16) -> Option<String> {
-        if let Some(ref cartridge) = self.cartridge {
-            Some(cartridge.analyze_nmi_handler(cpu_addr))
-        } else {
-            None
-        }
+    pub fn analyze_nmi_handler(&self, _cpu_addr: u16) -> Option<String> {
+        None
     }
     
     pub fn read_cartridge_address(&self, addr: u16) -> u8 {
