@@ -462,7 +462,6 @@ impl CpuBus for Bus {
     }
 
     fn write(&mut self, addr: u16, data: u8) {
-        // Debug: Show basic write operations for DQ3
         // DQ3 write debug (reduced)
         
         // Track writes to $06F0 with PC information

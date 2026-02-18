@@ -97,10 +97,13 @@ impl Nes {
         }
 
         // Check for APU Frame IRQ
+        // Don't clear frame_irq here - let the game acknowledge it via $4015 read.
+        // On real hardware, the IRQ line stays asserted until acknowledged.
+        // cpu.irq() will be silently ignored if the I flag is set (normal behavior).
         if self.bus.apu_irq_pending() {
             self.cpu.irq(&mut self.bus);
-            self.bus.clear_apu_irq();
         }
+
 
         // APU runs at CPU clock rate
         for _ in 0..total_cycles {
