@@ -124,10 +124,6 @@ pub struct Ppu {
     oam: [u8; 256],
     
     buffer: Vec<u8>,
-    sprite_0_hit_line: i16, // Track which scanline sprite 0 hit occurred
-    scroll_change_line: i16, // Track scroll register changes for split-screen
-    stable_split_line: i16, // Stable split point to prevent flickering
-    frame_since_scroll_change: u16, // Frames since last mid-frame scroll change
     
     // PPU $2007 read buffer for CHR-ROM reads
     read_buffer: u8,
@@ -186,10 +182,6 @@ impl Ppu {
                 }
                 buf
             },
-            sprite_0_hit_line: -1,
-            scroll_change_line: -1,
-            stable_split_line: -1,
-            frame_since_scroll_change: 0,
             read_buffer: 0,
             nmi_suppressed: false,
             vblank_flag_set_this_frame: false,
