@@ -86,17 +86,30 @@ fn main() -> Result<(), String> {
     let desired_audio = AudioSpecDesired {
         freq: Some(44_100),
         channels: Some(1),
-        samples: Some(1024),
+        samples: Some(512),
     };
 
     let audio_ring: Arc<SpscRingBuffer> = Arc::new(SpscRingBuffer::new(8192));
     let audio_ring_clone = audio_ring.clone();
+
+    // Attach ring buffer so APU pushes samples directly as they are generated
+    nes.set_audio_ring(audio_ring.clone());
+
     let audio_device = audio_subsystem
         .open_playback(None, &desired_audio, |_spec| NesAudioCallback {
             ring: audio_ring_clone,
             phase: 0.0,
         })
         .map_err(|e| e.to_string())?;
+    // Pre-buffer a few frames of audio before starting playback
+    for _ in 0..3 {
+        let mut step_count = 0;
+        loop {
+            if nes.step() { break; }
+            step_count += 1;
+            if step_count > 50000 { break; }
+        }
+    }
     audio_device.resume();
 
     let mut event_pump = sdl.event_pump().map_err(|e| e.to_string())?;
@@ -155,12 +168,6 @@ fn main() -> Result<(), String> {
 
                     if code == Keycode::Tab {
                         cheat_ui.panel_visible = !cheat_ui.panel_visible;
-                        continue;
-                    }
-
-                    if code == Keycode::Escape {
-                        let _ = nes.save_sram();
-                        quit = true;
                         continue;
                     }
 
@@ -257,11 +264,7 @@ fn main() -> Result<(), String> {
             }
         }
 
-        // Feed audio into lock-free ring buffer
-        let audio_samples = nes.get_audio_buffer();
-        if !audio_samples.is_empty() {
-            audio_ring.push_slice(&audio_samples);
-        }
+        // (Audio samples are pushed directly by APU during emulation)
 
         // Upload game frame to GL texture
         let frame_buf = nes.get_frame_buffer();
@@ -338,13 +341,14 @@ fn main() -> Result<(), String> {
 
         window.gl_swap_window();
 
-        // Frame timing
+        // Frame timing — accumulate ideal frame boundaries to self-correct
+        // for sleep overshoots and prevent timing drift.
+        let target = last_frame + frame_duration;
         let now = Instant::now();
-        let elapsed = now.duration_since(last_frame);
-        if elapsed < frame_duration {
-            std::thread::sleep(frame_duration - elapsed);
+        if now < target {
+            std::thread::sleep(target - now);
         }
-        last_frame = Instant::now();
+        last_frame = target;
     }
 
     Ok(())

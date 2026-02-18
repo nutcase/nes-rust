@@ -118,8 +118,20 @@ impl Nes {
         self.bus.get_ppu_buffer()
     }
 
+    /// Attach a ring buffer so the APU pushes samples directly as they
+    /// are generated (no batching, no intermediate Vec).
+    pub fn set_audio_ring(&mut self, ring: std::sync::Arc<audio_ring::SpscRingBuffer>) {
+        self.bus.set_audio_ring(ring);
+    }
+
     pub fn get_audio_buffer(&mut self) -> Vec<f32> {
         self.bus.get_audio_buffer()
+    }
+
+    /// Push accumulated audio samples directly into the ring buffer,
+    /// avoiding intermediate Vec allocation.
+    pub fn drain_audio_to_ring(&mut self, ring: &audio_ring::SpscRingBuffer) {
+        self.bus.drain_audio_to_ring(ring);
     }
 
     pub fn set_controller(&mut self, controller: u8) {

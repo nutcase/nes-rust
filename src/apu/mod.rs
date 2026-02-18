@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 pub struct Apu {
     pulse1: PulseChannel,
     pulse2: PulseChannel,
@@ -19,7 +21,9 @@ pub struct Apu {
     noise_enabled: bool,
     dmc_enabled: bool,
 
-    // Audio output buffer
+    // Audio output — samples are pushed directly to ring buffer when available,
+    // or fall back to the Vec buffer.
+    audio_ring: Option<Arc<crate::audio_ring::SpscRingBuffer>>,
     output_buffer: Vec<f32>,
     sample_rate: f32,
     cpu_clock_rate: f32,
@@ -153,6 +157,7 @@ impl Apu {
             noise_enabled: false,
             dmc_enabled: false,
 
+            audio_ring: None,
             output_buffer: Vec::new(),
             sample_rate: 44100.0,
             cpu_clock_rate: 1789773.0,
@@ -225,7 +230,13 @@ impl Apu {
         if self.sample_counter >= self.cpu_clock_rate {
             self.sample_counter -= self.cpu_clock_rate;
             let sample = self.mix_output();
-            self.output_buffer.push(sample);
+            // Push directly to ring buffer for jitter-free delivery,
+            // fall back to Vec when no ring buffer is attached.
+            if let Some(ref ring) = self.audio_ring {
+                ring.push_one(sample);
+            } else {
+                self.output_buffer.push(sample);
+            }
         }
     }
 
@@ -297,9 +308,22 @@ impl Apu {
         (filtered * 1.8).clamp(-1.0, 1.0)
     }
 
+    /// Attach a ring buffer for direct sample delivery (bypasses output_buffer).
+    pub fn set_audio_ring(&mut self, ring: Arc<crate::audio_ring::SpscRingBuffer>) {
+        self.audio_ring = Some(ring);
+    }
+
     pub fn get_audio_buffer(&mut self) -> Vec<f32> {
-        // drain preserves Vec capacity, avoiding reallocation every frame
         self.output_buffer.drain(..).collect()
+    }
+
+    /// Push accumulated samples directly into the ring buffer, avoiding
+    /// an intermediate Vec allocation.
+    pub fn drain_to_ring(&mut self, ring: &crate::audio_ring::SpscRingBuffer) {
+        if !self.output_buffer.is_empty() {
+            ring.push_slice(&self.output_buffer);
+            self.output_buffer.clear();
+        }
     }
 
     pub fn frame_irq_pending(&self) -> bool {

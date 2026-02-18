@@ -41,6 +41,21 @@ impl SpscRingBuffer {
         tail.wrapping_sub(head) & self.mask
     }
 
+    /// Push a single sample. Returns `true` if written, `false` if full.
+    #[inline]
+    pub fn push_one(&self, sample: f32) -> bool {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let next = (tail + 1) & self.mask;
+        if next == self.head.load(Ordering::Acquire) {
+            return false;
+        }
+        unsafe {
+            *self.buffer[tail].get() = sample;
+        }
+        self.tail.store(next, Ordering::Release);
+        true
+    }
+
     /// Push samples into the buffer. Returns how many were actually written.
     /// If the buffer is full, remaining samples are silently dropped.
     pub fn push_slice(&self, samples: &[f32]) -> usize {

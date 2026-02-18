@@ -98,8 +98,16 @@ impl Bus {
         self.ppu.get_buffer()
     }
 
+    pub fn set_audio_ring(&mut self, ring: std::sync::Arc<crate::audio_ring::SpscRingBuffer>) {
+        self.apu.set_audio_ring(ring);
+    }
+
     pub fn get_audio_buffer(&mut self) -> Vec<f32> {
         self.apu.get_audio_buffer()
+    }
+
+    pub fn drain_audio_to_ring(&mut self, ring: &crate::audio_ring::SpscRingBuffer) {
+        self.apu.drain_to_ring(ring);
     }
 
     // Check if APU frame IRQ is pending

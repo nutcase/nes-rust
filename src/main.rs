@@ -121,12 +121,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up audio
     let desired_spec = sdl2::audio::AudioSpecDesired {
         freq: Some(44100),
-        channels: Some(1),   // mono
-        samples: Some(1024), // smaller buffer for lower latency
+        channels: Some(1),  // mono
+        samples: Some(512), // small buffer for low latency
     };
 
     let audio_ring: Arc<SpscRingBuffer> = Arc::new(SpscRingBuffer::new(8192));
     let audio_ring_clone = audio_ring.clone();
+
+    // Attach ring buffer so APU pushes samples directly as they are generated
+    nes.set_audio_ring(audio_ring.clone());
 
     let audio_device =
         audio_subsystem.open_playback(None, &desired_spec, |_spec| NesAudioCallback {
@@ -134,6 +137,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             phase: 0.0,
         })?;
 
+    // Pre-buffer a few frames of audio before starting playback to prevent
+    // initial underruns.
+    for _ in 0..3 {
+        let mut step_count = 0;
+        loop {
+            if nes.step() { break; }
+            step_count += 1;
+            if step_count > 50000 { break; }
+        }
+    }
     audio_device.resume();
 
     let mut event_pump = sdl_context.event_pump()?;
@@ -148,11 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Handle events
         for event in event_pump.poll_iter() {
             match event {
-                Event::Quit { .. }
-                | Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
-                    ..
-                } => {
+                Event::Quit { .. } => {
                     // Save SRAM before quitting
                     if let Err(e) = nes.save_sram() {
                         eprintln!("Failed to save SRAM: {}", e);
@@ -221,24 +230,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             buffer.copy_from_slice(frame_buffer);
         })?;
 
-        // Feed audio into lock-free ring buffer
-        let audio_samples = nes.get_audio_buffer();
-        if !audio_samples.is_empty() {
-            audio_ring.push_slice(&audio_samples);
-        }
+        // (Audio samples are pushed directly by APU during emulation)
 
         // Render the frame
         canvas.clear();
         canvas.copy(&texture, None, None)?;
         canvas.present();
 
-        // Frame timing
+        // Frame timing — accumulate ideal frame boundaries to self-correct
+        // for sleep overshoots and prevent timing drift.
+        let target = last_frame + frame_duration;
         let now = Instant::now();
-        let elapsed = now.duration_since(last_frame);
-        if elapsed < frame_duration {
-            std::thread::sleep(frame_duration - elapsed);
+        if now < target {
+            std::thread::sleep(target - now);
         }
-        last_frame = Instant::now();
+        last_frame = target;
     }
 
     // Save SRAM before exit
