@@ -138,14 +138,26 @@ impl Nes {
         self.bus.set_controller(controller);
     }
 
+    /// Derive a filesystem-safe ROM stem from the loaded ROM path.
+    fn rom_stem(&self) -> String {
+        self.current_rom_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    }
+
     pub fn save_state(
         &self,
         slot: u8,
-        rom_filename: &str,
+        _rom_filename: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (ppu_control, ppu_mask, ppu_status, ppu_oam_addr) = self.bus.get_ppu_state();
         let (ppu_v, ppu_t, ppu_x, ppu_w, ppu_scanline, ppu_cycle, ppu_frame, ppu_data_buffer) =
             self.bus.get_ppu_registers();
+
+        let rom_stem = self.rom_stem();
 
         let save_state = save_state::SaveState {
             cpu_a: self.cpu.a,
@@ -179,19 +191,24 @@ impl Nes {
             cartridge_state: self.bus.get_cartridge_state(),
             apu_frame_counter: 0,
             apu_frame_interrupt: false,
-            rom_filename: rom_filename.to_string(),
+            rom_filename: rom_stem.clone(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs(),
         };
 
-        let filename = format!("save_state_{}.sav", slot);
+        let dir = std::path::Path::new("states");
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let filename = format!("states/{}.slot{}.sav", rom_stem, slot);
         save_state.save_to_file(&filename)?;
         Ok(())
     }
 
     pub fn load_state(&mut self, slot: u8) -> Result<(), Box<dyn std::error::Error>> {
-        let filename = format!("save_state_{}.sav", slot);
+        let rom_stem = self.rom_stem();
+        let filename = format!("states/{}.slot{}.sav", rom_stem, slot);
         let save_state = save_state::SaveState::load_from_file(&filename)?;
 
         self.cpu.a = save_state.cpu_a;
