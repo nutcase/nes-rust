@@ -3,6 +3,7 @@ mod egui_ui;
 use egui_ui::gl_game::GlGameRenderer;
 use egui_ui::CheatToolUi;
 use nes_emulator::audio_ring::SpscRingBuffer;
+use nes_emulator::hud_toast::{draw_hud_toast_rgb24, show_hud_toast, HudToast};
 use nes_emulator::Nes;
 use sdl2::audio::{AudioCallback, AudioSpecDesired};
 use sdl2::event::Event;
@@ -105,9 +106,13 @@ fn main() -> Result<(), String> {
     {
         let mut step_count = 0;
         loop {
-            if nes.step() { break; }
+            if nes.step() {
+                break;
+            }
             step_count += 1;
-            if step_count > 50000 { break; }
+            if step_count > 50000 {
+                break;
+            }
         }
     }
     audio_device.resume();
@@ -122,6 +127,8 @@ fn main() -> Result<(), String> {
     let mut panel_width_px: u32 = PANEL_WIDTH_DEFAULT as u32;
 
     let cheat_path = cheat_file_path(&rom_path);
+    let mut hud_toast: Option<HudToast> = None;
+    let mut hud_overlay_frame: Vec<u8> = Vec::new();
 
     // NTSC NES frame rate: 5369318.18 Hz PPU / (341*262-0.5) = 60.0988 Hz
     // Using exact NTSC timing eliminates audio drift between APU production and SDL consumption.
@@ -182,11 +189,25 @@ fn main() -> Result<(), String> {
 
                     if let Some(slot) = state_slot_from_key(code) {
                         if ctrl {
-                            if let Err(e) = nes.save_state(slot, "current_rom") {
-                                eprintln!("Failed to save state slot {}: {}", slot, e);
+                            match nes.save_state(slot, "current_rom") {
+                                Ok(()) => {
+                                    show_hud_toast(&mut hud_toast, format!("SAVE {slot} OK"));
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to save state slot {}: {}", slot, e);
+                                    show_hud_toast(&mut hud_toast, format!("SAVE {slot} ERR"));
+                                }
                             }
-                        } else if let Err(e) = nes.load_state(slot) {
-                            eprintln!("Failed to load state slot {}: {}", slot, e);
+                        } else {
+                            match nes.load_state(slot) {
+                                Ok(()) => {
+                                    show_hud_toast(&mut hud_toast, format!("LOAD {slot} OK"));
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to load state slot {}: {}", slot, e);
+                                    show_hud_toast(&mut hud_toast, format!("LOAD {slot} ERR"));
+                                }
+                            }
                         }
                         continue;
                     }
@@ -277,7 +298,16 @@ fn main() -> Result<(), String> {
 
         // Upload game frame to GL texture
         let frame_buf = nes.get_frame_buffer();
-        game_renderer.upload_frame_rgb24(frame_buf, 256, 240);
+        if hud_toast.is_some() {
+            if hud_overlay_frame.len() != frame_buf.len() {
+                hud_overlay_frame.resize(frame_buf.len(), 0);
+            }
+            hud_overlay_frame.copy_from_slice(frame_buf);
+            draw_hud_toast_rgb24(&mut hud_overlay_frame, 256, 240, &mut hud_toast);
+            game_renderer.upload_frame_rgb24(&hud_overlay_frame, 256, 240);
+        } else {
+            game_renderer.upload_frame_rgb24(frame_buf, 256, 240);
+        }
 
         // Render
         let (win_w, win_h) = window.size();

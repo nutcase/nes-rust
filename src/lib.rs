@@ -4,6 +4,7 @@ pub mod bus;
 pub mod cartridge;
 pub mod cheat;
 pub mod cpu;
+pub mod hud_toast;
 pub mod memory;
 pub mod ppu;
 pub mod save_state;

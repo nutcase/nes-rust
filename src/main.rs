@@ -1,4 +1,5 @@
 use nes_emulator::audio_ring::SpscRingBuffer;
+use nes_emulator::hud_toast::{draw_hud_toast_rgb24, show_hud_toast, HudToast};
 use nes_emulator::Nes;
 use sdl2::audio::AudioCallback;
 use sdl2::event::Event;
@@ -141,9 +142,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut step_count = 0;
         loop {
-            if nes.step() { break; }
+            if nes.step() {
+                break;
+            }
             step_count += 1;
-            if step_count > 50000 { break; }
+            if step_count > 50000 {
+                break;
+            }
         }
     }
     audio_device.resume();
@@ -156,6 +161,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut _frame_count = 0;
     let _start_time = Instant::now();
     let mut frames_since_save = 0u32;
+    let mut hud_toast: Option<HudToast> = None;
+    let mut hud_overlay_frame: Vec<u8> = Vec::new();
 
     'running: loop {
         // Handle events
@@ -178,11 +185,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             sdl2::keyboard::Mod::LCTRLMOD | sdl2::keyboard::Mod::RCTRLMOD,
                         );
                         if ctrl {
-                            if let Err(e) = nes.save_state(slot, "current_rom") {
-                                eprintln!("Failed to save state slot {}: {}", slot, e);
+                            match nes.save_state(slot, "current_rom") {
+                                Ok(()) => {
+                                    show_hud_toast(&mut hud_toast, format!("SAVE {slot} OK"));
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to save state slot {}: {}", slot, e);
+                                    show_hud_toast(&mut hud_toast, format!("SAVE {slot} ERR"));
+                                }
                             }
-                        } else if let Err(e) = nes.load_state(slot) {
-                            eprintln!("Failed to load state slot {}: {}", slot, e);
+                        } else {
+                            match nes.load_state(slot) {
+                                Ok(()) => {
+                                    show_hud_toast(&mut hud_toast, format!("LOAD {slot} OK"));
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to load state slot {}: {}", slot, e);
+                                    show_hud_toast(&mut hud_toast, format!("LOAD {slot} ERR"));
+                                }
+                            }
                         }
                         continue;
                     }
@@ -227,7 +248,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Update texture with frame buffer
         texture.with_lock(None, |buffer: &mut [u8], _pitch: usize| {
             let frame_buffer = nes.get_frame_buffer();
-            buffer.copy_from_slice(frame_buffer);
+            if hud_toast.is_some() {
+                if hud_overlay_frame.len() != frame_buffer.len() {
+                    hud_overlay_frame.resize(frame_buffer.len(), 0);
+                }
+                hud_overlay_frame.copy_from_slice(frame_buffer);
+                draw_hud_toast_rgb24(&mut hud_overlay_frame, 256, 240, &mut hud_toast);
+                buffer.copy_from_slice(&hud_overlay_frame);
+            } else {
+                buffer.copy_from_slice(frame_buffer);
+            }
         })?;
 
         // Safety net: discard only on extreme drift (OS clock vs audio hardware clock).
