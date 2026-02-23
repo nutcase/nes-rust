@@ -222,6 +222,7 @@ impl From<SaveStateV1> for SaveState {
                 mmc2: None,
                 mmc3: None,
                 fme7: None,
+                bandai_fcg: None,
             }),
             apu_frame_counter: v1.apu_frame_counter,
             apu_frame_interrupt: v1.apu_frame_interrupt,

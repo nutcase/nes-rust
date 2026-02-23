@@ -281,6 +281,11 @@ impl Cartridge {
                 return true;
             }
         }
+        if let Some(ref bandai) = self.bandai_fcg {
+            if bandai.irq_pending.get() {
+                return true;
+            }
+        }
         false
     }
 
@@ -291,12 +296,20 @@ impl Cartridge {
         if let Some(ref fme7) = self.fme7 {
             fme7.irq_pending.set(false);
         }
+        if let Some(ref bandai) = self.bandai_fcg {
+            bandai.irq_pending.set(false);
+        }
     }
 
     pub fn clock_irq_counter_cycles(&mut self, cycles: u32) {
         if let Some(ref mut fme7) = self.fme7 {
             for _ in 0..cycles {
                 fme7.clock_irq_mut();
+            }
+        }
+        if let Some(ref mut bandai) = self.bandai_fcg {
+            for _ in 0..cycles {
+                bandai.clock_irq_mut();
             }
         }
     }
