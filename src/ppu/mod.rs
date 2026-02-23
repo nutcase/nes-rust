@@ -504,7 +504,13 @@ impl Ppu {
                 let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
 
                 if tile_addr < 0x2000 {
-                    let (low_byte, high_byte) = if tile_addr == self.cached_tile_addr {
+                    // CHR latch mappers (MMC2/MMC4) can return different data
+                    // for the same address depending on latch state, so the
+                    // tile cache must be bypassed.
+                    let mapper = cart.mapper_number();
+                    let (low_byte, high_byte) = if mapper != 9 && mapper != 10
+                        && tile_addr == self.cached_tile_addr
+                    {
                         (self.cached_tile_low, self.cached_tile_high)
                     } else {
                         let low = cart.read_chr(tile_addr);
