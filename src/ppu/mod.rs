@@ -297,6 +297,60 @@ impl Ppu {
                     self.status.remove(PpuStatus::SPRITE_OVERFLOW);
                 }
 
+                // Pre-render BG tile fetches (cycles 1-256).
+                // Real hardware fetches BG tiles during these cycles using
+                // the current v register (stale from VBlank $2006/$2007
+                // operations). For MMC2/MMC4, these CHR reads trigger latch
+                // updates that set the correct CHR bank before scanline 0.
+                if self.cycle >= 1 && self.cycle <= 256 && self.rendering_enabled {
+                    if let Some(cart) = cartridge {
+                        let m = cart.mapper_number();
+                        if m == 9 || m == 10 {
+                            // CHR pattern fetch at cycle 5 of each 8-cycle group
+                            if self.cycle % 8 == 5 {
+                                let fine_y = ((self.v >> 12) & 7) as u16;
+                                let coarse_y = ((self.v >> 5) & 0x1F) as usize;
+                                let coarse_x = (self.v & 0x1F) as usize;
+                                let logical_nt = ((self.v >> 10) & 3) as usize;
+                                let physical_nt =
+                                    self.resolve_nametable(logical_nt, cartridge);
+                                let nt_addr = coarse_y * 32 + coarse_x;
+                                if nt_addr < 1024 {
+                                    let tile_id =
+                                        self.nametable[physical_nt][nt_addr];
+                                    let pattern_table: u16 =
+                                        if self.control.contains(PpuControl::BG_PATTERN) {
+                                            0x1000
+                                        } else {
+                                            0x0000
+                                        };
+                                    let tile_addr = pattern_table
+                                        + (tile_id as u16 * 16)
+                                        + fine_y;
+                                    if tile_addr < 0x2000 {
+                                        cart.read_chr(tile_addr);
+                                        cart.read_chr(tile_addr + 8);
+                                    }
+                                }
+                            }
+                            // Increment coarse X at end of each 8-cycle group
+                            if self.cycle % 8 == 0 {
+                                self.increment_coarse_x();
+                            }
+                        }
+                    }
+                }
+
+                // MMC2/MMC4: 2 extra tile fetches for pipeline lookahead.
+                if self.cycle == 256 && self.rendering_enabled {
+                    if let Some(cart) = cartridge {
+                        let m = cart.mapper_number();
+                        if m == 9 || m == 10 {
+                            self.pipeline_extra_tile_reads(cartridge);
+                        }
+                    }
+                }
+
                 // Copy horizontal scroll bits from t to v at cycle 257
                 if self.cycle == 257 && self.rendering_enabled {
                     self.v = (self.v & !0x041F) | (self.t & 0x041F);
@@ -307,6 +361,19 @@ impl Ppu {
                     if self.rendering_enabled {
                         // Copy vertical scroll bits from t to v
                         self.v = (self.v & !0x7BE0) | (self.t & 0x7BE0);
+                    }
+                }
+
+                // BG tile prefetch (cycles 321-336 on real hardware).
+                // Reads the first two BG tiles of scanline 0, which triggers
+                // MMC2/MMC4 latch updates and resets the latch state after any
+                // VBlank $2007 reads that may have corrupted it.
+                if self.cycle == 321 && self.rendering_enabled {
+                    if let Some(cart) = cartridge {
+                        let m = cart.mapper_number();
+                        if m == 9 || m == 10 {
+                            self.prefetch_bg_tiles(cartridge);
+                        }
                     }
                 }
             }
@@ -321,9 +388,22 @@ impl Ppu {
                 if self.cycle >= 1 && self.cycle <= 256 {
                     self.render_pixel(cartridge);
 
-                    // Increment coarse X every 8 pixels
+                    // Increment coarse X every 8 pixels and invalidate tile
+                    // cache at tile boundaries so latch-based mappers
+                    // (MMC2/MMC4) always fetch fresh CHR for each tile.
                     if self.cycle & 7 == 0 {
+                        self.cached_tile_addr = 0xFFFF;
                         self.increment_coarse_x();
+                    }
+                }
+
+                // MMC2/MMC4: 2 extra tile fetches for pipeline lookahead.
+                if self.cycle == 256 && self.rendering_enabled {
+                    if let Some(cart) = cartridge {
+                        let m = cart.mapper_number();
+                        if m == 9 || m == 10 {
+                            self.pipeline_extra_tile_reads(cartridge);
+                        }
                     }
                 }
 
@@ -337,7 +417,17 @@ impl Ppu {
                     self.v = (self.v & !0x041F) | (self.t & 0x041F);
                 }
 
-                // Removed automatic force rendering to fix frame synchronization issues
+                // End-of-scanline BG tile prefetch (cycles 321-336).
+                // Fetches the first 2 BG tiles of the next scanline,
+                // triggering MMC2/MMC4 latch updates for the next line.
+                if self.cycle == 321 && self.rendering_enabled {
+                    if let Some(cart) = cartridge {
+                        let m = cart.mapper_number();
+                        if m == 9 || m == 10 {
+                            self.prefetch_bg_tiles(cartridge);
+                        }
+                    }
+                }
             }
             240 => {
                 // Post-render scanline - no sprite evaluation needed here anymore
@@ -504,12 +594,11 @@ impl Ppu {
                 let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
 
                 if tile_addr < 0x2000 {
-                    // CHR latch mappers (MMC2/MMC4) can return different data
-                    // for the same address depending on latch state, so the
-                    // tile cache must be bypassed.
-                    let mapper = cart.mapper_number();
-                    let (low_byte, high_byte) = if mapper != 9 && mapper != 10
-                        && tile_addr == self.cached_tile_addr
+                    // Tile cache: reuse CHR data within the same tile (same
+                    // tile_addr).  The cache is invalidated every 8 pixels at
+                    // tile boundaries so that MMC2/MMC4 latch changes between
+                    // tiles always trigger a fresh CHR read.
+                    let (low_byte, high_byte) = if tile_addr == self.cached_tile_addr
                     {
                         (self.cached_tile_low, self.cached_tile_high)
                     } else {
@@ -730,6 +819,93 @@ impl Ppu {
             }
         }
         None
+    }
+
+    /// Prefetch the first two BG tiles using the current v register.
+    /// Emulates cycles 321-336 of real hardware, where the PPU reads the
+    /// first two tiles of the next scanline.  For MMC2/MMC4, these CHR reads
+    /// trigger latch updates that reset the latch to the correct state.
+    fn prefetch_bg_tiles(&self, cartridge: Option<&crate::cartridge::Cartridge>) {
+        let cart = match cartridge {
+            Some(c) => c,
+            None => return,
+        };
+
+        let fine_y = ((self.v >> 12) & 7) as u16;
+        let coarse_y = ((self.v >> 5) & 0x1F) as usize;
+        let coarse_x = (self.v & 0x1F) as usize;
+        let logical_nt = ((self.v >> 10) & 3) as usize;
+
+        let pattern_table: u16 = if self.control.contains(PpuControl::BG_PATTERN) {
+            0x1000
+        } else {
+            0x0000
+        };
+
+        // First tile
+        let physical_nt = self.resolve_nametable(logical_nt, cartridge);
+        let nt_addr = coarse_y * 32 + coarse_x;
+        if nt_addr < 1024 {
+            let tile_id = self.nametable[physical_nt][nt_addr];
+            let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
+            if tile_addr < 0x2000 {
+                cart.read_chr(tile_addr);
+                cart.read_chr(tile_addr + 8);
+            }
+        }
+
+        // Second tile (coarse_x + 1, wrapping nametable)
+        let (next_cx, next_nt) = if coarse_x == 31 {
+            (0, logical_nt ^ 1)
+        } else {
+            (coarse_x + 1, logical_nt)
+        };
+        let next_physical = self.resolve_nametable(next_nt, cartridge);
+        let next_nt_addr = coarse_y * 32 + next_cx;
+        if next_nt_addr < 1024 {
+            let tile_id = self.nametable[next_physical][next_nt_addr];
+            let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
+            if tile_addr < 0x2000 {
+                cart.read_chr(tile_addr);
+                cart.read_chr(tile_addr + 8);
+            }
+        }
+    }
+
+    /// Perform 2 extra BG tile CHR reads at the current v position.
+    /// On real hardware, the PPU's tile fetch pipeline runs 2 tiles ahead
+    /// of display. At the end of each scanline's 32 tile fetches, 2 extra
+    /// tiles are fetched beyond the visible area. These CHR reads trigger
+    /// MMC2/MMC4 latch updates critical for correct CHR bank selection.
+    fn pipeline_extra_tile_reads(&mut self, cartridge: Option<&crate::cartridge::Cartridge>) {
+        let cart = match cartridge {
+            Some(c) => c,
+            None => return,
+        };
+
+        let fine_y = ((self.v >> 12) & 7) as u16;
+        let pattern_table: u16 = if self.control.contains(PpuControl::BG_PATTERN) {
+            0x1000
+        } else {
+            0x0000
+        };
+
+        for _ in 0..2 {
+            let coarse_y = ((self.v >> 5) & 0x1F) as usize;
+            let coarse_x = (self.v & 0x1F) as usize;
+            let logical_nt = ((self.v >> 10) & 3) as usize;
+            let physical_nt = self.resolve_nametable(logical_nt, cartridge);
+            let nt_addr = coarse_y * 32 + coarse_x;
+            if nt_addr < 1024 {
+                let tile_id = self.nametable[physical_nt][nt_addr];
+                let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
+                if tile_addr < 0x2000 {
+                    cart.read_chr(tile_addr);
+                    cart.read_chr(tile_addr + 8);
+                }
+            }
+            self.increment_coarse_x();
+        }
     }
 
     pub fn read_register(
