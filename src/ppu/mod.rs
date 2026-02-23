@@ -161,9 +161,6 @@ pub struct Ppu {
 
     frame: u64,
 
-    // Flag to preserve forced rendering from being overwritten (disabled for natural rendering)
-    force_rendered_frame: bool,
-
     #[cfg(test)]
     pub nametable: [[u8; 1024]; 2],
     #[cfg(not(test))]
@@ -241,7 +238,6 @@ impl Ppu {
             cycle: 0,
             scanline: -1,
             frame: 0,
-            force_rendered_frame: false,
 
             nametable: [[0; 1024]; 2],
             palette: [0x0F; 32], // Initialize with black (0x0F)
@@ -385,69 +381,10 @@ impl Ppu {
                 self.scanline = -1;
                 self.frame += 1;
                 self.frame_complete = true;
-
-                // Reset force rendering flag for next frame
-                self.force_rendered_frame = false;
             }
         }
 
         nmi
-    }
-
-    pub fn force_full_render(&mut self, cartridge: Option<&crate::cartridge::Cartridge>) {
-        if let Some(cart) = cartridge {
-            for tile_y in 0..30 {
-                for tile_x in 0..32 {
-                    let nametable_offset = tile_y * 32 + tile_x;
-                    let tile_index = self.nametable[0][nametable_offset];
-
-                    let pattern_table_base = if self.control.contains(PpuControl::BG_PATTERN) {
-                        0x1000
-                    } else {
-                        0x0000
-                    };
-                    let tile_addr = pattern_table_base + (tile_index as u16) * 16;
-
-                    let mut tile_data = [0u8; 16];
-                    for i in 0..16 {
-                        tile_data[i] = cart.read_chr(tile_addr + i as u16);
-                    }
-
-                    for pixel_y in 0..8 {
-                        let low_byte = tile_data[pixel_y];
-                        let high_byte = tile_data[pixel_y + 8];
-
-                        for pixel_x in 0..8 {
-                            let bit = 7 - pixel_x;
-                            let low_bit = (low_byte >> bit) & 1;
-                            let high_bit = (high_byte >> bit) & 1;
-                            let pixel_value = (high_bit << 1) | low_bit;
-
-                            let screen_x = tile_x * 8 + pixel_x;
-                            let screen_y = tile_y * 8 + pixel_y;
-
-                            if screen_x < 256 && screen_y < 240 {
-                                let buffer_index = (screen_y * 256 + screen_x) * 3;
-                                if buffer_index + 2 < self.buffer.len() {
-                                    let palette_index = if pixel_value == 0 {
-                                        self.palette[0]
-                                    } else {
-                                        self.palette[pixel_value as usize]
-                                    };
-                                    let color = PALETTE_COLORS[palette_index as usize];
-
-                                    self.buffer[buffer_index] = color.0;
-                                    self.buffer[buffer_index + 1] = color.1;
-                                    self.buffer[buffer_index + 2] = color.2;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        self.force_rendered_frame = true;
     }
 
     // rendering_enabled is now a cached field updated on $2001 write
@@ -1012,10 +949,6 @@ impl Ppu {
         None
     }
 
-    pub fn get_vram_write_addr(&self) -> u16 {
-        self.v
-    }
-
     pub fn get_buffer(&self) -> &[u8] {
         &self.buffer
     }
@@ -1065,18 +998,6 @@ impl Ppu {
 
     pub fn get_oam(&self) -> [u8; 256] {
         self.oam
-    }
-
-    pub fn get_current_vram_address(&self) -> u16 {
-        self.v
-    }
-
-    pub fn debug_get_control(&self) -> u8 {
-        self.control.bits()
-    }
-
-    pub fn debug_get_mask(&self) -> u8 {
-        self.mask.bits()
     }
 
     // Save state getters (registers)

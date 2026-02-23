@@ -16,7 +16,6 @@ pub struct Cartridge {
     has_battery: bool,
     chr_bank: u8,
     prg_bank: u8,
-    is_goonies: bool,
     mmc1: Option<Mmc1>,
     mmc2: Option<Mmc2>,
 }
@@ -106,10 +105,6 @@ impl Cartridge {
             vec![0; 8192]
         };
 
-        // Detect Goonies by ROM size and mapper
-        let is_goonies =
-            (mapper == 3 || mapper == 87) && prg_rom.len() == 32768 && chr_rom.len() == 16384;
-
         let mmc1 = if mapper == 1 { Some(Mmc1::new()) } else { None };
         let mmc2 = if mapper == 9 || mapper == 10 {
             Some(Mmc2::new())
@@ -141,7 +136,6 @@ impl Cartridge {
             has_battery,
             chr_bank: 0,
             prg_bank: 0,
-            is_goonies,
             mmc1,
             mmc2,
         };
@@ -227,24 +221,6 @@ impl Cartridge {
 
     pub fn mirroring(&self) -> Mirroring {
         self.mirroring
-    }
-
-    pub fn is_goonies(&self) -> bool {
-        self.is_goonies
-    }
-
-    pub fn goonies_check_ce7x_loop(&self, _pc: u16, _sp: u8, _cycles: u64) -> Option<(u16, u8)> {
-        if !self.is_goonies {
-            return None;
-        }
-        None
-    }
-
-    pub fn goonies_check_abnormal_brk(&self, _pc: u16, _sp: u8, _cycles: u64) -> Option<(u16, u8)> {
-        if !self.is_goonies {
-            return None;
-        }
-        None
     }
 
     pub fn chr_rom_size(&self) -> usize {
@@ -419,7 +395,6 @@ mod tests {
             has_battery: true,
             chr_bank: 0,
             prg_bank: 0,
-            is_goonies: false,
             mmc1: Some(Mmc1::new()),
             mmc2: None,
         }

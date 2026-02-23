@@ -3,7 +3,6 @@ use bitflags::bitflags;
 mod instructions;
 #[cfg(test)]
 mod tests;
-mod tick;
 
 bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -1141,32 +1140,4 @@ impl Cpu {
 pub trait CpuBus {
     fn read(&mut self, addr: u16) -> u8;
     fn write(&mut self, addr: u16, data: u8);
-
-    // Game-specific protection methods (with default implementations)
-    fn check_game_specific_cpu_protection(
-        &self,
-        _pc: u16,
-        _sp: u8,
-        _cycles: u64,
-    ) -> Option<(u16, u8)> {
-        None
-    }
-
-    fn check_game_specific_brk_protection(
-        &self,
-        _pc: u16,
-        _sp: u8,
-        _cycles: u64,
-    ) -> Option<(u16, u8)> {
-        None
-    }
-
-    fn is_goonies(&self) -> bool {
-        false
-    }
-}
-
-// New trait for tick-enabled bus operations
-pub trait CpuBusWithTick: CpuBus {
-    fn tick(&mut self, cycles: u8) -> bool; // Returns true if NMI triggered
 }

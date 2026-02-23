@@ -1,5 +1,7 @@
 use super::*;
 
+mod additional;
+
 #[cfg(test)]
 mod tests {
     use super::*;

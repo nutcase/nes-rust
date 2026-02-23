@@ -150,50 +150,9 @@ impl Bus {
             0
         }
     }
-
-    pub fn is_goonies(&self) -> bool {
-        if let Some(ref cartridge) = self.cartridge {
-            cartridge.is_goonies()
-        } else {
-            false
-        }
-    }
 }
 
 impl CpuBus for Bus {
-    fn check_game_specific_cpu_protection(
-        &self,
-        pc: u16,
-        sp: u8,
-        cycles: u64,
-    ) -> Option<(u16, u8)> {
-        if let Some(ref cartridge) = self.cartridge {
-            if let Some(_result) = cartridge.goonies_check_ce7x_loop(pc, sp, cycles) {}
-        }
-        None
-    }
-
-    fn check_game_specific_brk_protection(
-        &self,
-        pc: u16,
-        sp: u8,
-        cycles: u64,
-    ) -> Option<(u16, u8)> {
-        if let Some(ref cartridge) = self.cartridge {
-            cartridge.goonies_check_abnormal_brk(pc, sp, cycles)
-        } else {
-            None
-        }
-    }
-
-    fn is_goonies(&self) -> bool {
-        if let Some(ref cartridge) = self.cartridge {
-            cartridge.is_goonies()
-        } else {
-            false
-        }
-    }
-
     fn read(&mut self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x1FFF => self.memory.read(addr),

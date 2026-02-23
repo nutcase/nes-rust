@@ -95,9 +95,9 @@ mod additional_ppu_tests {
         ppu.mask.insert(PpuMask::SPRITE_ENABLE);
 
         // Place sprite 0 at specific position
-        ppu.oam[0] = 50;  // Y position
-        ppu.oam[1] = 0;   // Tile index
-        ppu.oam[2] = 0;   // Attributes
+        ppu.oam[0] = 50; // Y position
+        ppu.oam[1] = 0; // Tile index
+        ppu.oam[2] = 0; // Attributes
         ppu.oam[3] = 100; // X position
 
         // Sprite 0 hit only occurs during visible scanlines (0-239)

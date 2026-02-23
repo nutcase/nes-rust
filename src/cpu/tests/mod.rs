@@ -1,7 +1,7 @@
 use super::*;
 
-#[path = "addressing_tests.rs"]
-mod addressing_mode_tests;
+mod additional;
+mod addressing;
 
 struct TestBus {
     memory: [u8; 0x10000],
