@@ -106,6 +106,11 @@ impl Nes {
             self.cpu.irq(&mut self.bus);
         }
 
+        // Check for mapper IRQ (MMC3 scanline counter)
+        if self.bus.mapper_irq_pending() {
+            self.cpu.irq(&mut self.bus);
+        }
+
         // APU runs at CPU clock rate
         for _ in 0..total_cycles {
             self.bus.step_apu();

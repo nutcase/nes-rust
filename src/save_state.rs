@@ -220,6 +220,7 @@ impl From<SaveStateV1> for SaveState {
                 has_valid_save_data: cs.has_valid_save_data,
                 mmc1: cs.mmc1,
                 mmc2: None,
+                mmc3: None,
             }),
             apu_frame_counter: v1.apu_frame_counter,
             apu_frame_interrupt: v1.apu_frame_interrupt,

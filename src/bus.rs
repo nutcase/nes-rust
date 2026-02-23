@@ -37,7 +37,14 @@ impl Bus {
 
     #[inline]
     pub fn step_ppu(&mut self) -> bool {
-        self.ppu.step(self.cartridge.as_ref())
+        let nmi = self.ppu.step(self.cartridge.as_ref());
+        if self.ppu.mapper_irq_clock {
+            self.ppu.mapper_irq_clock = false;
+            if let Some(ref mut cartridge) = self.cartridge {
+                cartridge.clock_irq_counter();
+            }
+        }
+        nmi
     }
 
     // New tick method for fine-grained synchronization (similar to reference emulator)
@@ -118,6 +125,22 @@ impl Bus {
     // Clear APU frame IRQ
     pub fn clear_apu_irq(&mut self) {
         self.apu.clear_frame_irq();
+    }
+
+    pub fn mapper_irq_pending(&self) -> bool {
+        if let Some(ref cartridge) = self.cartridge {
+            if cartridge.irq_pending() {
+                cartridge.acknowledge_irq();
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn clock_mapper_irq(&mut self) {
+        if let Some(ref mut cartridge) = self.cartridge {
+            cartridge.clock_irq_counter();
+        }
     }
 
     pub fn get_dma_cycles(&mut self) -> u32 {

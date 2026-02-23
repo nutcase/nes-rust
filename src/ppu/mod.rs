@@ -218,6 +218,9 @@ pub struct Ppu {
     // Scanline-cached sprite control registers
     cached_sprite_size: u8,
     cached_sprite_pattern_table: u16,
+
+    // Set when the PPU wants the mapper IRQ counter clocked (MMC3 scanline counter)
+    pub mapper_irq_clock: bool,
 }
 
 impl Ppu {
@@ -272,6 +275,7 @@ impl Ppu {
             scanline_grayscale: false,
             cached_sprite_size: 8,
             cached_sprite_pattern_table: 0,
+            mapper_irq_clock: false,
         };
 
         ppu
@@ -415,6 +419,11 @@ impl Ppu {
                 // Copy horizontal scroll bits from t to v at cycle 257
                 if self.cycle == 257 && self.rendering_enabled {
                     self.v = (self.v & !0x041F) | (self.t & 0x041F);
+                }
+
+                // Clock mapper IRQ counter (MMC3) at cycle 260 during rendering
+                if self.cycle == 260 && self.rendering_enabled {
+                    self.mapper_irq_clock = true;
                 }
 
                 // End-of-scanline BG tile prefetch (cycles 321-336).
