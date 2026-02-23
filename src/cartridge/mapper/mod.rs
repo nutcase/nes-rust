@@ -1,3 +1,4 @@
+mod axrom;
 mod bandai_fcg;
 mod cnrom;
 mod fme7;

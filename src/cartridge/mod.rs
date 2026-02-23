@@ -202,6 +202,7 @@ impl Cartridge {
             1 => self.read_prg_mmc1(addr, rom_addr),
             2 => self.read_prg_uxrom(addr, rom_addr),
             4 => self.read_prg_mmc3(addr),
+            7 => self.read_prg_axrom(addr),
             9 | 10 => self.read_prg_mmc2(addr, rom_addr),
             16 => self.read_prg_bandai(addr),
             69 => self.read_prg_fme7(addr),
@@ -216,6 +217,7 @@ impl Cartridge {
             2 => self.write_prg_uxrom(addr, data),
             3 => self.write_prg_cnrom(addr, data),
             4 => self.write_prg_mmc3(addr, data),
+            7 => self.write_prg_axrom(addr, data),
             9 | 10 => self.write_prg_mmc2(addr, data),
             16 => self.write_prg_bandai(addr, data),
             69 => self.write_prg_fme7(addr, data),
@@ -229,7 +231,7 @@ impl Cartridge {
         match self.mapper {
             0 => self.read_chr_nrom(addr),
             1 => self.read_chr_mmc1(addr),
-            2 => self.read_chr_uxrom(addr),
+            2 | 7 => self.read_chr_uxrom(addr),
             3 | 87 => self.read_chr_cnrom(addr),
             4 => self.read_chr_mmc3(addr),
             9 | 10 => self.read_chr_mmc2(addr),
@@ -254,7 +256,7 @@ impl Cartridge {
         match self.mapper {
             0 => self.write_chr_nrom(addr, data),
             1 => self.write_chr_mmc1(addr, data),
-            2 => self.write_chr_uxrom(addr, data),
+            2 | 7 => self.write_chr_uxrom(addr, data),
             3 | 87 => self.write_chr_cnrom(addr, data),
             4 => self.write_chr_mmc3(addr, data),
             9 | 10 => self.write_chr_mmc2(addr, data),
