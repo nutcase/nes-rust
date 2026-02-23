@@ -59,61 +59,78 @@ impl Nes {
     }
 
     pub fn step(&mut self) -> bool {
-        let total_cycles: u32;
+        let cpu_cycles: u32;
 
         // If DMA is in progress, don't execute CPU instruction
         if self.bus.is_dma_in_progress() {
             let dma_completed = self.bus.step_dma();
-            total_cycles = 1;
+            cpu_cycles = 1;
             if dma_completed {
                 // DMA completed
             }
         } else {
             // Normal CPU execution
-            let cpu_cycles = self.cpu.step(&mut self.bus);
+            let cycles = self.cpu.step(&mut self.bus);
 
             // Safety check for zero cycles
-            if cpu_cycles == 0 {
+            if cycles == 0 {
                 return false;
             }
 
-            total_cycles = cpu_cycles as u32;
+            cpu_cycles = cycles as u32;
         }
 
+        // --- Run all components for CPU instruction cycles ---
         let mut nmi_triggered = false;
-        let mut _nmi_count = 0;
-        let ppu_cycles = total_cycles * 3;
-
-        // Process all PPU cycles
-        for _cycle in 0..ppu_cycles {
-            let nmi = self.bus.step_ppu();
-            if nmi {
+        for _cycle in 0..(cpu_cycles * 3) {
+            if self.bus.step_ppu() {
                 nmi_triggered = true;
-                _nmi_count += 1;
+            }
+        }
+        self.bus.clock_mapper_irq_cycles(cpu_cycles);
+        for _ in 0..cpu_cycles {
+            self.bus.step_apu();
+        }
+
+        // --- Handle NMI (7-cycle entry must advance all components) ---
+        if nmi_triggered {
+            let nmi_cycles = self.cpu.nmi(&mut self.bus) as u32;
+            for _ in 0..(nmi_cycles * 3) {
+                self.bus.step_ppu();
+            }
+            self.bus.clock_mapper_irq_cycles(nmi_cycles);
+            for _ in 0..nmi_cycles {
+                self.bus.step_apu();
             }
         }
 
-        // Only process one NMI per CPU instruction (prevent double NMI)
-        if nmi_triggered {
-            self.cpu.nmi(&mut self.bus);
-        }
-
-        // Check for APU Frame IRQ
-        // Don't clear frame_irq here - let the game acknowledge it via $4015 read.
-        // On real hardware, the IRQ line stays asserted until acknowledged.
-        // cpu.irq() will be silently ignored if the I flag is set (normal behavior).
+        // --- Handle APU Frame IRQ ---
+        // cpu.irq() is silently ignored if I flag is set (returns 0 cycles).
         if self.bus.apu_irq_pending() {
-            self.cpu.irq(&mut self.bus);
+            let irq_cycles = self.cpu.irq(&mut self.bus) as u32;
+            if irq_cycles > 0 {
+                for _ in 0..(irq_cycles * 3) {
+                    self.bus.step_ppu();
+                }
+                self.bus.clock_mapper_irq_cycles(irq_cycles);
+                for _ in 0..irq_cycles {
+                    self.bus.step_apu();
+                }
+            }
         }
 
-        // Check for mapper IRQ (MMC3 scanline counter)
+        // --- Handle mapper IRQ (MMC3 scanline counter, FME-7 cycle counter) ---
         if self.bus.mapper_irq_pending() {
-            self.cpu.irq(&mut self.bus);
-        }
-
-        // APU runs at CPU clock rate
-        for _ in 0..total_cycles {
-            self.bus.step_apu();
+            let irq_cycles = self.cpu.irq(&mut self.bus) as u32;
+            if irq_cycles > 0 {
+                for _ in 0..(irq_cycles * 3) {
+                    self.bus.step_ppu();
+                }
+                self.bus.clock_mapper_irq_cycles(irq_cycles);
+                for _ in 0..irq_cycles {
+                    self.bus.step_apu();
+                }
+            }
         }
 
         // Use PPU frame completion as the authoritative frame boundary

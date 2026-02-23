@@ -75,7 +75,7 @@ impl Cpu {
         cycles
     }
 
-    pub fn nmi(&mut self, bus: &mut dyn CpuBus) {
+    pub fn nmi(&mut self, bus: &mut dyn CpuBus) -> u8 {
         self.push(bus, (self.pc >> 8) as u8);
         self.push(bus, self.pc as u8);
         self.push(bus, self.status.bits() & !StatusFlags::BREAK.bits());
@@ -88,12 +88,13 @@ impl Cpu {
         self.pc = nmi_vector;
 
         self.cycles += 7;
+        7
     }
 
-    pub fn irq(&mut self, bus: &mut dyn CpuBus) {
+    pub fn irq(&mut self, bus: &mut dyn CpuBus) -> u8 {
         // IRQ is maskable - check interrupt disable flag
         if self.status.contains(StatusFlags::INTERRUPT_DISABLE) {
-            return;
+            return 0;
         }
 
         self.push(bus, (self.pc >> 8) as u8);
@@ -110,6 +111,7 @@ impl Cpu {
         self.pc = irq_vector;
 
         self.cycles += 7;
+        7
     }
 
     fn execute_instruction(&mut self, opcode: u8, bus: &mut dyn CpuBus) -> u8 {

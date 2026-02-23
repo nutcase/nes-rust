@@ -31,10 +31,23 @@ pub struct Apu {
     // Fractional sample accumulator
     sample_counter: f32,
 
+    // Oversampling anti-aliasing: accumulate raw mixer output every CPU cycle,
+    // then average when producing an output sample (~40x oversampling).
+    sample_accumulator: f32,
+    sample_accumulator_count: u32,
+
+    // Anti-aliasing pre-filters running at CPU rate (~1.79 MHz).
+    // Two cascaded first-order IIR low-pass at 18 kHz.
+    aa_filter1: LowPassFilter,
+    aa_filter2: LowPassFilter,
+
     // NES hardware audio filters (nesdev wiki)
     high_pass_90hz: HighPassFilter,  // AC coupling capacitor (~90 Hz)
     high_pass_440hz: HighPassFilter, // Amplifier feedback (~440 Hz)
     low_pass_14khz: LowPassFilter,   // Amplifier bandwidth (~14 kHz)
+
+    // Expansion audio (e.g. Sunsoft 5B) — set by bus each CPU cycle
+    expansion_audio: f32,
 }
 
 struct PulseChannel {
@@ -164,32 +177,36 @@ impl Apu {
 
             sample_counter: 0.0,
 
+            sample_accumulator: 0.0,
+            sample_accumulator_count: 0,
+
+            aa_filter1: LowPassFilter::new(1789773.0, 18000.0),
+            aa_filter2: LowPassFilter::new(1789773.0, 18000.0),
+
             high_pass_90hz: HighPassFilter::new(44100.0, 90.0),
             high_pass_440hz: HighPassFilter::new(44100.0, 440.0),
             low_pass_14khz: LowPassFilter::new(44100.0, 14000.0),
+
+            expansion_audio: 0.0,
         }
+    }
+
+    pub fn set_expansion_audio(&mut self, value: f32) {
+        self.expansion_audio = value;
     }
 
     pub fn step(&mut self) {
         self.cycle_count += 1;
         self.frame_counter += 1;
 
-        // Triangle: clocked every CPU cycle
-        if self.triangle_enabled {
-            self.triangle.step();
-        }
+        // Triangle: clocked every CPU cycle (timer always runs)
+        self.triangle.step();
 
-        // Pulse and Noise: clocked every 2 CPU cycles
+        // Pulse and Noise: clocked every 2 CPU cycles (timers always run)
         if self.cycle_count & 1 == 0 {
-            if self.pulse1_enabled {
-                self.pulse1.step();
-            }
-            if self.pulse2_enabled {
-                self.pulse2.step();
-            }
-            if self.noise_enabled {
-                self.noise.step();
-            }
+            self.pulse1.step();
+            self.pulse2.step();
+            self.noise.step();
         }
 
         // Frame sequencer with proper 4-step/5-step timing
@@ -225,11 +242,18 @@ impl Apu {
             }
         }
 
+        // Anti-aliasing: filter raw mixer output at CPU rate, then accumulate.
+        let raw = self.raw_mix() + self.expansion_audio;
+        let aa = self.aa_filter1.process(raw);
+        let aa = self.aa_filter2.process(aa);
+        self.sample_accumulator += aa;
+        self.sample_accumulator_count += 1;
+
         // Fractional sample accumulator for accurate 44100 Hz sampling
         self.sample_counter += self.sample_rate;
         if self.sample_counter >= self.cpu_clock_rate {
             self.sample_counter -= self.cpu_clock_rate;
-            let sample = self.mix_output();
+            let sample = self.produce_sample();
             // Push directly to ring buffer for jitter-free delivery,
             // fall back to Vec when no ring buffer is attached.
             if let Some(ref ring) = self.audio_ring {
@@ -259,7 +283,10 @@ impl Apu {
         self.noise.clock_length_counter();
     }
 
-    fn mix_output(&mut self) -> f32 {
+    /// Non-linear mixer (nesdev wiki) without filters. Called every CPU cycle
+    /// for oversampling accumulation.
+    #[inline]
+    fn raw_mix(&self) -> f32 {
         let pulse1_out = if self.pulse1_enabled && self.pulse1.length_counter > 0 {
             self.pulse1.output()
         } else {
@@ -297,10 +324,21 @@ impl Apu {
             0.0
         };
 
-        let mixed = pulse_out + tnd_out; // 0.0 to ~1.0 unsigned
+        pulse_out + tnd_out
+    }
+
+    /// Average accumulated raw mix, apply hardware filters, produce final sample.
+    fn produce_sample(&mut self) -> f32 {
+        let averaged = if self.sample_accumulator_count > 0 {
+            self.sample_accumulator / self.sample_accumulator_count as f32
+        } else {
+            0.0
+        };
+        self.sample_accumulator = 0.0;
+        self.sample_accumulator_count = 0;
 
         // Apply NES hardware filter chain (nesdev wiki)
-        let filtered = self.high_pass_90hz.process(mixed);
+        let filtered = self.high_pass_90hz.process(averaged);
         let filtered = self.high_pass_440hz.process(filtered);
         let filtered = self.low_pass_14khz.process(filtered);
 
@@ -373,25 +411,25 @@ impl Apu {
             0x4000 => self.pulse1.write_control(data),
             0x4001 => self.pulse1.write_sweep(data),
             0x4002 => self.pulse1.write_timer_low(data),
-            0x4003 => self.pulse1.write_timer_high(data),
+            0x4003 => self.pulse1.write_timer_high(data, self.pulse1_enabled),
 
             // Pulse 2
             0x4004 => self.pulse2.write_control(data),
             0x4005 => self.pulse2.write_sweep(data),
             0x4006 => self.pulse2.write_timer_low(data),
-            0x4007 => self.pulse2.write_timer_high(data),
+            0x4007 => self.pulse2.write_timer_high(data, self.pulse2_enabled),
 
             // Triangle
             0x4008 => self.triangle.write_control(data),
             0x4009 => {}
             0x400A => self.triangle.write_timer_low(data),
-            0x400B => self.triangle.write_timer_high(data),
+            0x400B => self.triangle.write_timer_high(data, self.triangle_enabled),
 
             // Noise
             0x400C => self.noise.write_control(data),
             0x400D => {}
             0x400E => self.noise.write_period(data),
-            0x400F => self.noise.write_length(data),
+            0x400F => self.noise.write_length(data, self.noise_enabled),
 
             // DMC (not implemented)
             0x4010..=0x4013 => {}
@@ -434,6 +472,7 @@ impl Apu {
             _ => {}
         }
     }
+
 }
 
 // Length counter lookup table
@@ -476,7 +515,8 @@ impl PulseChannel {
         self.length_enabled = (data & 0x20) == 0;
         self.envelope_disable = (data & 0x10) != 0;
         self.volume = data & 0x0F;
-        self.envelope_start = true;
+        // Note: writing to $4000/$4004 does NOT restart the envelope.
+        // Only writing to $4003/$4007 (4th register) sets envelope_start.
     }
 
     fn write_sweep(&mut self, data: u8) {
@@ -485,16 +525,17 @@ impl PulseChannel {
         self.sweep_negate = (data & 0x08) != 0;
         self.sweep_shift = data & 0x07;
         self.sweep_reload = true;
-        self.sweep_divider = 0;
     }
 
     fn write_timer_low(&mut self, data: u8) {
         self.timer_reload = (self.timer_reload & 0xFF00) | data as u16;
     }
 
-    fn write_timer_high(&mut self, data: u8) {
+    fn write_timer_high(&mut self, data: u8, enabled: bool) {
         self.timer_reload = (self.timer_reload & 0x00FF) | ((data as u16 & 0x07) << 8);
-        self.length_counter = LENGTH_TABLE[((data >> 3) & 0x1F) as usize];
+        if enabled {
+            self.length_counter = LENGTH_TABLE[((data >> 3) & 0x1F) as usize];
+        }
         self.timer = self.timer_reload;
         self.duty_counter = 0;
         self.envelope_start = true;
@@ -503,9 +544,7 @@ impl PulseChannel {
     fn step(&mut self) {
         if self.timer == 0 {
             self.timer = self.timer_reload;
-            if self.length_counter > 0 && self.timer_reload >= 8 {
-                self.duty_counter = (self.duty_counter + 1) % 8;
-            }
+            self.duty_counter = (self.duty_counter + 1) % 8;
         } else {
             self.timer -= 1;
         }
@@ -637,9 +676,11 @@ impl TriangleChannel {
         self.timer_reload = (self.timer_reload & 0xFF00) | data as u16;
     }
 
-    fn write_timer_high(&mut self, data: u8) {
+    fn write_timer_high(&mut self, data: u8, enabled: bool) {
         self.timer_reload = (self.timer_reload & 0x00FF) | ((data as u16 & 0x07) << 8);
-        self.length_counter = LENGTH_TABLE[((data >> 3) & 0x1F) as usize];
+        if enabled {
+            self.length_counter = LENGTH_TABLE[((data >> 3) & 0x1F) as usize];
+        }
         self.linear_reload_flag = true;
     }
 
@@ -707,7 +748,8 @@ impl NoiseChannel {
         self.length_enabled = (data & 0x20) == 0;
         self.envelope_disable = (data & 0x10) != 0;
         self.volume = data & 0x0F;
-        self.envelope_start = true;
+        // Note: writing to $400C does NOT restart the envelope.
+        // Only writing to $400F (4th register) sets envelope_start.
     }
 
     fn write_period(&mut self, data: u8) {
@@ -715,8 +757,10 @@ impl NoiseChannel {
         self.timer_reload = NOISE_PERIOD_TABLE[(data & 0x0F) as usize];
     }
 
-    fn write_length(&mut self, data: u8) {
-        self.length_counter = LENGTH_TABLE[((data >> 3) & 0x1F) as usize];
+    fn write_length(&mut self, data: u8, enabled: bool) {
+        if enabled {
+            self.length_counter = LENGTH_TABLE[((data >> 3) & 0x1F) as usize];
+        }
         self.envelope_start = true;
     }
 

@@ -1,6 +1,6 @@
 mod mapper;
 
-use mapper::{Mmc1, Mmc2, Mmc3};
+use mapper::{Fme7, Mmc1, Mmc2, Mmc3};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Result};
@@ -19,6 +19,7 @@ pub struct Cartridge {
     mmc1: Option<Mmc1>,
     mmc2: Option<Mmc2>,
     mmc3: Option<Mmc3>,
+    fme7: Option<Fme7>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -66,6 +67,20 @@ pub struct Mmc3State {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fme7State {
+    pub command: u8,
+    pub chr_banks: [u8; 8],
+    pub prg_banks: [u8; 3],
+    pub prg_bank_6000: u8,
+    pub prg_ram_enabled: bool,
+    pub prg_ram_select: bool,
+    pub irq_counter: u16,
+    pub irq_counter_enabled: bool,
+    pub irq_enabled: bool,
+    pub irq_pending: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CartridgeState {
     pub mapper: u8,
     pub mirroring: Mirroring,
@@ -78,6 +93,8 @@ pub struct CartridgeState {
     pub mmc2: Option<Mmc2State>,
     #[serde(default)]
     pub mmc3: Option<Mmc3State>,
+    #[serde(default)]
+    pub fme7: Option<Fme7State>,
 }
 
 impl Cartridge {
@@ -128,9 +145,10 @@ impl Cartridge {
             None
         };
         let mmc3 = if mapper == 4 { Some(Mmc3::new()) } else { None };
+        let fme7 = if mapper == 69 { Some(Fme7::new()) } else { None };
 
         // Initialize PRG-RAM for mappers that support it
-        let prg_ram = if mapper == 1 || mapper == 4 || mapper == 9 || mapper == 10 {
+        let prg_ram = if mapper == 1 || mapper == 4 || mapper == 9 || mapper == 10 || mapper == 69 {
             vec![0x00; 8192]
         } else {
             Vec::new()
@@ -156,6 +174,7 @@ impl Cartridge {
             mmc1,
             mmc2,
             mmc3,
+            fme7,
         };
 
         Ok(cartridge)
@@ -169,6 +188,7 @@ impl Cartridge {
             2 => self.read_prg_uxrom(addr, rom_addr),
             4 => self.read_prg_mmc3(addr),
             9 | 10 => self.read_prg_mmc2(addr, rom_addr),
+            69 => self.read_prg_fme7(addr),
             _ => 0,
         }
     }
@@ -181,6 +201,7 @@ impl Cartridge {
             3 => self.write_prg_cnrom(addr, data),
             4 => self.write_prg_mmc3(addr, data),
             9 | 10 => self.write_prg_mmc2(addr, data),
+            69 => self.write_prg_fme7(addr, data),
             87 => self.write_prg_mapper87(addr, data),
             _ => {}
         }
@@ -195,6 +216,7 @@ impl Cartridge {
             3 | 87 => self.read_chr_cnrom(addr),
             4 => self.read_chr_mmc3(addr),
             9 | 10 => self.read_chr_mmc2(addr),
+            69 => self.read_chr_fme7(addr),
             _ => {
                 let chr_addr = (addr & 0x1FFF) as usize;
                 if chr_addr < self.chr_rom.len() {
@@ -218,6 +240,7 @@ impl Cartridge {
             3 | 87 => self.write_chr_cnrom(addr, data),
             4 => self.write_chr_mmc3(addr, data),
             9 | 10 => self.write_chr_mmc2(addr, data),
+            69 => self.write_chr_fme7(addr, data),
             _ => {
                 self.chr_rom[(addr & 0x1FFF) as usize] = data;
             }
@@ -229,6 +252,7 @@ impl Cartridge {
             1 => self.read_prg_ram_mmc1(addr),
             4 => self.read_prg_ram_mmc3(addr),
             9 | 10 => self.read_prg_ram_mmc2(addr),
+            69 => self.read_prg_ram_fme7(addr),
             _ => 0,
         }
     }
@@ -239,6 +263,7 @@ impl Cartridge {
             1 => self.write_prg_ram_mmc1(addr, data),
             4 => self.write_prg_ram_mmc3(addr, data),
             9 | 10 => self.write_prg_ram_mmc2(addr, data),
+            69 => self.write_prg_ram_fme7(addr, data),
             _ => {}
         }
     }
@@ -360,6 +385,19 @@ impl Cartridge {
             prg_ram_write_protect: m.prg_ram_write_protect,
         });
 
+        let fme7 = self.fme7.as_ref().map(|f| Fme7State {
+            command: f.command,
+            chr_banks: f.chr_banks,
+            prg_banks: f.prg_banks,
+            prg_bank_6000: f.prg_bank_6000,
+            prg_ram_enabled: f.prg_ram_enabled,
+            prg_ram_select: f.prg_ram_select,
+            irq_counter: f.irq_counter,
+            irq_counter_enabled: f.irq_counter_enabled,
+            irq_enabled: f.irq_enabled,
+            irq_pending: f.irq_pending.get(),
+        });
+
         CartridgeState {
             mapper: self.mapper,
             mirroring: self.mirroring,
@@ -371,6 +409,7 @@ impl Cartridge {
             mmc1,
             mmc2,
             mmc3,
+            fme7,
         }
     }
 
@@ -425,6 +464,19 @@ impl Cartridge {
             mmc3.prg_ram_enabled = saved.prg_ram_enabled;
             mmc3.prg_ram_write_protect = saved.prg_ram_write_protect;
         }
+
+        if let (Some(ref mut fme7), Some(saved)) = (self.fme7.as_mut(), state.fme7.as_ref()) {
+            fme7.command = saved.command;
+            fme7.chr_banks = saved.chr_banks;
+            fme7.prg_banks = saved.prg_banks;
+            fme7.prg_bank_6000 = saved.prg_bank_6000;
+            fme7.prg_ram_enabled = saved.prg_ram_enabled;
+            fme7.prg_ram_select = saved.prg_ram_select;
+            fme7.irq_counter = saved.irq_counter;
+            fme7.irq_counter_enabled = saved.irq_counter_enabled;
+            fme7.irq_enabled = saved.irq_enabled;
+            fme7.irq_pending.set(saved.irq_pending);
+        }
     }
 }
 
@@ -447,6 +499,7 @@ mod tests {
             mmc1: Some(Mmc1::new()),
             mmc2: None,
             mmc3: None,
+            fme7: None,
         }
     }
 

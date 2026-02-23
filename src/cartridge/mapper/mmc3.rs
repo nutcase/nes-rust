@@ -272,15 +272,41 @@ impl Cartridge {
 
     pub fn irq_pending(&self) -> bool {
         if let Some(ref mmc3) = self.mmc3 {
-            mmc3.irq_pending.get()
-        } else {
-            false
+            if mmc3.irq_pending.get() {
+                return true;
+            }
         }
+        if let Some(ref fme7) = self.fme7 {
+            if fme7.irq_pending.get() {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn acknowledge_irq(&self) {
         if let Some(ref mmc3) = self.mmc3 {
             mmc3.irq_pending.set(false);
+        }
+        if let Some(ref fme7) = self.fme7 {
+            fme7.irq_pending.set(false);
+        }
+    }
+
+    pub fn clock_irq_counter_cycles(&mut self, cycles: u32) {
+        if let Some(ref mut fme7) = self.fme7 {
+            for _ in 0..cycles {
+                fme7.clock_irq_mut();
+            }
+        }
+    }
+
+    /// Clock Sunsoft 5B expansion audio one CPU cycle and return output sample.
+    pub fn clock_expansion_audio(&mut self) -> f32 {
+        if let Some(ref mut fme7) = self.fme7 {
+            fme7.audio.clock()
+        } else {
+            0.0
         }
     }
 }

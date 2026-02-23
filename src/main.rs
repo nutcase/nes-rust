@@ -123,10 +123,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let desired_spec = sdl2::audio::AudioSpecDesired {
         freq: Some(44100),
         channels: Some(1),  // mono
-        samples: Some(256), // small buffer for low latency
+        samples: Some(512), // moderate buffer for stability
     };
 
-    let audio_ring: Arc<SpscRingBuffer> = Arc::new(SpscRingBuffer::new(8192));
+    let audio_ring: Arc<SpscRingBuffer> = Arc::new(SpscRingBuffer::new(16384));
     let audio_ring_clone = audio_ring.clone();
 
     // Attach ring buffer so APU pushes samples directly as they are generated
@@ -138,15 +138,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             phase: 0.0,
         })?;
 
-    // Pre-buffer 1 frame of audio before starting playback (~735 samples)
+    // Pre-buffer 4 frames of audio before starting playback (~2940 samples)
+    // Provides ~67ms of cushion against timing jitter.
     {
+        let mut frames = 0;
         let mut step_count = 0;
-        loop {
+        while frames < 4 {
             if nes.step() {
-                break;
+                frames += 1;
             }
             step_count += 1;
-            if step_count > 50000 {
+            if step_count > 200000 {
                 break;
             }
         }
@@ -260,15 +262,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-        // Safety net: discard only on extreme drift (OS clock vs audio hardware clock).
-        // With NTSC-accurate frame timing, this should essentially never fire.
-        {
-            let buffered = audio_ring.len();
-            if buffered > 4096 {
-                audio_ring.discard(buffered - 2048);
-            }
-        }
-
         // Render the frame
         canvas.clear();
         canvas.copy(&texture, None, None)?;
@@ -333,9 +326,10 @@ impl AudioCallback for NesAudioCallback {
         if read > 0 {
             self.phase = out[read - 1];
         }
-        // Underrun: smooth decay for remaining samples
+        // Underrun: rapid decay to silence to minimize discontinuity artifacts.
+        // 0.9 factor: after 20 samples (~0.5ms) signal is < 12% amplitude.
         for sample in out[read..].iter_mut() {
-            self.phase *= 0.995;
+            self.phase *= 0.9;
             *sample = self.phase;
         }
     }

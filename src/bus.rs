@@ -62,8 +62,14 @@ impl Bus {
             }
         }
 
-        // Step APU at CPU rate
+        // Step APU at CPU rate (with expansion audio)
         for _ in 0..cycles {
+            let exp = if let Some(ref mut cartridge) = self.cartridge {
+                cartridge.clock_expansion_audio()
+            } else {
+                0.0
+            };
+            self.apu.set_expansion_audio(exp);
             self.apu.step();
         }
 
@@ -71,6 +77,12 @@ impl Bus {
     }
 
     pub fn step_apu(&mut self) {
+        let exp = if let Some(ref mut cartridge) = self.cartridge {
+            cartridge.clock_expansion_audio()
+        } else {
+            0.0
+        };
+        self.apu.set_expansion_audio(exp);
         self.apu.step();
     }
 
@@ -129,17 +141,21 @@ impl Bus {
 
     pub fn mapper_irq_pending(&self) -> bool {
         if let Some(ref cartridge) = self.cartridge {
-            if cartridge.irq_pending() {
-                cartridge.acknowledge_irq();
-                return true;
-            }
+            cartridge.irq_pending()
+        } else {
+            false
         }
-        false
     }
 
     pub fn clock_mapper_irq(&mut self) {
         if let Some(ref mut cartridge) = self.cartridge {
             cartridge.clock_irq_counter();
+        }
+    }
+
+    pub fn clock_mapper_irq_cycles(&mut self, cycles: u32) {
+        if let Some(ref mut cartridge) = self.cartridge {
+            cartridge.clock_irq_counter_cycles(cycles);
         }
     }
 
@@ -459,4 +475,5 @@ impl Bus {
     pub fn prg_ram_mut(&mut self) -> Option<&mut [u8]> {
         self.cartridge.as_mut().and_then(|c| c.prg_ram_mut())
     }
+
 }
