@@ -151,6 +151,10 @@ impl Nes {
         self.bus.get_audio_buffer()
     }
 
+    pub fn audio_diag_full(&self) -> apu::AudioDiagFull {
+        self.bus.audio_diag_full()
+    }
+
     /// Push accumulated audio samples directly into the ring buffer,
     /// avoiding intermediate Vec allocation.
     pub fn drain_audio_to_ring(&mut self, ring: &audio_ring::SpscRingBuffer) {

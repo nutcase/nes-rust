@@ -129,6 +129,10 @@ impl Bus {
         self.apu.drain_to_ring(ring);
     }
 
+    pub fn audio_diag_full(&self) -> crate::apu::AudioDiagFull {
+        self.apu.audio_diag_full()
+    }
+
     // Check if APU frame IRQ is pending
     pub fn apu_irq_pending(&self) -> bool {
         self.apu.frame_irq_pending()
@@ -475,5 +479,4 @@ impl Bus {
     pub fn prg_ram_mut(&mut self) -> Option<&mut [u8]> {
         self.cartridge.as_mut().and_then(|c| c.prg_ram_mut())
     }
-
 }

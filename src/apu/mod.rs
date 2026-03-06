@@ -1,5 +1,21 @@
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AudioDiagFull {
+    pub pulse1_enabled: bool,
+    pub pulse1_length: u8,
+    pub pulse2_enabled: bool,
+    pub pulse2_length: u8,
+    pub triangle_enabled: bool,
+    pub triangle_length: u8,
+    pub noise_enabled: bool,
+    pub noise_length: u8,
+    pub noise_vol: u8,
+    pub noise_period: u16,
+    pub noise_envelope_disable: bool,
+    pub expansion: f32,
+}
+
 pub struct Apu {
     pulse1: PulseChannel,
     pulse2: PulseChannel,
@@ -193,6 +209,27 @@ impl Apu {
 
     pub fn set_expansion_audio(&mut self, value: f32) {
         self.expansion_audio = value;
+    }
+
+    pub fn audio_diag_full(&self) -> AudioDiagFull {
+        AudioDiagFull {
+            pulse1_enabled: self.pulse1_enabled,
+            pulse1_length: self.pulse1.length_counter,
+            pulse2_enabled: self.pulse2_enabled,
+            pulse2_length: self.pulse2.length_counter,
+            triangle_enabled: self.triangle_enabled,
+            triangle_length: self.triangle.length_counter,
+            noise_enabled: self.noise_enabled,
+            noise_length: self.noise.length_counter,
+            noise_vol: if self.noise.envelope_disable {
+                self.noise.volume
+            } else {
+                self.noise.envelope_decay
+            },
+            noise_period: self.noise.timer_reload,
+            noise_envelope_disable: self.noise.envelope_disable,
+            expansion: self.expansion_audio,
+        }
     }
 
     pub fn step(&mut self) {
@@ -472,7 +509,6 @@ impl Apu {
             _ => {}
         }
     }
-
 }
 
 // Length counter lookup table
