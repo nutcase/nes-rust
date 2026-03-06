@@ -78,9 +78,7 @@ impl Cartridge {
                     };
                     (bank, (addr - 0xC000) as usize)
                 }
-                0xE000..=0xFFFF => {
-                    (last, (addr - 0xE000) as usize)
-                }
+                0xE000..=0xFFFF => (last, (addr - 0xE000) as usize),
                 _ => return 0,
             };
 
@@ -160,7 +158,8 @@ impl Cartridge {
             }
             let bank_mask = num_1k_banks - 1;
 
-            let (bank_1k, local_offset) = self.resolve_chr_bank_mmc3(addr, chr_a12_invert, bank_mask, mmc3);
+            let (bank_1k, local_offset) =
+                self.resolve_chr_bank_mmc3(addr, chr_a12_invert, bank_mask, mmc3);
 
             let chr_addr = bank_1k * 0x0400 + local_offset;
             if !self.chr_ram.is_empty() {
@@ -189,7 +188,8 @@ impl Cartridge {
                 }
                 let bank_mask = num_1k_banks - 1;
 
-                let (bank_1k, local_offset) = self.resolve_chr_bank_mmc3(addr, chr_a12_invert, bank_mask, mmc3);
+                let (bank_1k, local_offset) =
+                    self.resolve_chr_bank_mmc3(addr, chr_a12_invert, bank_mask, mmc3);
 
                 let chr_addr = bank_1k * 0x0400 + local_offset;
                 if chr_addr < self.chr_ram.len() {
@@ -217,9 +217,9 @@ impl Cartridge {
         };
 
         let bank_1k = match adjusted_slot {
-            0 => (mmc3.bank_registers[0] as usize & !1) & bank_mask,       // R0 low
+            0 => (mmc3.bank_registers[0] as usize & !1) & bank_mask, // R0 low
             1 => ((mmc3.bank_registers[0] as usize & !1) | 1) & bank_mask, // R0 high
-            2 => (mmc3.bank_registers[1] as usize & !1) & bank_mask,       // R1 low
+            2 => (mmc3.bank_registers[1] as usize & !1) & bank_mask, // R1 low
             3 => ((mmc3.bank_registers[1] as usize & !1) | 1) & bank_mask, // R1 high
             4 => (mmc3.bank_registers[2] as usize) & bank_mask,
             5 => (mmc3.bank_registers[3] as usize) & bank_mask,

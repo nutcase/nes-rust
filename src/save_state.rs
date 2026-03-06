@@ -384,15 +384,17 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&path, &encoded).expect("write v1 save");
-        let decoded = SaveState::load_from_file(path.to_str().expect("utf-8 path"))
-            .expect("load v1 save");
+        let decoded =
+            SaveState::load_from_file(path.to_str().expect("utf-8 path")).expect("load v1 save");
         let _ = std::fs::remove_file(path);
 
         assert_eq!(decoded.cpu_a, 0x10);
         assert_eq!(decoded.apu_frame_counter, 2);
         assert_eq!(decoded.rom_filename, "v1_test");
 
-        let cs = decoded.cartridge_state.expect("cartridge_state should exist");
+        let cs = decoded
+            .cartridge_state
+            .expect("cartridge_state should exist");
         assert_eq!(cs.mapper, 1);
         assert_eq!(cs.prg_bank, 3);
         assert!(cs.mmc1.is_some());

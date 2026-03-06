@@ -21,8 +21,8 @@ impl Mmc2 {
             chr_bank_0_fe: 0,
             chr_bank_1_fd: 0,
             chr_bank_1_fe: 0,
-            latch_0: Cell::new(true),  // FE selected initially
-            latch_1: Cell::new(true),  // FE selected initially
+            latch_0: Cell::new(true), // FE selected initially
+            latch_1: Cell::new(true), // FE selected initially
         }
     }
 }

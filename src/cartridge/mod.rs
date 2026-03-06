@@ -158,11 +158,25 @@ impl Cartridge {
             None
         };
         let mmc3 = if mapper == 4 { Some(Mmc3::new()) } else { None };
-        let fme7 = if mapper == 69 { Some(Fme7::new()) } else { None };
-        let bandai_fcg = if mapper == 16 { Some(BandaiFcg::new()) } else { None };
+        let fme7 = if mapper == 69 {
+            Some(Fme7::new())
+        } else {
+            None
+        };
+        let bandai_fcg = if mapper == 16 {
+            Some(BandaiFcg::new())
+        } else {
+            None
+        };
 
         // Initialize PRG-RAM for mappers that support it
-        let prg_ram = if mapper == 1 || mapper == 4 || mapper == 9 || mapper == 10 || mapper == 16 || mapper == 69 {
+        let prg_ram = if mapper == 1
+            || mapper == 4
+            || mapper == 9
+            || mapper == 10
+            || mapper == 16
+            || mapper == 69
+        {
             vec![0x00; 8192]
         } else {
             Vec::new()
@@ -511,7 +525,9 @@ impl Cartridge {
             fme7.irq_pending.set(saved.irq_pending);
         }
 
-        if let (Some(ref mut bandai), Some(saved)) = (self.bandai_fcg.as_mut(), state.bandai_fcg.as_ref()) {
+        if let (Some(ref mut bandai), Some(saved)) =
+            (self.bandai_fcg.as_mut(), state.bandai_fcg.as_ref())
+        {
             bandai.chr_banks = saved.chr_banks;
             bandai.prg_bank = saved.prg_bank;
             bandai.irq_counter = saved.irq_counter;

@@ -316,21 +316,17 @@ impl Ppu {
                                 let coarse_y = ((self.v >> 5) & 0x1F) as usize;
                                 let coarse_x = (self.v & 0x1F) as usize;
                                 let logical_nt = ((self.v >> 10) & 3) as usize;
-                                let physical_nt =
-                                    self.resolve_nametable(logical_nt, cartridge);
+                                let physical_nt = self.resolve_nametable(logical_nt, cartridge);
                                 let nt_addr = coarse_y * 32 + coarse_x;
                                 if nt_addr < 1024 {
-                                    let tile_id =
-                                        self.nametable[physical_nt][nt_addr];
+                                    let tile_id = self.nametable[physical_nt][nt_addr];
                                     let pattern_table: u16 =
                                         if self.control.contains(PpuControl::BG_PATTERN) {
                                             0x1000
                                         } else {
                                             0x0000
                                         };
-                                    let tile_addr = pattern_table
-                                        + (tile_id as u16 * 16)
-                                        + fine_y;
+                                    let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
                                     if tile_addr < 0x2000 {
                                         cart.read_chr(tile_addr);
                                         cart.read_chr(tile_addr + 8);
@@ -607,8 +603,7 @@ impl Ppu {
                     // tile_addr).  The cache is invalidated every 8 pixels at
                     // tile boundaries so that MMC2/MMC4 latch changes between
                     // tiles always trigger a fresh CHR read.
-                    let (low_byte, high_byte) = if tile_addr == self.cached_tile_addr
-                    {
+                    let (low_byte, high_byte) = if tile_addr == self.cached_tile_addr {
                         (self.cached_tile_low, self.cached_tile_high)
                     } else {
                         let low = cart.read_chr(tile_addr);
@@ -700,8 +695,16 @@ impl Ppu {
         self.scanline_grayscale = self.mask.contains(PpuMask::GRAYSCALE);
 
         // Cache sprite control registers
-        self.cached_sprite_size = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
-        self.cached_sprite_pattern_table = if self.control.contains(PpuControl::SPRITE_PATTERN) { 0x1000 } else { 0x0000 };
+        self.cached_sprite_size = if self.control.contains(PpuControl::SPRITE_SIZE) {
+            16
+        } else {
+            8
+        };
+        self.cached_sprite_pattern_table = if self.control.contains(PpuControl::SPRITE_PATTERN) {
+            0x1000
+        } else {
+            0x0000
+        };
 
         // Cache nametable mirroring map
         if let Some(cart) = _cartridge {
@@ -1263,8 +1266,16 @@ impl Ppu {
         self.scanline_bg_left = self.mask.contains(PpuMask::BG_LEFT_ENABLE);
         self.scanline_sprite_left = self.mask.contains(PpuMask::SPRITE_LEFT_ENABLE);
         self.scanline_grayscale = self.mask.contains(PpuMask::GRAYSCALE);
-        self.cached_sprite_size = if self.control.contains(PpuControl::SPRITE_SIZE) { 16 } else { 8 };
-        self.cached_sprite_pattern_table = if self.control.contains(PpuControl::SPRITE_PATTERN) { 0x1000 } else { 0x0000 };
+        self.cached_sprite_size = if self.control.contains(PpuControl::SPRITE_SIZE) {
+            16
+        } else {
+            8
+        };
+        self.cached_sprite_pattern_table = if self.control.contains(PpuControl::SPRITE_PATTERN) {
+            0x1000
+        } else {
+            0x0000
+        };
     }
 
     pub fn write_oam_data(&mut self, addr: u8, data: u8) {

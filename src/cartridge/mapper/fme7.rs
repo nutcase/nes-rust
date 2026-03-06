@@ -6,9 +6,8 @@ use super::super::{Cartridge, Mirroring};
 /// Pre-scaled for NES mixing: ~0.12 max per channel, 3 channels total ~0.36.
 /// Logarithmic curve (~3 dB per step) matching the hardware DAC.
 const AY_VOLUME: [f32; 16] = [
-    0.0,
-    0.00095, 0.00134, 0.00190, 0.00268, 0.00379, 0.00535, 0.00755,
-    0.01067, 0.01506, 0.02128, 0.03006, 0.04247, 0.05999, 0.08474, 0.11973,
+    0.0, 0.00095, 0.00134, 0.00190, 0.00268, 0.00379, 0.00535, 0.00755, 0.01067, 0.01506, 0.02128,
+    0.03006, 0.04247, 0.05999, 0.08474, 0.11973,
 ];
 
 /// Sunsoft 5B expansion audio (YM2149F / AY-3-8910 compatible).
@@ -18,14 +17,14 @@ pub(in crate::cartridge) struct Sunsoft5BAudio {
     register_select: u8,
 
     // Tone generators (3 channels)
-    tone_period: [u16; 3],   // 12-bit period
+    tone_period: [u16; 3], // 12-bit period
     tone_counter: [u16; 3],
-    tone_output: [bool; 3],  // Current square wave state
+    tone_output: [bool; 3], // Current square wave state
 
     // Noise generator
-    noise_period: u8,        // 5-bit period
+    noise_period: u8, // 5-bit period
     noise_counter: u8,
-    noise_lfsr: u32,         // 17-bit LFSR
+    noise_lfsr: u32, // 17-bit LFSR
     noise_output: bool,
 
     // Mixer (register 7): bits 0-2 = tone disable A/B/C, bits 3-5 = noise disable A/B/C
@@ -38,9 +37,9 @@ pub(in crate::cartridge) struct Sunsoft5BAudio {
     envelope_period: u16,
     envelope_counter: u16,
     envelope_shape: u8,
-    envelope_volume: u8,     // 0-15
+    envelope_volume: u8, // 0-15
     envelope_holding: bool,
-    envelope_up: bool,       // true = attack (counting up)
+    envelope_up: bool, // true = attack (counting up)
 
     // CPU clock prescaler (divides by 16)
     prescaler: u8,
@@ -198,8 +197,8 @@ impl Sunsoft5BAudio {
             let noise_disable = (self.mixer >> (ch + 3)) & 1 != 0;
 
             // Channel gate: (tone OR tone_disabled) AND (noise OR noise_disabled)
-            let gate = (self.tone_output[ch] || tone_disable)
-                && (self.noise_output || noise_disable);
+            let gate =
+                (self.tone_output[ch] || tone_disable) && (self.noise_output || noise_disable);
 
             if gate {
                 let vol_reg = self.volume[ch];
