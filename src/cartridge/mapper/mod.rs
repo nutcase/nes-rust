@@ -6,6 +6,7 @@ mod cnrom;
 mod color_dreams;
 mod fme7;
 mod gxrom;
+mod jaleco_jf;
 mod mmc1;
 mod mmc2;
 mod mmc3;

@@ -230,11 +230,11 @@ impl Cartridge {
         match self.mapper {
             0 | 3 | 87 => self.read_prg_nrom(rom_addr),
             1 => self.read_prg_mmc1(addr, rom_addr),
-            2 => self.read_prg_uxrom(addr, rom_addr),
+            2 | 70 | 71 | 152 => self.read_prg_uxrom(addr, rom_addr),
             34 => self.read_prg_axrom(addr),
+            180 => self.read_prg_uxrom_inverted(addr, rom_addr),
             4 => self.read_prg_mmc3(addr),
             7 | 11 | 66 => self.read_prg_axrom(addr),
-            71 => self.read_prg_uxrom(addr, rom_addr),
             9 | 10 => self.read_prg_mmc2(addr, rom_addr),
             16 => self.read_prg_bandai(addr),
             69 => self.read_prg_fme7(addr),
@@ -253,7 +253,10 @@ impl Cartridge {
             4 => self.write_prg_mmc3(addr, data),
             7 => self.write_prg_axrom(addr, data),
             11 => self.write_prg_color_dreams(addr, data),
+            70 => self.write_prg_mapper70(addr, data),
             71 => self.write_prg_camerica(addr, data),
+            152 => self.write_prg_mapper152(addr, data),
+            180 => self.write_prg_uxrom_inverted(addr, data),
             9 | 10 => self.write_prg_mmc2(addr, data),
             16 => self.write_prg_bandai(addr, data),
             66 => self.write_prg_gxrom(addr, data),
@@ -268,10 +271,10 @@ impl Cartridge {
         match self.mapper {
             0 => self.read_chr_nrom(addr),
             1 => self.read_chr_mmc1(addr),
-            2 | 7 | 71 => self.read_chr_uxrom(addr),
+            2 | 7 | 71 | 180 => self.read_chr_uxrom(addr),
             34 if self.mapper34_nina001 => self.read_chr_nina001(addr),
             34 => self.read_chr_nrom(addr),
-            3 | 11 | 66 | 87 => self.read_chr_cnrom(addr),
+            3 | 11 | 66 | 70 | 152 | 87 => self.read_chr_cnrom(addr),
             4 => self.read_chr_mmc3(addr),
             9 | 10 => self.read_chr_mmc2(addr),
             16 => self.read_chr_bandai(addr),
@@ -295,10 +298,10 @@ impl Cartridge {
         match self.mapper {
             0 => self.write_chr_nrom(addr, data),
             1 => self.write_chr_mmc1(addr, data),
-            2 | 7 | 71 => self.write_chr_uxrom(addr, data),
+            2 | 7 | 71 | 180 => self.write_chr_uxrom(addr, data),
             34 if self.mapper34_nina001 => self.write_chr_nina001(addr, data),
             34 => self.write_chr_nrom(addr, data),
-            3 | 11 | 66 | 87 => self.write_chr_cnrom(addr, data),
+            3 | 11 | 66 | 70 | 152 | 87 => self.write_chr_cnrom(addr, data),
             4 => self.write_chr_mmc3(addr, data),
             9 | 10 => self.write_chr_mmc2(addr, data),
             16 => self.write_chr_bandai(addr, data),
@@ -675,6 +678,38 @@ mod tests {
         }
     }
 
+    fn make_uxrom_like_cart(mapper: u8, prg_banks_16k: usize, chr_banks_8k: usize) -> Cartridge {
+        let mut prg_rom = vec![0; prg_banks_16k * 0x4000];
+        for bank in 0..prg_banks_16k {
+            prg_rom[bank * 0x4000..(bank + 1) * 0x4000].fill(bank as u8);
+        }
+
+        let mut chr_rom = vec![0; chr_banks_8k * 0x2000];
+        for bank in 0..chr_banks_8k {
+            chr_rom[bank * 0x2000..(bank + 1) * 0x2000].fill(0x70 | bank as u8);
+        }
+
+        Cartridge {
+            prg_rom,
+            chr_rom,
+            chr_ram: vec![],
+            prg_ram: vec![],
+            has_valid_save_data: false,
+            mapper,
+            mirroring: Mirroring::Horizontal,
+            has_battery: false,
+            chr_bank: 0,
+            chr_bank_1: 1,
+            prg_bank: 0,
+            mapper34_nina001: false,
+            mmc1: None,
+            mmc2: None,
+            mmc3: None,
+            fme7: None,
+            bandai_fcg: None,
+        }
+    }
+
     fn make_nina001_cart() -> Cartridge {
         let mut prg_rom = vec![0; 4 * 0x8000];
         for bank in 0..4 {
@@ -839,5 +874,44 @@ mod tests {
         assert_eq!(cart.read_prg(0xBFFF), 3);
         assert_eq!(cart.read_prg(0xC000), 7);
         assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
+    }
+
+    #[test]
+    fn mapper_70_switches_prg_and_chr_banks() {
+        let mut cart = make_uxrom_like_cart(70, 8, 16);
+        cart.prg_rom[0] = 0xFF;
+
+        cart.write_prg(0x8000, 0x21);
+
+        assert_eq!(cart.read_prg(0x8000), 2);
+        assert_eq!(cart.read_prg(0xC000), 7);
+        assert_eq!(cart.read_chr(0x0000), 0x71);
+        assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+    }
+
+    #[test]
+    fn mapper_152_switches_prg_chr_and_mirroring() {
+        let mut cart = make_uxrom_like_cart(152, 8, 16);
+        cart.prg_rom[0] = 0xFF;
+
+        cart.write_prg(0x8000, 0xB2);
+
+        assert_eq!(cart.read_prg(0x8000), 3);
+        assert_eq!(cart.read_prg(0xC000), 7);
+        assert_eq!(cart.read_chr(0x0000), 0x72);
+        assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
+    }
+
+    #[test]
+    fn mapper_180_switches_upper_prg_bank_only() {
+        let mut cart = make_uxrom_like_cart(180, 8, 1);
+        cart.prg_rom[1] = 0xFF;
+
+        cart.write_prg(0xC001, 0x03);
+
+        assert_eq!(cart.read_prg(0x8000), 0);
+        assert_eq!(cart.read_prg(0xBFFF), 0);
+        assert_eq!(cart.read_prg(0xC000), 3);
+        assert_eq!(cart.read_prg(0xFFFF), 3);
     }
 }

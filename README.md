@@ -6,7 +6,7 @@ A cycle-accurate NES (Nintendo Entertainment System / Famicom) emulator written 
 
 - Cycle-accurate CPU (6502) and PPU emulation
 - Audio support with pulse, triangle, noise, and DMC channels
-- Multiple mapper support (0, 1, 2, 3, 4, 7, 9, 10, 11, 16, 34, 66, 69, 71, 87)
+- Multiple mapper support (0, 1, 2, 3, 4, 7, 9, 10, 11, 16, 34, 66, 69, 70, 71, 87, 152, 180)
 - Save states (4 slots)
 - Battery-backed SRAM persistence
 - SDL2-based graphics and audio
@@ -93,8 +93,11 @@ Cheats are saved/loaded as JSON in the `cheats/` directory.
 | 34 | BNROM / NINA-001 | Deadly Towers, Impossible Mission II |
 | 66 | GxROM/MHROM | Dragon Spirit, Bart vs. the Space Mutants |
 | 69 | Sunsoft FME-7 | Batman: Return of the Joker, Gimmick! |
+| 70 | Jaleco JF-11/JF-14 | City Connection, Rod Land |
 | 71 | Camerica / BF9093 | Fire Hawk, Micro Machines |
 | 87 | - | Variant of Mapper 3 |
+| 152 | Jaleco JF-17/JF-19 | Moero!! Pro Soccer, Goal! Two |
+| 180 | UNROM-180 | Crazy Climber |
 
 ## Architecture
 
