@@ -58,6 +58,26 @@ impl Nes {
         Ok(())
     }
 
+    fn run_cpu_time(&mut self, cycles: u32) -> bool {
+        let mut nmi_triggered = false;
+        let mut pending_cycles = cycles;
+
+        while pending_cycles > 0 {
+            for _ in 0..(pending_cycles * 3) {
+                if self.bus.step_ppu() {
+                    nmi_triggered = true;
+                }
+            }
+            self.bus.clock_mapper_irq_cycles(pending_cycles);
+            for _ in 0..pending_cycles {
+                self.bus.step_apu();
+            }
+            pending_cycles = self.bus.take_dmc_stall_cycles();
+        }
+
+        nmi_triggered
+    }
+
     pub fn step(&mut self) -> bool {
         let cpu_cycles: u32;
 
@@ -81,27 +101,12 @@ impl Nes {
         }
 
         // --- Run all components for CPU instruction cycles ---
-        let mut nmi_triggered = false;
-        for _cycle in 0..(cpu_cycles * 3) {
-            if self.bus.step_ppu() {
-                nmi_triggered = true;
-            }
-        }
-        self.bus.clock_mapper_irq_cycles(cpu_cycles);
-        for _ in 0..cpu_cycles {
-            self.bus.step_apu();
-        }
+        let nmi_triggered = self.run_cpu_time(cpu_cycles);
 
         // --- Handle NMI (7-cycle entry must advance all components) ---
         if nmi_triggered {
             let nmi_cycles = self.cpu.nmi(&mut self.bus) as u32;
-            for _ in 0..(nmi_cycles * 3) {
-                self.bus.step_ppu();
-            }
-            self.bus.clock_mapper_irq_cycles(nmi_cycles);
-            for _ in 0..nmi_cycles {
-                self.bus.step_apu();
-            }
+            self.run_cpu_time(nmi_cycles);
         }
 
         // --- Handle APU Frame IRQ ---
@@ -109,13 +114,7 @@ impl Nes {
         if self.bus.apu_irq_pending() {
             let irq_cycles = self.cpu.irq(&mut self.bus) as u32;
             if irq_cycles > 0 {
-                for _ in 0..(irq_cycles * 3) {
-                    self.bus.step_ppu();
-                }
-                self.bus.clock_mapper_irq_cycles(irq_cycles);
-                for _ in 0..irq_cycles {
-                    self.bus.step_apu();
-                }
+                self.run_cpu_time(irq_cycles);
             }
         }
 
@@ -123,13 +122,7 @@ impl Nes {
         if self.bus.mapper_irq_pending() {
             let irq_cycles = self.cpu.irq(&mut self.bus) as u32;
             if irq_cycles > 0 {
-                for _ in 0..(irq_cycles * 3) {
-                    self.bus.step_ppu();
-                }
-                self.bus.clock_mapper_irq_cycles(irq_cycles);
-                for _ in 0..irq_cycles {
-                    self.bus.step_apu();
-                }
+                self.run_cpu_time(irq_cycles);
             }
         }
 
@@ -185,6 +178,7 @@ impl Nes {
             self.bus.get_ppu_registers();
 
         let rom_stem = self.rom_stem();
+        let apu_state = self.bus.get_apu_state();
 
         let save_state = save_state::SaveState {
             cpu_a: self.cpu.a,
@@ -216,8 +210,9 @@ impl Nes {
             cartridge_prg_bank: self.bus.get_cartridge_prg_bank(),
             cartridge_chr_bank: self.bus.get_cartridge_chr_bank(),
             cartridge_state: self.bus.get_cartridge_state(),
-            apu_frame_counter: 0,
-            apu_frame_interrupt: false,
+            apu_frame_counter: apu_state.frame_counter as u8,
+            apu_frame_interrupt: apu_state.frame_irq,
+            apu_state: Some(apu_state),
             rom_filename: rom_stem.clone(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -269,6 +264,14 @@ impl Nes {
         )?;
         if let Some(ref state) = save_state.cartridge_state {
             self.bus.restore_cartridge_state(state);
+        }
+        if let Some(ref state) = save_state.apu_state {
+            self.bus.restore_apu_state(state);
+        } else {
+            self.bus.restore_legacy_apu_state(
+                save_state.apu_frame_counter,
+                save_state.apu_frame_interrupt,
+            );
         }
 
         Ok(())

@@ -1,3 +1,4 @@
+use crate::apu::ApuState;
 use crate::cartridge::{CartridgeState, Mirroring, Mmc1State};
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +47,8 @@ pub struct SaveState {
     // APU state (basic)
     pub apu_frame_counter: u8,
     pub apu_frame_interrupt: bool,
+    #[serde(default)]
+    pub apu_state: Option<ApuState>,
 
     // Additional metadata
     pub rom_filename: String,
@@ -122,6 +125,7 @@ impl From<LegacySaveState> for SaveState {
             cartridge_state: None,
             apu_frame_counter: legacy.apu_frame_counter,
             apu_frame_interrupt: legacy.apu_frame_interrupt,
+            apu_state: None,
             rom_filename: legacy.rom_filename,
             timestamp: legacy.timestamp,
         }
@@ -223,11 +227,91 @@ impl From<SaveStateV1> for SaveState {
                 mmc3: None,
                 fme7: None,
                 bandai_fcg: None,
+                mapper34: None,
             }),
             apu_frame_counter: v1.apu_frame_counter,
             apu_frame_interrupt: v1.apu_frame_interrupt,
+            apu_state: None,
             rom_filename: v1.rom_filename,
             timestamp: v1.timestamp,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SaveStateV2 {
+    cpu_a: u8,
+    cpu_x: u8,
+    cpu_y: u8,
+    cpu_pc: u16,
+    cpu_sp: u8,
+    cpu_status: u8,
+    cpu_cycles: u64,
+    ppu_control: u8,
+    ppu_mask: u8,
+    ppu_status: u8,
+    ppu_oam_addr: u8,
+    ppu_scroll_x: u8,
+    ppu_scroll_y: u8,
+    ppu_addr: u16,
+    ppu_data_buffer: u8,
+    ppu_w: bool,
+    ppu_t: u16,
+    ppu_v: u16,
+    ppu_x: u8,
+    ppu_scanline: i16,
+    ppu_cycle: u16,
+    ppu_frame: u64,
+    ppu_palette: [u8; 32],
+    ppu_nametable: Vec<u8>,
+    ppu_oam: Vec<u8>,
+    ram: Vec<u8>,
+    cartridge_prg_bank: u8,
+    cartridge_chr_bank: u8,
+    cartridge_state: Option<CartridgeState>,
+    apu_frame_counter: u8,
+    apu_frame_interrupt: bool,
+    rom_filename: String,
+    timestamp: u64,
+}
+
+impl From<SaveStateV2> for SaveState {
+    fn from(v2: SaveStateV2) -> Self {
+        SaveState {
+            cpu_a: v2.cpu_a,
+            cpu_x: v2.cpu_x,
+            cpu_y: v2.cpu_y,
+            cpu_pc: v2.cpu_pc,
+            cpu_sp: v2.cpu_sp,
+            cpu_status: v2.cpu_status,
+            cpu_cycles: v2.cpu_cycles,
+            ppu_control: v2.ppu_control,
+            ppu_mask: v2.ppu_mask,
+            ppu_status: v2.ppu_status,
+            ppu_oam_addr: v2.ppu_oam_addr,
+            ppu_scroll_x: v2.ppu_scroll_x,
+            ppu_scroll_y: v2.ppu_scroll_y,
+            ppu_addr: v2.ppu_addr,
+            ppu_data_buffer: v2.ppu_data_buffer,
+            ppu_w: v2.ppu_w,
+            ppu_t: v2.ppu_t,
+            ppu_v: v2.ppu_v,
+            ppu_x: v2.ppu_x,
+            ppu_scanline: v2.ppu_scanline,
+            ppu_cycle: v2.ppu_cycle,
+            ppu_frame: v2.ppu_frame,
+            ppu_palette: v2.ppu_palette,
+            ppu_nametable: v2.ppu_nametable,
+            ppu_oam: v2.ppu_oam,
+            ram: v2.ram,
+            cartridge_prg_bank: v2.cartridge_prg_bank,
+            cartridge_chr_bank: v2.cartridge_chr_bank,
+            cartridge_state: v2.cartridge_state,
+            apu_frame_counter: v2.apu_frame_counter,
+            apu_frame_interrupt: v2.apu_frame_interrupt,
+            apu_state: None,
+            rom_filename: v2.rom_filename,
+            timestamp: v2.timestamp,
         }
     }
 }
@@ -245,6 +329,11 @@ impl SaveState {
         if let Ok(save_state) = bincode::deserialize::<SaveState>(&data) {
             println!("Save state loaded from: {}", filename);
             return Ok(save_state);
+        }
+
+        if let Ok(v2) = bincode::deserialize::<SaveStateV2>(&data) {
+            println!("Save state loaded from: {} (v2 format)", filename);
+            return Ok(v2.into());
         }
 
         if let Ok(v1) = bincode::deserialize::<SaveStateV1>(&data) {
@@ -314,6 +403,64 @@ mod tests {
         let _ = std::fs::remove_file(path);
 
         assert!(decoded.cartridge_state.is_none());
+        assert!(decoded.apu_state.is_none());
+    }
+
+    #[test]
+    fn deserialize_v2_save_state_defaults_apu_state() {
+        let v2 = SaveStateV2 {
+            cpu_a: 0x01,
+            cpu_x: 0x02,
+            cpu_y: 0x03,
+            cpu_pc: 0x8000,
+            cpu_sp: 0xFD,
+            cpu_status: 0x24,
+            cpu_cycles: 1234,
+            ppu_control: 0,
+            ppu_mask: 0,
+            ppu_status: 0,
+            ppu_oam_addr: 0,
+            ppu_scroll_x: 0,
+            ppu_scroll_y: 0,
+            ppu_addr: 0,
+            ppu_data_buffer: 0,
+            ppu_w: false,
+            ppu_t: 0,
+            ppu_v: 0,
+            ppu_x: 0,
+            ppu_scanline: 0,
+            ppu_cycle: 0,
+            ppu_frame: 0,
+            ppu_palette: [0; 32],
+            ppu_nametable: vec![0; 2048],
+            ppu_oam: vec![0; 256],
+            ram: vec![0; 0x800],
+            cartridge_prg_bank: 0,
+            cartridge_chr_bank: 0,
+            cartridge_state: None,
+            apu_frame_counter: 7,
+            apu_frame_interrupt: true,
+            rom_filename: "v2".to_string(),
+            timestamp: 77,
+        };
+
+        let encoded = bincode::serialize(&v2).expect("serialize v2 save");
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "nes_v2_state_{}.sav",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::write(&path, &encoded).expect("write v2 save");
+        let decoded =
+            SaveState::load_from_file(path.to_str().expect("utf-8 path")).expect("load v2 save");
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(decoded.apu_frame_counter, 7);
+        assert!(decoded.apu_frame_interrupt);
+        assert!(decoded.apu_state.is_none());
     }
 
     #[test]
@@ -391,6 +538,7 @@ mod tests {
         assert_eq!(decoded.cpu_a, 0x10);
         assert_eq!(decoded.apu_frame_counter, 2);
         assert_eq!(decoded.rom_filename, "v1_test");
+        assert!(decoded.apu_state.is_none());
 
         let cs = decoded
             .cartridge_state

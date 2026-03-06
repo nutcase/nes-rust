@@ -28,19 +28,24 @@ impl Cartridge {
 
     /// CNROM/Mapper 87 CHR read - 8KB CHR bank switching
     pub(in crate::cartridge) fn read_chr_cnrom(&self, addr: u16) -> u8 {
-        let bank_addr = (self.chr_bank as usize) * 0x2000 + (addr as usize);
-        if bank_addr < self.chr_rom.len() {
-            self.chr_rom[bank_addr]
-        } else {
-            0
+        if self.chr_rom.is_empty() {
+            return 0;
         }
+
+        let bank_count = (self.chr_rom.len() / 0x2000).max(1);
+        let bank = (self.chr_bank as usize) % bank_count;
+        let bank_addr = bank * 0x2000 + (addr as usize);
+        self.chr_rom[bank_addr % self.chr_rom.len()]
     }
 
     /// CNROM/Mapper 87 CHR write
     pub(in crate::cartridge) fn write_chr_cnrom(&mut self, addr: u16, data: u8) {
-        let bank_addr = (self.chr_bank as usize) * 0x2000 + (addr as usize);
-        if bank_addr < self.chr_rom.len() {
-            self.chr_rom[bank_addr] = data;
+        if !self.chr_rom.is_empty() {
+            let bank_count = (self.chr_rom.len() / 0x2000).max(1);
+            let bank = (self.chr_bank as usize) % bank_count;
+            let bank_addr = bank * 0x2000 + (addr as usize);
+            let chr_len = self.chr_rom.len();
+            self.chr_rom[bank_addr % chr_len] = data;
         }
     }
 }

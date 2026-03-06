@@ -5,8 +5,8 @@ A cycle-accurate NES (Nintendo Entertainment System / Famicom) emulator written 
 ## Features
 
 - Cycle-accurate CPU (6502) and PPU emulation
-- Audio support with pulse, triangle, and noise channels
-- Multiple mapper support (0, 1, 2, 3, 87)
+- Audio support with pulse, triangle, noise, and DMC channels
+- Multiple mapper support (0, 1, 2, 3, 4, 7, 9, 10, 11, 16, 34, 66, 69, 71, 87)
 - Save states (4 slots)
 - Battery-backed SRAM persistence
 - SDL2-based graphics and audio
@@ -84,6 +84,16 @@ Cheats are saved/loaded as JSON in the `cheats/` directory.
 | 1 | MMC1/SxROM | The Legend of Zelda, Metroid |
 | 2 | UxROM | Mega Man, Castlevania |
 | 3 | CNROM | Solomon's Key |
+| 4 | MMC3/TxROM | Super Mario Bros. 3, Kirby's Adventure |
+| 7 | AxROM | Battletoads |
+| 9 | MMC2 | Punch-Out!! |
+| 10 | MMC4 | Fire Emblem Gaiden |
+| 11 | Color Dreams | Crystal Mines, Menace Beach |
+| 16 | Bandai FCG | Dragon Ball Z II |
+| 34 | BNROM / NINA-001 | Deadly Towers, Impossible Mission II |
+| 66 | GxROM/MHROM | Dragon Spirit, Bart vs. the Space Mutants |
+| 69 | Sunsoft FME-7 | Batman: Return of the Joker, Gimmick! |
+| 71 | Camerica / BF9093 | Fire Hawk, Micro Machines |
 | 87 | - | Variant of Mapper 3 |
 
 ## Architecture

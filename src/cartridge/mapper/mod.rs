@@ -1,7 +1,11 @@
 mod axrom;
 mod bandai_fcg;
+mod bnrom_nina001;
+mod camerica;
 mod cnrom;
+mod color_dreams;
 mod fme7;
+mod gxrom;
 mod mmc1;
 mod mmc2;
 mod mmc3;

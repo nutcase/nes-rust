@@ -1,4 +1,4 @@
-use crate::apu::Apu;
+use crate::apu::{Apu, ApuState};
 use crate::cartridge::{Cartridge, CartridgeState};
 use crate::cpu::CpuBus;
 use crate::memory::Memory;
@@ -14,6 +14,7 @@ pub struct Bus {
     strobe: bool,          // Controller strobe mode
     dma_cycles: u32,       // Cycles to add due to DMA operations
     dma_in_progress: bool, // Flag to indicate DMA is in progress
+    dmc_stall_cycles: u32,
 }
 
 impl Bus {
@@ -28,11 +29,20 @@ impl Bus {
             strobe: false,
             dma_cycles: 0,
             dma_in_progress: false,
+            dmc_stall_cycles: 0,
         }
     }
 
     pub fn load_cartridge(&mut self, cartridge: Cartridge) {
         self.cartridge = Some(cartridge);
+    }
+
+    fn service_dmc_sample(&mut self) {
+        if let Some(addr) = self.apu.pull_dmc_sample_request() {
+            let data = self.read_dmc_sample(addr);
+            self.apu.push_dmc_sample(data);
+            self.dmc_stall_cycles += 4;
+        }
     }
 
     #[inline]
@@ -70,6 +80,7 @@ impl Bus {
                 0.0
             };
             self.apu.set_expansion_audio(exp);
+            self.service_dmc_sample();
             self.apu.step();
         }
 
@@ -83,6 +94,7 @@ impl Bus {
             0.0
         };
         self.apu.set_expansion_audio(exp);
+        self.service_dmc_sample();
         self.apu.step();
     }
 
@@ -135,7 +147,7 @@ impl Bus {
 
     // Check if APU frame IRQ is pending
     pub fn apu_irq_pending(&self) -> bool {
-        self.apu.frame_irq_pending()
+        self.apu.irq_pending()
     }
 
     // Clear APU frame IRQ
@@ -186,11 +198,28 @@ impl Bus {
         false
     }
 
+    pub fn take_dmc_stall_cycles(&mut self) -> u32 {
+        std::mem::take(&mut self.dmc_stall_cycles)
+    }
+
     pub fn read_chr(&self, addr: u16) -> u8 {
         if let Some(ref cartridge) = self.cartridge {
             cartridge.read_chr(addr)
         } else {
             0
+        }
+    }
+
+    fn read_dmc_sample(&self, addr: u16) -> u8 {
+        match addr {
+            0x8000..=0xFFFF => {
+                if let Some(ref cartridge) = self.cartridge {
+                    cartridge.read_prg(addr)
+                } else {
+                    0
+                }
+            }
+            _ => 0,
         }
     }
 }
@@ -372,10 +401,24 @@ impl Bus {
         self.cartridge.as_ref().map(|c| c.snapshot_state())
     }
 
+    pub fn get_apu_state(&self) -> ApuState {
+        self.apu.snapshot_state()
+    }
+
     pub fn restore_cartridge_state(&mut self, state: &CartridgeState) {
         if let Some(ref mut cartridge) = self.cartridge {
             cartridge.restore_state(state);
         }
+    }
+
+    pub fn restore_apu_state(&mut self, state: &ApuState) {
+        self.apu.restore_state(state);
+        self.dmc_stall_cycles = 0;
+    }
+
+    pub fn restore_legacy_apu_state(&mut self, frame_counter: u8, frame_irq: bool) {
+        self.apu.restore_legacy_state(frame_counter, frame_irq);
+        self.dmc_stall_cycles = 0;
     }
 
     pub fn restore_state_flat(
@@ -478,5 +521,24 @@ impl Bus {
     /// Mutable reference to PRG-RAM / SRAM.
     pub fn prg_ram_mut(&mut self) -> Option<&mut [u8]> {
         self.cartridge.as_mut().and_then(|c| c.prg_ram_mut())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dmc_sample_fetch_schedules_cpu_stall_cycles() {
+        let mut bus = Bus::new();
+        bus.apu.write_register(0x4010, 0x0F);
+        bus.apu.write_register(0x4012, 0x00);
+        bus.apu.write_register(0x4013, 0x00);
+        bus.apu.write_register(0x4015, 0x10);
+
+        bus.step_apu();
+
+        assert_eq!(bus.take_dmc_stall_cycles(), 4);
+        assert_eq!(bus.take_dmc_stall_cycles(), 0);
     }
 }
