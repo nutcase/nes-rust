@@ -181,7 +181,9 @@ impl Cartridge {
         };
 
         // Initialize PRG-RAM for mappers that support it
-        let prg_ram = if mapper == 1
+        let prg_ram = if mapper == 16 && has_battery {
+            vec![0xFF; 256]
+        } else if mapper == 1
             || mapper == 4
             || mapper34_nina001
             || mapper == 9

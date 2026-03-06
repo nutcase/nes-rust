@@ -2,6 +2,26 @@ use std::cell::Cell;
 
 use super::super::{Cartridge, Mirroring};
 
+#[derive(Debug, Clone, Copy)]
+enum BandaiEepromNext {
+    ReceiveAddress,
+    ReceiveData,
+    SendData,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BandaiEepromPhase {
+    Idle,
+    ReceivingControl,
+    ReceivingAddress,
+    ReceivingData,
+    AckPending(BandaiEepromNext),
+    AckLow(BandaiEepromNext),
+    Sending { byte: u8, bit_index: u8 },
+    WaitAckPending,
+    WaitAck,
+}
+
 /// Bandai FCG / LZ93D50 (Mapper 16).
 /// Used by Dragon Ball Z series and other Bandai games.
 /// Features: 8x1KB CHR banking, 16KB PRG banking, CPU-cycle IRQ counter.
@@ -13,6 +33,13 @@ pub(in crate::cartridge) struct BandaiFcg {
     pub(in crate::cartridge) irq_latch: u16,
     pub(in crate::cartridge) irq_enabled: bool,
     pub(in crate::cartridge) irq_pending: Cell<bool>,
+    eeprom_phase: BandaiEepromPhase,
+    eeprom_address: u8,
+    eeprom_shift: u8,
+    eeprom_bits: u8,
+    eeprom_prev_scl: bool,
+    eeprom_prev_sda: bool,
+    eeprom_data_out: bool,
 }
 
 impl BandaiFcg {
@@ -24,6 +51,13 @@ impl BandaiFcg {
             irq_latch: 0,
             irq_enabled: false,
             irq_pending: Cell::new(false),
+            eeprom_phase: BandaiEepromPhase::Idle,
+            eeprom_address: 0,
+            eeprom_shift: 0,
+            eeprom_bits: 0,
+            eeprom_prev_scl: false,
+            eeprom_prev_sda: true,
+            eeprom_data_out: true,
         }
     }
 
@@ -36,6 +70,164 @@ impl BandaiFcg {
                 self.irq_counter -= 1;
             }
         }
+    }
+
+    fn eeprom_start(&mut self) {
+        self.eeprom_phase = BandaiEepromPhase::ReceivingControl;
+        self.eeprom_shift = 0;
+        self.eeprom_bits = 0;
+        self.eeprom_data_out = true;
+    }
+
+    fn eeprom_stop(&mut self) {
+        self.eeprom_phase = BandaiEepromPhase::Idle;
+        self.eeprom_data_out = true;
+        self.eeprom_shift = 0;
+        self.eeprom_bits = 0;
+    }
+
+    fn eeprom_begin_send(&mut self, byte: u8) {
+        self.eeprom_phase = BandaiEepromPhase::Sending { byte, bit_index: 7 };
+        self.eeprom_data_out = (byte & 0x80) != 0;
+    }
+
+    fn eeprom_transition_after_ack(&mut self, next: BandaiEepromNext, storage: &[u8]) {
+        self.eeprom_data_out = true;
+        match next {
+            BandaiEepromNext::ReceiveAddress => {
+                self.eeprom_phase = BandaiEepromPhase::ReceivingAddress;
+                self.eeprom_shift = 0;
+                self.eeprom_bits = 0;
+            }
+            BandaiEepromNext::ReceiveData => {
+                self.eeprom_phase = BandaiEepromPhase::ReceivingData;
+                self.eeprom_shift = 0;
+                self.eeprom_bits = 0;
+            }
+            BandaiEepromNext::SendData => {
+                let byte = storage[self.eeprom_address as usize % storage.len()];
+                self.eeprom_begin_send(byte);
+            }
+        }
+    }
+
+    fn eeprom_process_received_byte(&mut self, byte: u8, storage: &mut [u8], dirty: &mut bool) {
+        match self.eeprom_phase {
+            BandaiEepromPhase::ReceivingControl => {
+                // 24C02 fixed device address 1010_000x.
+                if (byte >> 1) == 0x50 {
+                    let next = if byte & 0x01 == 0 {
+                        BandaiEepromNext::ReceiveAddress
+                    } else {
+                        BandaiEepromNext::SendData
+                    };
+                    self.eeprom_phase = BandaiEepromPhase::AckPending(next);
+                } else {
+                    self.eeprom_phase = BandaiEepromPhase::Idle;
+                }
+            }
+            BandaiEepromPhase::ReceivingAddress => {
+                self.eeprom_address = byte;
+                self.eeprom_phase = BandaiEepromPhase::AckPending(BandaiEepromNext::ReceiveData);
+            }
+            BandaiEepromPhase::ReceivingData => {
+                let index = self.eeprom_address as usize % storage.len();
+                if storage[index] != byte {
+                    storage[index] = byte;
+                    *dirty = true;
+                }
+                self.eeprom_address = self.eeprom_address.wrapping_add(1);
+                self.eeprom_phase = BandaiEepromPhase::AckPending(BandaiEepromNext::ReceiveData);
+            }
+            _ => {}
+        }
+    }
+
+    fn eeprom_clock_control(&mut self, control: u8, storage: &mut [u8], dirty: &mut bool) {
+        if storage.is_empty() {
+            self.eeprom_data_out = true;
+            return;
+        }
+
+        let read_enabled = (control & 0x80) != 0;
+        let sda = if read_enabled {
+            true
+        } else {
+            (control & 0x40) != 0
+        };
+        let scl = (control & 0x20) != 0;
+
+        if self.eeprom_prev_scl && scl {
+            if self.eeprom_prev_sda && !sda {
+                self.eeprom_start();
+            } else if !self.eeprom_prev_sda && sda {
+                self.eeprom_stop();
+            }
+        }
+
+        if !self.eeprom_prev_scl && scl {
+            match self.eeprom_phase {
+                BandaiEepromPhase::ReceivingControl
+                | BandaiEepromPhase::ReceivingAddress
+                | BandaiEepromPhase::ReceivingData => {
+                    self.eeprom_shift = (self.eeprom_shift << 1) | u8::from(sda);
+                    self.eeprom_bits += 1;
+                    if self.eeprom_bits == 8 {
+                        let byte = self.eeprom_shift;
+                        self.eeprom_shift = 0;
+                        self.eeprom_bits = 0;
+                        self.eeprom_process_received_byte(byte, storage, dirty);
+                    }
+                }
+                BandaiEepromPhase::Sending { byte, bit_index } => {
+                    if bit_index == 0 {
+                        self.eeprom_phase = BandaiEepromPhase::WaitAckPending;
+                    } else {
+                        self.eeprom_phase = BandaiEepromPhase::Sending {
+                            byte,
+                            bit_index: bit_index - 1,
+                        };
+                    }
+                }
+                BandaiEepromPhase::WaitAckPending => {}
+                BandaiEepromPhase::WaitAck => {
+                    if !sda {
+                        self.eeprom_address = self.eeprom_address.wrapping_add(1);
+                        let byte = storage[self.eeprom_address as usize % storage.len()];
+                        self.eeprom_begin_send(byte);
+                    } else {
+                        self.eeprom_phase = BandaiEepromPhase::Idle;
+                        self.eeprom_data_out = true;
+                    }
+                }
+                BandaiEepromPhase::AckPending(_)
+                | BandaiEepromPhase::AckLow(_)
+                | BandaiEepromPhase::Idle => {}
+            }
+        }
+
+        if self.eeprom_prev_scl && !scl {
+            match self.eeprom_phase {
+                BandaiEepromPhase::AckPending(next) => {
+                    self.eeprom_phase = BandaiEepromPhase::AckLow(next);
+                    self.eeprom_data_out = false;
+                }
+                BandaiEepromPhase::AckLow(next) => {
+                    self.eeprom_transition_after_ack(next, storage);
+                }
+                BandaiEepromPhase::Sending { byte, bit_index } => {
+                    self.eeprom_data_out = ((byte >> bit_index) & 0x01) != 0;
+                }
+                BandaiEepromPhase::WaitAckPending => {
+                    self.eeprom_phase = BandaiEepromPhase::WaitAck;
+                    self.eeprom_data_out = true;
+                }
+                _ => {}
+            }
+        }
+
+        self.eeprom_prev_scl = scl;
+        self.eeprom_prev_sda = sda;
     }
 }
 
@@ -71,7 +263,14 @@ impl Cartridge {
     }
 
     pub(in crate::cartridge) fn write_prg_bandai(&mut self, addr: u16, data: u8) {
-        if let Some(ref mut bandai) = self.bandai_fcg {
+        let Cartridge {
+            bandai_fcg,
+            prg_ram,
+            has_valid_save_data,
+            mirroring,
+            ..
+        } = self;
+        if let Some(ref mut bandai) = bandai_fcg {
             let reg = addr & 0x0F;
             match reg {
                 0x00..=0x07 => {
@@ -81,7 +280,7 @@ impl Cartridge {
                     bandai.prg_bank = data & 0x0F;
                 }
                 0x09 => {
-                    self.mirroring = match data & 0x03 {
+                    *mirroring = match data & 0x03 {
                         0 => Mirroring::Vertical,
                         1 => Mirroring::Horizontal,
                         2 => Mirroring::OneScreenLower,
@@ -101,7 +300,7 @@ impl Cartridge {
                     bandai.irq_latch = (bandai.irq_latch & 0x00FF) | ((data as u16) << 8);
                 }
                 0x0D => {
-                    // EEPROM I/O - not implemented
+                    bandai.eeprom_clock_control(data, prg_ram, has_valid_save_data);
                 }
                 _ => {}
             }
@@ -134,6 +333,12 @@ impl Cartridge {
     }
 
     pub(in crate::cartridge) fn read_prg_ram_bandai(&self, addr: u16) -> u8 {
+        if let Some(ref bandai) = self.bandai_fcg {
+            if self.has_battery {
+                return if bandai.eeprom_data_out { 0x10 } else { 0 };
+            }
+        }
+
         let ram_addr = (addr - 0x6000) as usize;
         if ram_addr < self.prg_ram.len() {
             self.prg_ram[ram_addr]
@@ -143,9 +348,131 @@ impl Cartridge {
     }
 
     pub(in crate::cartridge) fn write_prg_ram_bandai(&mut self, addr: u16, data: u8) {
+        if self.has_battery {
+            return;
+        }
         let ram_addr = (addr - 0x6000) as usize;
         if ram_addr < self.prg_ram.len() {
             self.prg_ram[ram_addr] = data;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EEPROM_READ: u8 = 0x80;
+    const EEPROM_SDA: u8 = 0x40;
+    const EEPROM_SCL: u8 = 0x20;
+
+    fn make_bandai_eeprom_cart() -> Cartridge {
+        Cartridge {
+            prg_rom: vec![0; 0x8000],
+            chr_rom: vec![0; 0x2000],
+            chr_ram: vec![],
+            prg_ram: vec![0xFF; 256],
+            has_valid_save_data: false,
+            mapper: 16,
+            mirroring: Mirroring::Horizontal,
+            has_battery: true,
+            chr_bank: 0,
+            chr_bank_1: 1,
+            prg_bank: 0,
+            mapper34_nina001: false,
+            mmc1: None,
+            mmc2: None,
+            mmc3: None,
+            fme7: None,
+            bandai_fcg: Some(BandaiFcg::new()),
+        }
+    }
+
+    fn drive(cart: &mut Cartridge, read: bool, sda: bool, scl: bool) {
+        let mut data = 0;
+        if read {
+            data |= EEPROM_READ;
+        }
+        if sda {
+            data |= EEPROM_SDA;
+        }
+        if scl {
+            data |= EEPROM_SCL;
+        }
+        cart.write_prg_bandai(0x800D, data);
+    }
+
+    fn start(cart: &mut Cartridge) {
+        drive(cart, false, true, false);
+        drive(cart, false, true, true);
+        drive(cart, false, false, true);
+        drive(cart, false, false, false);
+    }
+
+    fn stop(cart: &mut Cartridge) {
+        drive(cart, false, false, false);
+        drive(cart, false, false, true);
+        drive(cart, false, true, true);
+        drive(cart, false, true, false);
+    }
+
+    fn write_bit(cart: &mut Cartridge, bit: bool) {
+        drive(cart, false, bit, false);
+        drive(cart, false, bit, true);
+        drive(cart, false, bit, false);
+    }
+
+    fn read_bit(cart: &mut Cartridge) -> bool {
+        drive(cart, true, true, false);
+        drive(cart, true, true, true);
+        let bit = cart.read_prg_ram_bandai(0x6000) & 0x10 != 0;
+        drive(cart, true, true, false);
+        bit
+    }
+
+    fn write_byte(cart: &mut Cartridge, byte: u8) -> bool {
+        for shift in (0..8).rev() {
+            write_bit(cart, ((byte >> shift) & 1) != 0);
+        }
+        !read_bit(cart)
+    }
+
+    fn read_byte(cart: &mut Cartridge, ack: bool) -> u8 {
+        let mut byte = 0;
+        for _ in 0..8 {
+            byte = (byte << 1) | u8::from(read_bit(cart));
+        }
+        write_bit(cart, !ack);
+        byte
+    }
+
+    #[test]
+    fn bandai_eeprom_round_trips_a_byte() {
+        let mut cart = make_bandai_eeprom_cart();
+
+        start(&mut cart);
+        assert!(write_byte(&mut cart, 0xA0));
+        assert!(write_byte(&mut cart, 0x2A));
+        assert!(write_byte(&mut cart, 0x5C));
+        stop(&mut cart);
+
+        start(&mut cart);
+        assert!(write_byte(&mut cart, 0xA0));
+        assert!(write_byte(&mut cart, 0x2A));
+        start(&mut cart);
+        assert!(write_byte(&mut cart, 0xA1));
+        let value = read_byte(&mut cart, false);
+        stop(&mut cart);
+
+        assert_eq!(value, 0x5C);
+        assert_eq!(cart.prg_ram[0x2A], 0x5C);
+        assert!(cart.has_valid_save_data);
+    }
+
+    #[test]
+    fn bandai_eeprom_idle_line_reads_high() {
+        let mut cart = make_bandai_eeprom_cart();
+        drive(&mut cart, true, true, true);
+        assert_eq!(cart.read_prg_ram_bandai(0x6000) & 0x10, 0x10);
     }
 }
