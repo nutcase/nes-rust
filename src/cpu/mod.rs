@@ -26,6 +26,7 @@ pub struct Cpu {
     pub pc: u16, // Program counter
     pub status: StatusFlags,
     cycles: u64,
+    halted: bool,
     rts_count: u32,   // Counter for consecutive RTS calls at same PC
     last_rts_pc: u16, // Last PC where RTS was executed
 }
@@ -40,6 +41,7 @@ impl Cpu {
             pc: 0,
             status: StatusFlags::from_bits_truncate(0x24),
             cycles: 0,
+            halted: false,
             rts_count: 0,
             last_rts_pc: 0,
         }
@@ -51,6 +53,7 @@ impl Cpu {
         self.y = 0;
         self.sp = 0xFD;
         self.status = StatusFlags::from_bits_truncate(0x24);
+        self.halted = false;
 
         let low = bus.read(0xFFFC) as u16;
         let high = bus.read(0xFFFD) as u16;
@@ -59,6 +62,11 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut dyn CpuBus) -> u8 {
+        if self.halted {
+            self.cycles += 1;
+            return 1;
+        }
+
         let opcode = bus.read(self.pc);
 
         // Increment PC for most instructions - special ones handle it themselves
@@ -76,6 +84,10 @@ impl Cpu {
     }
 
     pub fn nmi(&mut self, bus: &mut dyn CpuBus) -> u8 {
+        if self.halted {
+            return 0;
+        }
+
         self.push(bus, (self.pc >> 8) as u8);
         self.push(bus, self.pc as u8);
         self.push(bus, self.status.bits() & !StatusFlags::BREAK.bits());
@@ -92,6 +104,10 @@ impl Cpu {
     }
 
     pub fn irq(&mut self, bus: &mut dyn CpuBus) -> u8 {
+        if self.halted {
+            return 0;
+        }
+
         // IRQ is maskable - check interrupt disable flag
         if self.status.contains(StatusFlags::INTERRUPT_DISABLE) {
             return 0;
@@ -112,6 +128,22 @@ impl Cpu {
 
         self.cycles += 7;
         7
+    }
+
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    pub fn set_halted(&mut self, halted: bool) {
+        self.halted = halted;
+    }
+
+    pub fn total_cycles(&self) -> u64 {
+        self.cycles
+    }
+
+    pub fn set_total_cycles(&mut self, cycles: u64) {
+        self.cycles = cycles;
     }
 
     fn execute_instruction(&mut self, opcode: u8, bus: &mut dyn CpuBus) -> u8 {
@@ -542,12 +574,9 @@ impl Cpu {
                         }
                     }
                     // SHY unofficial opcode
-                    // JAM/KIL opcodes - These should halt the CPU but we treat as NOP for compatibility
+                    // JAM/KIL opcodes - Halt the CPU until reset.
                     0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2 | 0xD2
-                    | 0xF2 => {
-                        // JAM/KIL - Officially halt CPU, but treat as NOP for game compatibility
-                        1 // 1 cycle minimal operation
-                    }
+                    | 0xF2 => self.jam(),
                     0x9C => {
                         // SHY absolute,X - Store Y AND (high byte of original addr + 1) [UNSTABLE]
                         let addr = self.read_word(bus);

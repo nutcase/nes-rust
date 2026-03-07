@@ -118,4 +118,33 @@ mod additional_cpu_tests {
 
         assert_eq!(cpu.pc, 0x4080); // Bug behavior
     }
+
+    #[test]
+    fn test_jam_halts_cpu_until_reset() {
+        let (mut cpu, mut bus) = setup_cpu();
+        cpu.reset(&mut bus);
+
+        bus.load_program(&[0x02, 0xE8], 0x8000);
+        cpu.pc = 0x8000;
+
+        let jam_cycles = cpu.step(&mut bus);
+        assert_eq!(jam_cycles, 2);
+        assert!(cpu.is_halted());
+        assert_eq!(cpu.pc, 0x8001);
+
+        cpu.x = 0x10;
+        let halted_cycles = cpu.step(&mut bus);
+        assert_eq!(halted_cycles, 1);
+        assert_eq!(cpu.pc, 0x8001);
+        assert_eq!(cpu.x, 0x10);
+
+        bus.write(0xFFFA, 0x00);
+        bus.write(0xFFFB, 0x90);
+        assert_eq!(cpu.nmi(&mut bus), 0);
+        assert_eq!(cpu.pc, 0x8001);
+
+        cpu.reset(&mut bus);
+        assert!(!cpu.is_halted());
+        assert_eq!(cpu.pc, 0x8000);
+    }
 }

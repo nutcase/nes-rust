@@ -38,10 +38,10 @@ impl Bus {
     }
 
     fn service_dmc_sample(&mut self) {
-        if let Some(addr) = self.apu.pull_dmc_sample_request() {
+        if let Some((addr, stall_cycles)) = self.apu.pull_dmc_sample_request() {
             let data = self.read_dmc_sample(addr);
             self.apu.push_dmc_sample(data);
-            self.dmc_stall_cycles += 4;
+            self.dmc_stall_cycles += stall_cycles as u32;
         }
     }
 
@@ -202,6 +202,28 @@ impl Bus {
         std::mem::take(&mut self.dmc_stall_cycles)
     }
 
+    pub fn timing_state(&self) -> (u32, bool, u32, bool) {
+        (
+            self.dma_cycles,
+            self.dma_in_progress,
+            self.dmc_stall_cycles,
+            self.ppu.frame_complete,
+        )
+    }
+
+    pub fn restore_timing_state(
+        &mut self,
+        dma_cycles: u32,
+        dma_in_progress: bool,
+        dmc_stall_cycles: u32,
+        ppu_frame_complete: bool,
+    ) {
+        self.dma_cycles = dma_cycles;
+        self.dma_in_progress = dma_in_progress;
+        self.dmc_stall_cycles = dmc_stall_cycles;
+        self.ppu.frame_complete = ppu_frame_complete;
+    }
+
     pub fn read_chr(&self, addr: u16) -> u8 {
         if let Some(ref cartridge) = self.cartridge {
             cartridge.read_chr(addr)
@@ -314,6 +336,9 @@ impl CpuBus for Bus {
             0x4020..=0xFFFF => {
                 if let Some(ref mut cartridge) = self.cartridge {
                     match addr {
+                        0x4020..=0x5FFF => {
+                            cartridge.write_prg(addr, data);
+                        }
                         0x6000..=0x7FFF => {
                             cartridge.write_prg_ram(addr, data);
                         }
@@ -537,8 +562,31 @@ mod tests {
         bus.apu.write_register(0x4015, 0x10);
 
         bus.step_apu();
-
-        assert_eq!(bus.take_dmc_stall_cycles(), 4);
         assert_eq!(bus.take_dmc_stall_cycles(), 0);
+        bus.step_apu();
+        assert_eq!(bus.take_dmc_stall_cycles(), 0);
+        bus.step_apu();
+
+        assert_eq!(bus.take_dmc_stall_cycles(), 3);
+        assert_eq!(bus.take_dmc_stall_cycles(), 0);
+    }
+
+    #[test]
+    fn restore_timing_state_restores_dma_and_frame_flags() {
+        let mut bus = Bus::new();
+        bus.restore_timing_state(7, true, 2, true);
+
+        assert!(bus.is_dma_in_progress());
+        assert_eq!(bus.take_dmc_stall_cycles(), 2);
+        assert!(bus.ppu_frame_complete());
+        assert!(!bus.ppu_frame_complete());
+
+        assert!(!bus.step_dma());
+        let (dma_cycles, dma_in_progress, dmc_stall_cycles, ppu_frame_complete) =
+            bus.timing_state();
+        assert_eq!(dma_cycles, 6);
+        assert!(dma_in_progress);
+        assert_eq!(dmc_stall_cycles, 0);
+        assert!(!ppu_frame_complete);
     }
 }

@@ -110,6 +110,10 @@ pub struct DmcState {
     pub shift_register: u8,
     pub bits_remaining: u8,
     pub silence: bool,
+    #[serde(default)]
+    pub dma_delay: u8,
+    #[serde(default)]
+    pub pending_dma_stall_cycles: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +240,8 @@ struct DmcChannel {
     shift_register: u8,
     bits_remaining: u8,
     silence: bool,
+    dma_delay: u8,
+    pending_dma_stall_cycles: u8,
 }
 
 // High-quality audio filters
@@ -739,7 +745,7 @@ impl Apu {
         }
     }
 
-    pub(crate) fn pull_dmc_sample_request(&mut self) -> Option<u16> {
+    pub(crate) fn pull_dmc_sample_request(&mut self) -> Option<(u16, u8)> {
         self.dmc.pull_sample_request()
     }
 
@@ -1218,6 +1224,8 @@ impl DmcChannel {
             shift_register: 0,
             bits_remaining: 8,
             silence: true,
+            dma_delay: 0,
+            pending_dma_stall_cycles: 0,
         }
     }
 
@@ -1245,11 +1253,14 @@ impl DmcChannel {
     fn set_enabled(&mut self, enabled: bool) {
         if !enabled {
             self.bytes_remaining = 0;
+            self.dma_delay = 0;
+            self.pending_dma_stall_cycles = 0;
             return;
         }
 
         if self.bytes_remaining == 0 {
             self.restart_sample();
+            self.schedule_dma(2, 3);
         }
     }
 
@@ -1258,11 +1269,33 @@ impl DmcChannel {
         self.bytes_remaining = self.sample_length;
     }
 
-    fn pull_sample_request(&mut self) -> Option<u16> {
-        if self.sample_buffer.is_some() || self.bytes_remaining == 0 {
+    fn schedule_dma(&mut self, delay: u8, stall_cycles: u8) {
+        if self.sample_buffer.is_some()
+            || self.bytes_remaining == 0
+            || self.pending_dma_stall_cycles != 0
+        {
+            return;
+        }
+
+        self.dma_delay = delay;
+        self.pending_dma_stall_cycles = stall_cycles;
+    }
+
+    fn pull_sample_request(&mut self) -> Option<(u16, u8)> {
+        if self.pending_dma_stall_cycles == 0
+            || self.sample_buffer.is_some()
+            || self.bytes_remaining == 0
+        {
             return None;
         }
 
+        if self.dma_delay > 0 {
+            self.dma_delay -= 1;
+            return None;
+        }
+
+        let stall_cycles = self.pending_dma_stall_cycles;
+        self.pending_dma_stall_cycles = 0;
         let addr = self.current_address;
         self.current_address = if self.current_address == 0xFFFF {
             0x8000
@@ -1279,7 +1312,7 @@ impl DmcChannel {
             }
         }
 
-        Some(addr)
+        Some((addr, stall_cycles))
     }
 
     fn push_sample(&mut self, data: u8) {
@@ -1316,6 +1349,7 @@ impl DmcChannel {
             if let Some(sample) = self.sample_buffer.take() {
                 self.shift_register = sample;
                 self.silence = false;
+                self.schedule_dma(0, 4);
             } else {
                 self.silence = true;
             }
@@ -1342,6 +1376,8 @@ impl DmcChannel {
             shift_register: self.shift_register,
             bits_remaining: self.bits_remaining,
             silence: self.silence,
+            dma_delay: self.dma_delay,
+            pending_dma_stall_cycles: self.pending_dma_stall_cycles,
         }
     }
 
@@ -1360,6 +1396,8 @@ impl DmcChannel {
         self.shift_register = state.shift_register;
         self.bits_remaining = state.bits_remaining;
         self.silence = state.silence;
+        self.dma_delay = state.dma_delay;
+        self.pending_dma_stall_cycles = state.pending_dma_stall_cycles;
     }
 }
 
@@ -1369,7 +1407,7 @@ mod tests {
 
     fn step_dmc(apu: &mut Apu, cycles: usize, sample_data: u8) {
         for _ in 0..cycles {
-            if let Some(addr) = apu.pull_dmc_sample_request() {
+            if let Some((addr, _stall_cycles)) = apu.pull_dmc_sample_request() {
                 assert_eq!(addr, 0xC000);
                 apu.push_dmc_sample(sample_data);
             }
@@ -1386,7 +1424,11 @@ mod tests {
         apu.write_register(0x4013, 0x00);
         apu.write_register(0x4015, 0x10);
 
-        assert_eq!(apu.pull_dmc_sample_request(), Some(0xC000));
+        assert_eq!(apu.pull_dmc_sample_request(), None);
+        apu.step();
+        assert_eq!(apu.pull_dmc_sample_request(), None);
+        apu.step();
+        assert_eq!(apu.pull_dmc_sample_request(), Some((0xC000, 3)));
         apu.push_dmc_sample(0xFF);
 
         let cycles = apu.dmc.timer as usize + (DMC_RATE_TABLE[15] as usize + 1) * 20;
@@ -1404,7 +1446,11 @@ mod tests {
         apu.write_register(0x4013, 0x00);
         apu.write_register(0x4015, 0x10);
 
-        assert_eq!(apu.pull_dmc_sample_request(), Some(0xC000));
+        assert_eq!(apu.pull_dmc_sample_request(), None);
+        apu.step();
+        assert_eq!(apu.pull_dmc_sample_request(), None);
+        apu.step();
+        assert_eq!(apu.pull_dmc_sample_request(), Some((0xC000, 3)));
         assert!(apu.dmc.irq_pending);
         apu.push_dmc_sample(0x00);
 
@@ -1425,7 +1471,11 @@ mod tests {
         apu.write_register(0x4013, 0x01);
         apu.write_register(0x4015, 0x10);
 
-        assert_eq!(apu.pull_dmc_sample_request(), Some(0xC000));
+        assert_eq!(apu.pull_dmc_sample_request(), None);
+        apu.step();
+        assert_eq!(apu.pull_dmc_sample_request(), None);
+        apu.step();
+        assert_eq!(apu.pull_dmc_sample_request(), Some((0xC000, 3)));
         apu.push_dmc_sample(0xAA);
         let cycles = apu.dmc.timer as usize + (DMC_RATE_TABLE[15] as usize + 1) * 6;
         step_dmc(&mut apu, cycles, 0x55);

@@ -129,6 +129,12 @@ impl Cpu {
     }
 
     #[inline]
+    pub(super) fn jam(&mut self) -> u8 {
+        self.halted = true;
+        2
+    }
+
+    #[inline]
     pub(super) fn brk(&mut self, bus: &mut dyn CpuBus) -> u8 {
         // BRK is a 2-byte instruction (0x00 + signature byte)
         // PC has already been incremented to point to signature byte

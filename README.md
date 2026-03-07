@@ -6,7 +6,7 @@ A cycle-accurate NES (Nintendo Entertainment System / Famicom) emulator written 
 
 - Cycle-accurate CPU (6502) and PPU emulation
 - Audio support with pulse, triangle, noise, and DMC channels
-- Multiple mapper support (0, 1, 2, 3, 4, 7, 9, 10, 11, 16, 34, 66, 69, 70, 71, 87, 152, 180)
+- Multiple mapper support (0, 1, 2, 3, 4, 7, 9, 10, 11, 16, 34, 66, 69, 70, 71, 78, 79, 87, 89, 93, 94, 146, 148, 152, 180)
 - Save states (4 slots)
 - Battery-backed SRAM persistence
 - SDL2-based graphics and audio
@@ -95,7 +95,14 @@ Cheats are saved/loaded as JSON in the `cheats/` directory.
 | 69 | Sunsoft FME-7 | Batman: Return of the Joker, Gimmick! |
 | 70 | Jaleco JF-11/JF-14 | City Connection, Rod Land |
 | 71 | Camerica / BF9093 | Fire Hawk, Micro Machines |
+| 78 | Irem 74HC161/32 | Holy Diver, Cosmo Carrier |
+| 79 | AVE NINA-03/NINA-06 | - |
 | 87 | - | Variant of Mapper 3 |
+| 89 | Sunsoft-2 | - |
+| 93 | Sunsoft-2 variant | - |
+| 94 | UN1ROM | Senjou no Ookami, Higemaru Makaijima |
+| 146 | AVE 301/301? (79-compatible) | - |
+| 148 | Sachen SA-008-A | - |
 | 152 | Jaleco JF-17/JF-19 | Moero!! Pro Soccer, Goal! Two |
 | 180 | UNROM-180 | Crazy Climber |
 

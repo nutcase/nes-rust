@@ -58,21 +58,36 @@ impl Nes {
         Ok(())
     }
 
+    fn run_single_cpu_cycle(&mut self) -> bool {
+        let mut nmi_triggered = false;
+
+        for _ in 0..3 {
+            if self.bus.step_ppu() {
+                nmi_triggered = true;
+            }
+        }
+        self.bus.clock_mapper_irq_cycles(1);
+        self.bus.step_apu();
+
+        nmi_triggered
+    }
+
     fn run_cpu_time(&mut self, cycles: u32) -> bool {
         let mut nmi_triggered = false;
-        let mut pending_cycles = cycles;
 
-        while pending_cycles > 0 {
-            for _ in 0..(pending_cycles * 3) {
-                if self.bus.step_ppu() {
+        for _ in 0..cycles {
+            if self.run_single_cpu_cycle() {
+                nmi_triggered = true;
+            }
+
+            let mut stall_cycles = self.bus.take_dmc_stall_cycles();
+            while stall_cycles > 0 {
+                if self.run_single_cpu_cycle() {
                     nmi_triggered = true;
                 }
+                stall_cycles -= 1;
+                stall_cycles += self.bus.take_dmc_stall_cycles();
             }
-            self.bus.clock_mapper_irq_cycles(pending_cycles);
-            for _ in 0..pending_cycles {
-                self.bus.step_apu();
-            }
-            pending_cycles = self.bus.take_dmc_stall_cycles();
         }
 
         nmi_triggered
@@ -179,6 +194,8 @@ impl Nes {
 
         let rom_stem = self.rom_stem();
         let apu_state = self.bus.get_apu_state();
+        let (bus_dma_cycles, bus_dma_in_progress, bus_dmc_stall_cycles, ppu_frame_complete) =
+            self.bus.timing_state();
 
         let save_state = save_state::SaveState {
             cpu_a: self.cpu.a,
@@ -187,7 +204,8 @@ impl Nes {
             cpu_pc: self.cpu.pc,
             cpu_sp: self.cpu.sp,
             cpu_status: self.cpu.status.bits(),
-            cpu_cycles: 0,
+            cpu_cycles: self.cpu.total_cycles(),
+            cpu_halted: self.cpu.is_halted(),
             ppu_control,
             ppu_mask,
             ppu_status,
@@ -217,6 +235,10 @@ impl Nes {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs(),
+            bus_dma_cycles,
+            bus_dma_in_progress,
+            bus_dmc_stall_cycles,
+            ppu_frame_complete,
         };
 
         let dir = std::path::Path::new("states");
@@ -239,6 +261,8 @@ impl Nes {
         self.cpu.pc = save_state.cpu_pc;
         self.cpu.sp = save_state.cpu_sp;
         self.cpu.status = StatusFlags::from_bits_truncate(save_state.cpu_status);
+        self.cpu.set_halted(save_state.cpu_halted);
+        self.cpu.set_total_cycles(save_state.cpu_cycles);
 
         self.bus.restore_state_flat(
             save_state.ppu_palette,
@@ -273,6 +297,12 @@ impl Nes {
                 save_state.apu_frame_interrupt,
             );
         }
+        self.bus.restore_timing_state(
+            save_state.bus_dma_cycles,
+            save_state.bus_dma_in_progress,
+            save_state.bus_dmc_stall_cycles,
+            save_state.ppu_frame_complete,
+        );
 
         Ok(())
     }

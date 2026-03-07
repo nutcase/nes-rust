@@ -53,6 +53,16 @@ pub struct SaveState {
     // Additional metadata
     pub rom_filename: String,
     pub timestamp: u64,
+    #[serde(default)]
+    pub cpu_halted: bool,
+    #[serde(default)]
+    pub bus_dma_cycles: u32,
+    #[serde(default)]
+    pub bus_dma_in_progress: bool,
+    #[serde(default)]
+    pub bus_dmc_stall_cycles: u32,
+    #[serde(default)]
+    pub ppu_frame_complete: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -101,6 +111,7 @@ impl From<LegacySaveState> for SaveState {
             cpu_sp: legacy.cpu_sp,
             cpu_status: legacy.cpu_status,
             cpu_cycles: legacy.cpu_cycles,
+            cpu_halted: false,
             ppu_control: legacy.ppu_control,
             ppu_mask: legacy.ppu_mask,
             ppu_status: legacy.ppu_status,
@@ -128,6 +139,10 @@ impl From<LegacySaveState> for SaveState {
             apu_state: None,
             rom_filename: legacy.rom_filename,
             timestamp: legacy.timestamp,
+            bus_dma_cycles: 0,
+            bus_dma_in_progress: false,
+            bus_dmc_stall_cycles: 0,
+            ppu_frame_complete: false,
         }
     }
 }
@@ -193,6 +208,7 @@ impl From<SaveStateV1> for SaveState {
             cpu_sp: v1.cpu_sp,
             cpu_status: v1.cpu_status,
             cpu_cycles: v1.cpu_cycles,
+            cpu_halted: false,
             ppu_control: v1.ppu_control,
             ppu_mask: v1.ppu_mask,
             ppu_status: v1.ppu_status,
@@ -228,12 +244,17 @@ impl From<SaveStateV1> for SaveState {
                 fme7: None,
                 bandai_fcg: None,
                 mapper34: None,
+                mapper93: None,
             }),
             apu_frame_counter: v1.apu_frame_counter,
             apu_frame_interrupt: v1.apu_frame_interrupt,
             apu_state: None,
             rom_filename: v1.rom_filename,
             timestamp: v1.timestamp,
+            bus_dma_cycles: 0,
+            bus_dma_in_progress: false,
+            bus_dmc_stall_cycles: 0,
+            ppu_frame_complete: false,
         }
     }
 }
@@ -285,6 +306,7 @@ impl From<SaveStateV2> for SaveState {
             cpu_sp: v2.cpu_sp,
             cpu_status: v2.cpu_status,
             cpu_cycles: v2.cpu_cycles,
+            cpu_halted: false,
             ppu_control: v2.ppu_control,
             ppu_mask: v2.ppu_mask,
             ppu_status: v2.ppu_status,
@@ -312,6 +334,10 @@ impl From<SaveStateV2> for SaveState {
             apu_state: None,
             rom_filename: v2.rom_filename,
             timestamp: v2.timestamp,
+            bus_dma_cycles: 0,
+            bus_dma_in_progress: false,
+            bus_dmc_stall_cycles: 0,
+            ppu_frame_complete: false,
         }
     }
 }
@@ -404,6 +430,11 @@ mod tests {
 
         assert!(decoded.cartridge_state.is_none());
         assert!(decoded.apu_state.is_none());
+        assert!(!decoded.cpu_halted);
+        assert_eq!(decoded.bus_dma_cycles, 0);
+        assert!(!decoded.bus_dma_in_progress);
+        assert_eq!(decoded.bus_dmc_stall_cycles, 0);
+        assert!(!decoded.ppu_frame_complete);
     }
 
     #[test]
@@ -461,6 +492,66 @@ mod tests {
         assert_eq!(decoded.apu_frame_counter, 7);
         assert!(decoded.apu_frame_interrupt);
         assert!(decoded.apu_state.is_none());
+        assert!(!decoded.cpu_halted);
+        assert_eq!(decoded.bus_dma_cycles, 0);
+        assert!(!decoded.bus_dma_in_progress);
+        assert_eq!(decoded.bus_dmc_stall_cycles, 0);
+        assert!(!decoded.ppu_frame_complete);
+    }
+
+    #[test]
+    fn save_state_round_trips_cpu_and_bus_timing_fields() {
+        let state = SaveState {
+            cpu_a: 0,
+            cpu_x: 0,
+            cpu_y: 0,
+            cpu_pc: 0x8000,
+            cpu_sp: 0xFD,
+            cpu_status: 0x24,
+            cpu_cycles: 42_123,
+            ppu_control: 0,
+            ppu_mask: 0,
+            ppu_status: 0,
+            ppu_oam_addr: 0,
+            ppu_scroll_x: 0,
+            ppu_scroll_y: 0,
+            ppu_addr: 0,
+            ppu_data_buffer: 0,
+            ppu_w: false,
+            ppu_t: 0,
+            ppu_v: 0,
+            ppu_x: 0,
+            ppu_scanline: 10,
+            ppu_cycle: 123,
+            ppu_frame: 456,
+            ppu_palette: [0; 32],
+            ppu_nametable: vec![0; 2048],
+            ppu_oam: vec![0; 256],
+            ram: vec![0; 0x800],
+            cartridge_prg_bank: 0,
+            cartridge_chr_bank: 0,
+            cartridge_state: None,
+            apu_frame_counter: 0,
+            apu_frame_interrupt: false,
+            apu_state: None,
+            rom_filename: "roundtrip".to_string(),
+            timestamp: 999,
+            cpu_halted: true,
+            bus_dma_cycles: 7,
+            bus_dma_in_progress: true,
+            bus_dmc_stall_cycles: 3,
+            ppu_frame_complete: true,
+        };
+
+        let encoded = bincode::serialize(&state).expect("serialize save state");
+        let decoded: SaveState = bincode::deserialize(&encoded).expect("deserialize save state");
+
+        assert_eq!(decoded.cpu_cycles, 42_123);
+        assert!(decoded.cpu_halted);
+        assert_eq!(decoded.bus_dma_cycles, 7);
+        assert!(decoded.bus_dma_in_progress);
+        assert_eq!(decoded.bus_dmc_stall_cycles, 3);
+        assert!(decoded.ppu_frame_complete);
     }
 
     #[test]
@@ -539,6 +630,11 @@ mod tests {
         assert_eq!(decoded.apu_frame_counter, 2);
         assert_eq!(decoded.rom_filename, "v1_test");
         assert!(decoded.apu_state.is_none());
+        assert!(!decoded.cpu_halted);
+        assert_eq!(decoded.bus_dma_cycles, 0);
+        assert!(!decoded.bus_dma_in_progress);
+        assert_eq!(decoded.bus_dmc_stall_cycles, 0);
+        assert!(!decoded.ppu_frame_complete);
 
         let cs = decoded
             .cartridge_state

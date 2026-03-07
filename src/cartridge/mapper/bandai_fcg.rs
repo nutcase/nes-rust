@@ -380,6 +380,8 @@ mod tests {
             chr_bank_1: 1,
             prg_bank: 0,
             mapper34_nina001: false,
+            mapper93_chr_ram_enabled: true,
+            mapper78_hv_mirroring: false,
             mmc1: None,
             mmc2: None,
             mmc3: None,
