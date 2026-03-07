@@ -55,6 +55,7 @@ impl Cpu {
         self.status = StatusFlags::from_bits_truncate(0x24);
         self.halted = false;
 
+        bus.on_reset();
         let low = bus.read(0xFFFC) as u16;
         let high = bus.read(0xFFFD) as u16;
         self.pc = (high << 8) | low;
@@ -1169,6 +1170,7 @@ impl Cpu {
 }
 
 pub trait CpuBus {
+    fn on_reset(&mut self) {}
     fn read(&mut self, addr: u16) -> u8;
     fn write(&mut self, addr: u16, data: u8);
 }

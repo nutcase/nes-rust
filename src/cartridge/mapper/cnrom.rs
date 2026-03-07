@@ -26,6 +26,34 @@ impl Cartridge {
         }
     }
 
+    /// Mapper 101 - JF-10 bad dump variant with normal CHR bit ordering.
+    pub(in crate::cartridge) fn write_prg_mapper101(&mut self, addr: u16, data: u8) {
+        if addr >= 0x6000 && addr <= 0x7FFF {
+            let bank_count = (self.chr_rom.len() / 0x2000).max(1);
+            self.chr_bank = (data as usize % bank_count) as u8;
+        }
+    }
+
+    /// Mapper 145: low-address latch variant of CNROM using bit 7 as the
+    /// 8KB CHR bank select.
+    pub(in crate::cartridge) fn write_prg_mapper145(&mut self, addr: u16, data: u8) {
+        if (addr & 0xE100) == 0x4100 {
+            let bank_count = (self.chr_rom.len() / 0x2000).max(1);
+            self.chr_bank = (((data >> 7) as usize) % bank_count) as u8;
+        }
+    }
+
+    /// Mapper 184 (Sunsoft-1): bits 0-2 select the lower 4KB CHR bank and
+    /// bits 4-5 select the upper bank, which always maps into banks 4-7.
+    pub(in crate::cartridge) fn write_prg_mapper184(&mut self, addr: u16, data: u8) {
+        if addr >= 0x6000 && addr <= 0x7FFF {
+            let bank_count = (self.chr_rom.len() / 0x1000).max(1);
+            self.chr_bank = ((data & 0x07) as usize % bank_count) as u8;
+            let upper_bank = 4 | ((data >> 4) & 0x03);
+            self.chr_bank_1 = (upper_bank as usize % bank_count) as u8;
+        }
+    }
+
     /// CNROM/Mapper 87 CHR read - 8KB CHR bank switching
     pub(in crate::cartridge) fn read_chr_cnrom(&self, addr: u16) -> u8 {
         if self.chr_rom.is_empty() {
@@ -47,5 +75,42 @@ impl Cartridge {
             let chr_len = self.chr_rom.len();
             self.chr_rom[bank_addr % chr_len] = data;
         }
+    }
+
+    pub(in crate::cartridge) fn read_chr_split_4k(&self, addr: u16) -> u8 {
+        if self.chr_rom.is_empty() {
+            return 0;
+        }
+
+        let bank_count = (self.chr_rom.len() / 0x1000).max(1);
+        let (bank, offset) = if addr < 0x1000 {
+            ((self.chr_bank as usize) % bank_count, addr as usize)
+        } else {
+            (
+                (self.chr_bank_1 as usize) % bank_count,
+                (addr as usize) - 0x1000,
+            )
+        };
+        let chr_addr = bank * 0x1000 + offset;
+        self.chr_rom[chr_addr % self.chr_rom.len()]
+    }
+
+    pub(in crate::cartridge) fn write_chr_split_4k(&mut self, addr: u16, data: u8) {
+        if self.chr_rom.is_empty() {
+            return;
+        }
+
+        let bank_count = (self.chr_rom.len() / 0x1000).max(1);
+        let (bank, offset) = if addr < 0x1000 {
+            ((self.chr_bank as usize) % bank_count, addr as usize)
+        } else {
+            (
+                (self.chr_bank_1 as usize) % bank_count,
+                (addr as usize) - 0x1000,
+            )
+        };
+        let chr_len = self.chr_rom.len();
+        let chr_addr = bank * 0x1000 + offset;
+        self.chr_rom[chr_addr % chr_len] = data;
     }
 }

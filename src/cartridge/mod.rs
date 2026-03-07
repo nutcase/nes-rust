@@ -1,9 +1,13 @@
+mod load;
 mod mapper;
+mod state;
 
-use mapper::{BandaiFcg, Fme7, Mmc1, Mmc2, Mmc3};
+use mapper::{
+    BandaiFcg, Fme7, Mapper15, Mapper246, Mmc1, Mmc2, Mmc3, Sunsoft4, TaitoTc0190, TaitoX1005,
+    TaitoX1017, Vrc1,
+};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::{Read, Result};
+pub use state::*;
 
 pub struct Cartridge {
     prg_rom: Vec<u8>,
@@ -20,239 +24,102 @@ pub struct Cartridge {
     mapper34_nina001: bool,
     mapper93_chr_ram_enabled: bool,
     mapper78_hv_mirroring: bool,
+    mapper58_nrom128: bool,
+    mapper225_nrom128: bool,
+    mapper232_outer_bank: u8,
+    mapper233_nrom128: bool,
+    mapper234_reg0: u8,
+    mapper234_reg1: u8,
+    mapper235_nrom128: bool,
+    mapper202_32k_mode: bool,
+    mapper212_32k_mode: bool,
+    mapper226_nrom128: bool,
+    mapper230_contra_mode: bool,
+    mapper230_nrom128: bool,
+    mapper228_chip_select: u8,
+    mapper228_nrom128: bool,
+    mapper242_latch: u16,
+    mapper243_index: u8,
+    mapper243_registers: [u8; 8],
+    mapper221_mode: u8,
+    mapper221_outer_bank: u8,
+    mapper221_chr_write_protect: bool,
+    mapper191_outer_bank: u8,
+    mapper195_mode: u8,
+    mapper208_protection_index: u8,
+    mapper208_protection_regs: [u8; 4],
     mmc1: Option<Mmc1>,
     mmc2: Option<Mmc2>,
     mmc3: Option<Mmc3>,
     fme7: Option<Fme7>,
     bandai_fcg: Option<BandaiFcg>,
+    vrc1: Option<Vrc1>,
+    mapper15: Option<Mapper15>,
+    sunsoft4: Option<Sunsoft4>,
+    taito_tc0190: Option<TaitoTc0190>,
+    taito_x1005: Option<TaitoX1005>,
+    taito_x1017: Option<TaitoX1017>,
+    mapper227_latch: u16,
+    mapper246: Option<Mapper246>,
+    mapper236_mode: u8,
+    mapper236_outer_bank: u8,
+    mapper236_chr_ram: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Mirroring {
     Horizontal,
+    HorizontalSwapped,
+    ThreeScreenLower,
     Vertical,
     FourScreen,
     OneScreenLower,
     OneScreenUpper,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mmc1State {
-    pub shift_register: u8,
-    pub shift_count: u8,
-    pub control: u8,
-    pub chr_bank_0: u8,
-    pub chr_bank_1: u8,
-    pub prg_bank: u8,
-    pub prg_ram_disable: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mmc2State {
-    pub prg_bank: u8,
-    pub chr_bank_0_fd: u8,
-    pub chr_bank_0_fe: u8,
-    pub chr_bank_1_fd: u8,
-    pub chr_bank_1_fe: u8,
-    pub latch_0: bool,
-    pub latch_1: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mmc3State {
-    pub bank_select: u8,
-    pub bank_registers: [u8; 8],
-    pub irq_latch: u8,
-    pub irq_counter: u8,
-    pub irq_reload: bool,
-    pub irq_enabled: bool,
-    pub irq_pending: bool,
-    pub prg_ram_enabled: bool,
-    pub prg_ram_write_protect: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Fme7State {
-    pub command: u8,
-    pub chr_banks: [u8; 8],
-    pub prg_banks: [u8; 3],
-    pub prg_bank_6000: u8,
-    pub prg_ram_enabled: bool,
-    pub prg_ram_select: bool,
-    pub irq_counter: u16,
-    pub irq_counter_enabled: bool,
-    pub irq_enabled: bool,
-    pub irq_pending: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BandaiFcgState {
-    pub chr_banks: [u8; 8],
-    pub prg_bank: u8,
-    pub irq_counter: u16,
-    pub irq_latch: u16,
-    pub irq_enabled: bool,
-    pub irq_pending: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mapper34State {
-    pub nina001: bool,
-    pub chr_bank_1: u8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mapper93State {
-    pub chr_ram_enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CartridgeState {
-    pub mapper: u8,
-    pub mirroring: Mirroring,
-    pub prg_bank: u8,
-    pub chr_bank: u8,
-    pub prg_ram: Vec<u8>,
-    pub chr_ram: Vec<u8>,
-    pub has_valid_save_data: bool,
-    pub mmc1: Option<Mmc1State>,
-    pub mmc2: Option<Mmc2State>,
-    #[serde(default)]
-    pub mmc3: Option<Mmc3State>,
-    #[serde(default)]
-    pub fme7: Option<Fme7State>,
-    #[serde(default)]
-    pub bandai_fcg: Option<BandaiFcgState>,
-    #[serde(default)]
-    pub mapper34: Option<Mapper34State>,
-    #[serde(default)]
-    pub mapper93: Option<Mapper93State>,
-}
-
 impl Cartridge {
-    pub fn load(path: &str) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-
-        if &data[0..4] != b"NES\x1a" {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid NES file format",
-            ));
-        }
-
-        let prg_rom_size = data[4] as usize * 16384;
-        let chr_rom_size = data[5] as usize * 8192;
-        let flags6 = data[6];
-        let flags7 = data[7];
-
-        let has_battery = (flags6 & 0x02) != 0;
-        let mapper = (flags7 & 0xF0) | (flags6 >> 4);
-        let mapper34_nina001 = mapper == 34 && chr_rom_size > 8192;
-        let mapper93_chr_ram_enabled = true;
-        let mapper78_hv_mirroring = mapper == 78 && (flags6 & 0x08) != 0;
-
-        let mirroring = if mapper == 78 {
-            if mapper78_hv_mirroring {
-                Mirroring::Horizontal
-            } else {
-                Mirroring::OneScreenLower
-            }
-        } else if flags6 & 0x08 != 0 {
-            Mirroring::FourScreen
-        } else if flags6 & 0x01 != 0 {
-            Mirroring::Vertical
-        } else {
-            Mirroring::Horizontal
-        };
-
-        let prg_rom_start = 16;
-        let chr_rom_start = prg_rom_start + prg_rom_size;
-
-        let prg_rom = data[prg_rom_start..prg_rom_start + prg_rom_size].to_vec();
-        let chr_rom = if chr_rom_size > 0 {
-            data[chr_rom_start..chr_rom_start + chr_rom_size].to_vec()
-        } else {
-            // CHR RAM - initialize with zeros
-            vec![0; 8192]
-        };
-
-        let mmc1 = if mapper == 1 { Some(Mmc1::new()) } else { None };
-        let mmc2 = if mapper == 9 || mapper == 10 {
-            Some(Mmc2::new())
-        } else {
-            None
-        };
-        let mmc3 = if mapper == 4 { Some(Mmc3::new()) } else { None };
-        let fme7 = if mapper == 69 {
-            Some(Fme7::new())
-        } else {
-            None
-        };
-        let bandai_fcg = if mapper == 16 {
-            Some(BandaiFcg::new())
-        } else {
-            None
-        };
-
-        // Initialize PRG-RAM for mappers that support it
-        let prg_ram = if mapper == 16 && has_battery {
-            vec![0xFF; 256]
-        } else if mapper == 1
-            || mapper == 4
-            || mapper34_nina001
-            || mapper == 9
-            || mapper == 10
-            || mapper == 16
-            || mapper == 69
-        {
-            vec![0x00; 8192]
-        } else {
-            Vec::new()
-        };
-
-        let chr_ram = if (mapper == 1 || mapper == 4 || mapper == 10) && chr_rom_size == 0 {
-            vec![0x00; 8192]
-        } else {
-            vec![]
-        };
-
-        let cartridge = Cartridge {
-            prg_rom,
-            chr_rom,
-            chr_ram,
-            prg_ram,
-            has_valid_save_data: false,
-            mapper,
-            mirroring,
-            has_battery,
-            chr_bank: 0,
-            chr_bank_1: 1,
-            prg_bank: 0,
-            mapper34_nina001,
-            mapper93_chr_ram_enabled,
-            mapper78_hv_mirroring,
-            mmc1,
-            mmc2,
-            mmc3,
-            fme7,
-            bandai_fcg,
-        };
-
-        Ok(cartridge)
-    }
-
     pub fn read_prg(&self, addr: u16) -> u8 {
         let rom_addr = addr - 0x8000;
         match self.mapper {
-            0 | 3 | 87 => self.read_prg_nrom(rom_addr),
+            0 | 3 | 13 | 87 | 101 | 184 => self.read_prg_nrom(rom_addr),
             1 => self.read_prg_mmc1(addr, rom_addr),
-            2 | 70 | 71 | 89 | 93 | 152 => self.read_prg_uxrom(addr, rom_addr),
-            34 | 79 | 146 | 148 => self.read_prg_axrom(addr),
-            180 => self.read_prg_uxrom_inverted(addr, rom_addr),
-            4 => self.read_prg_mmc3(addr),
-            7 | 11 | 66 => self.read_prg_axrom(addr),
+            208 => self.read_prg_mapper208(addr),
+            15 => self.read_prg_mapper15(addr),
+            33 => self.read_prg_taito_tc0190(addr),
+            221 => self.read_prg_mapper221(addr),
+            225 | 255 => self.read_prg_mapper225(addr),
+            230 => self.read_prg_mapper230(addr),
+            227 => self.read_prg_mapper227(addr),
+            231 => self.read_prg_mapper231(addr),
+            236 => self.read_prg_mapper236(addr),
+            232 => self.read_prg_mapper232(addr),
+            233 => self.read_prg_mapper233(addr),
+            234 => self.read_prg_mapper234(addr),
+            235 => self.read_prg_mapper235(addr),
+            246 => self.read_prg_mapper246(addr),
+            200 | 203 => self.read_prg_mapper200(addr),
+            202 => self.read_prg_mapper202(addr),
+            212 => self.read_prg_mapper212(addr),
+            226 => self.read_prg_mapper226(addr),
+            228 => self.read_prg_mapper228(addr),
+            242 => self.read_prg_mapper242(addr),
+            2 | 70 | 71 | 72 | 81 | 86 | 89 | 93 | 152 => self.read_prg_uxrom(addr, rom_addr),
+            34 | 38 | 46 | 79 | 113 | 133 | 140 | 144 | 146 | 147 | 148 | 201 | 240 | 241 | 243 => {
+                self.read_prg_axrom(addr)
+            }
+            58 | 213 => self.read_prg_mapper58(addr),
+            229 => self.read_prg_mapper229(addr),
+            92 | 180 => self.read_prg_uxrom_inverted(addr, rom_addr),
+            97 => self.read_prg_fixed_last_switch_high(addr, rom_addr),
+            191 => self.read_prg_mapper191(addr),
+            4 | 74 | 118 | 119 | 192 | 194 | 195 | 250 => self.read_prg_mmc3(addr),
+            245 => self.read_prg_mapper245(addr),
+            68 => self.read_prg_sunsoft4(addr),
+            75 => self.read_prg_vrc1(addr),
+            80 | 207 => self.read_prg_taito_x1005(addr),
+            82 => self.read_prg_taito_x1017(addr),
+            76 | 88 | 95 | 154 | 206 => self.read_prg_namco108(addr),
+            7 | 11 | 66 | 107 => self.read_prg_axrom(addr),
             78 | 94 => self.read_prg_uxrom(addr, rom_addr),
             9 | 10 => self.read_prg_mmc2(addr, rom_addr),
             16 => self.read_prg_bandai(addr),
@@ -261,27 +128,79 @@ impl Cartridge {
         }
     }
 
+    pub fn read_prg_cpu(&mut self, addr: u16) -> u8 {
+        let value = self.read_prg(addr);
+        if self.mapper == 234 {
+            self.apply_mapper234_value(addr, value);
+        }
+        value
+    }
+
     pub fn write_prg(&mut self, addr: u16, data: u8) {
         match self.mapper {
             0 => {}
             1 => self.write_prg_mmc1(addr, data),
+            208 => self.write_prg_mapper208(addr, data),
+            15 => self.write_prg_mapper15(addr, data),
+            33 => self.write_prg_taito_tc0190(addr, data),
+            221 => self.write_prg_mapper221(addr),
             2 => self.write_prg_uxrom(addr, data),
+            225 | 255 => self.write_prg_mapper225(addr, data),
+            230 => self.write_prg_mapper230(addr, data),
+            227 => self.write_prg_mapper227(addr),
+            231 => self.write_prg_mapper231(addr),
+            236 => self.write_prg_mapper236(addr, data),
+            232 => self.write_prg_mapper232(addr, data),
+            233 => self.write_prg_mapper233(addr, data),
+            234 => self.write_prg_mapper234(addr, data),
+            235 => self.write_prg_mapper235(addr, data),
             3 => self.write_prg_cnrom(addr, data),
+            13 => self.write_prg_cprom(addr, data),
             34 if self.mapper34_nina001 => {}
             34 => self.write_prg_bnrom(addr, data),
-            4 => self.write_prg_mmc3(addr, data),
+            46 => self.write_prg_mapper46_inner(addr, data),
+            191 => self.write_prg_mapper191(addr, data),
+            4 | 74 | 118 | 119 | 192 | 194 | 195 | 245 => self.write_prg_mmc3(addr, data),
+            250 => self.write_prg_mapper250(addr, data),
+            58 | 213 => self.write_prg_mapper58(addr),
+            72 | 92 => self.write_prg_mapper72_92(addr, data),
+            68 => self.write_prg_sunsoft4(addr, data),
+            75 => self.write_prg_vrc1(addr, data),
+            76 | 88 | 95 | 154 | 206 => self.write_prg_namco108(addr, data),
             7 => self.write_prg_axrom(addr, data),
+            200 => self.write_prg_mapper200(addr),
+            201 => self.write_prg_mapper201(addr),
+            202 => self.write_prg_mapper202(addr),
+            203 => self.write_prg_mapper203(addr, data),
+            212 => self.write_prg_mapper212(addr),
+            226 => self.write_prg_mapper226(addr, data),
+            228 => self.write_prg_mapper228(addr, data),
+            229 => self.write_prg_mapper229(addr),
+            242 => self.write_prg_mapper242(addr),
+            243 => self.write_prg_mapper243(addr, data),
+            241 => self.write_prg_mapper241(addr, data),
             79 | 146 => self.write_prg_mapper79_146(addr, data),
+            133 => self.write_prg_mapper133(addr, data),
+            113 => self.write_prg_mapper113(addr, data),
+            144 => self.write_prg_mapper144(addr, data),
+            145 => self.write_prg_mapper145(addr, data),
             11 => self.write_prg_color_dreams(addr, data),
             89 => self.write_prg_mapper89(addr, data),
             93 => self.write_prg_mapper93(addr, data),
             70 => self.write_prg_mapper70(addr, data),
             71 => self.write_prg_camerica(addr, data),
+            81 => self.write_prg_mapper81(addr),
+            97 => self.write_prg_mapper97(addr, data),
             78 => self.write_prg_mapper78(addr, data),
+            80 => {}
+            86 => self.write_prg_mapper86(addr, data),
             94 => self.write_prg_mapper94(addr, data),
+            107 => self.write_prg_mapper107(addr, data),
+            147 => self.write_prg_mapper147(addr, data),
             148 => self.write_prg_mapper148(addr, data),
             152 => self.write_prg_mapper152(addr, data),
             180 => self.write_prg_uxrom_inverted(addr, data),
+            240 => self.write_prg_mapper240(addr, data),
             9 | 10 => self.write_prg_mmc2(addr, data),
             16 => self.write_prg_bandai(addr, data),
             66 => self.write_prg_gxrom(addr, data),
@@ -294,14 +213,35 @@ impl Cartridge {
     #[inline]
     pub fn read_chr(&self, addr: u16) -> u8 {
         match self.mapper {
-            0 => self.read_chr_nrom(addr),
+            0 | 97 | 226 | 241 | 242 => self.read_chr_nrom(addr),
             1 => self.read_chr_mmc1(addr),
-            2 | 7 | 71 | 94 | 180 => self.read_chr_uxrom(addr),
+            2 | 7 | 15 | 71 | 94 | 180 | 227 | 230 | 232 | 235 => self.read_chr_uxrom(addr),
+            221 => self.read_chr_mapper221(addr),
+            231 => self.read_chr_mapper231(addr),
+            236 => self.read_chr_mapper236(addr),
+            75 => self.read_chr_vrc1(addr),
+            13 => self.read_chr_cprom(addr),
             34 if self.mapper34_nina001 => self.read_chr_nina001(addr),
+            184 => self.read_chr_split_4k(addr),
+            33 => self.read_chr_taito_tc0190(addr),
             34 => self.read_chr_nrom(addr),
-            3 | 11 | 66 | 70 | 78 | 79 | 89 | 146 | 148 | 152 | 87 => self.read_chr_cnrom(addr),
+            3 | 11 | 38 | 46 | 58 | 66 | 70 | 72 | 78 | 79 | 81 | 86 | 89 | 92 | 101 | 107
+            | 113 | 133 | 140 | 144 | 145 | 146 | 147 | 148 | 152 | 200 | 201 | 202 | 203 | 212
+            | 213 | 225 | 228 | 229 | 233 | 234 | 240 | 243 | 255 | 87 => self.read_chr_cnrom(addr),
             93 => self.read_chr_mapper93(addr),
-            4 => self.read_chr_mmc3(addr),
+            4 | 118 | 208 | 250 => self.read_chr_mmc3(addr),
+            74 => self.read_chr_mapper74(addr),
+            119 => self.read_chr_mapper119(addr),
+            191 => self.read_chr_mapper191(addr),
+            192 => self.read_chr_mapper192(addr),
+            194 => self.read_chr_mapper194(addr),
+            195 => self.read_chr_mapper195(addr),
+            245 => self.read_chr_mapper245(addr),
+            246 => self.read_chr_mapper246(addr),
+            68 => self.read_chr_sunsoft4(addr),
+            80 | 207 => self.read_chr_taito_x1005(addr),
+            82 => self.read_chr_taito_x1017(addr),
+            76 | 88 | 95 | 154 | 206 => self.read_chr_namco108(addr),
             9 | 10 => self.read_chr_mmc2(addr),
             16 => self.read_chr_bandai(addr),
             69 => self.read_chr_fme7(addr),
@@ -322,16 +262,39 @@ impl Cartridge {
 
     pub fn write_chr(&mut self, addr: u16, data: u8) {
         match self.mapper {
-            0 => self.write_chr_nrom(addr, data),
+            0 | 97 | 226 | 241 => self.write_chr_nrom(addr, data),
             1 => self.write_chr_mmc1(addr, data),
-            2 | 7 | 71 | 94 | 180 => self.write_chr_uxrom(addr, data),
+            2 | 7 | 15 | 71 | 94 | 180 | 230 | 232 | 235 => self.write_chr_uxrom(addr, data),
+            221 => self.write_chr_mapper221(addr, data),
+            227 => self.write_chr_mapper227(addr, data),
+            231 => self.write_chr_mapper231(addr, data),
+            236 => self.write_chr_mapper236(addr, data),
+            75 => self.write_chr_vrc1(addr, data),
+            13 => self.write_chr_cprom(addr, data),
             34 if self.mapper34_nina001 => self.write_chr_nina001(addr, data),
+            184 => self.write_chr_split_4k(addr, data),
+            33 => self.write_chr_taito_tc0190(addr, data),
             34 => self.write_chr_nrom(addr, data),
-            3 | 11 | 66 | 70 | 78 | 79 | 89 | 146 | 148 | 152 | 87 => {
+            3 | 11 | 38 | 46 | 58 | 66 | 70 | 72 | 78 | 79 | 81 | 86 | 89 | 92 | 101 | 107
+            | 113 | 133 | 140 | 144 | 145 | 146 | 147 | 148 | 152 | 200 | 201 | 202 | 203 | 212
+            | 213 | 225 | 228 | 229 | 233 | 234 | 240 | 243 | 255 | 87 => {
                 self.write_chr_cnrom(addr, data)
             }
+            242 => self.write_chr_mapper242(addr, data),
             93 => self.write_chr_mapper93(addr, data),
-            4 => self.write_chr_mmc3(addr, data),
+            4 | 118 | 208 | 250 => self.write_chr_mmc3(addr, data),
+            74 => self.write_chr_mapper74(addr, data),
+            119 => self.write_chr_mapper119(addr, data),
+            191 => self.write_chr_mapper191(addr, data),
+            192 => self.write_chr_mapper192(addr, data),
+            194 => self.write_chr_mapper194(addr, data),
+            195 => self.write_chr_mapper195(addr, data),
+            245 => self.write_chr_mapper245(addr, data),
+            68 => self.write_chr_sunsoft4(addr, data),
+            80 | 207 => self.write_chr_taito_x1005(addr, data),
+            82 => self.write_chr_taito_x1017(addr, data),
+            246 => {}
+            76 | 88 | 95 | 154 | 206 => self.write_chr_namco108(addr, data),
             9 | 10 => self.write_chr_mmc2(addr, data),
             16 => self.write_chr_bandai(addr, data),
             69 => self.write_chr_fme7(addr, data),
@@ -344,6 +307,27 @@ impl Cartridge {
     pub fn read_prg_ram(&self, addr: u16) -> u8 {
         match self.mapper {
             1 => self.read_prg_ram_mmc1(addr),
+            15 => self.read_prg_ram_mapper15(addr),
+            80 | 207 => self.read_prg_ram_taito_x1005(addr),
+            82 => self.read_prg_ram_taito_x1017(addr),
+            227 => {
+                let offset = (addr - 0x6000) as usize;
+                if offset < self.prg_ram.len() {
+                    self.prg_ram[offset]
+                } else {
+                    0
+                }
+            }
+            212 => 0x80,
+            246 => self.read_prg_ram_mapper246(addr),
+            241 => {
+                let offset = (addr - 0x6000) as usize;
+                if offset < self.prg_ram.len() {
+                    self.prg_ram[offset]
+                } else {
+                    0
+                }
+            }
             34 if self.mapper34_nina001 => {
                 let offset = (addr - 0x6000) as usize;
                 if offset < self.prg_ram.len() {
@@ -352,7 +336,16 @@ impl Cartridge {
                     0
                 }
             }
-            4 => self.read_prg_ram_mmc3(addr),
+            4 | 74 | 118 | 119 | 192 | 194 | 245 | 250 => self.read_prg_ram_mmc3(addr),
+            68 => self.read_prg_ram_sunsoft4(addr),
+            240 => {
+                let offset = (addr - 0x6000) as usize;
+                if offset < self.prg_ram.len() {
+                    self.prg_ram[offset]
+                } else {
+                    0
+                }
+            }
             9 | 10 => self.read_prg_ram_mmc2(addr),
             16 => self.read_prg_ram_bandai(addr),
             69 => self.read_prg_ram_fme7(addr),
@@ -360,12 +353,51 @@ impl Cartridge {
         }
     }
 
+    pub fn read_prg_low(&self, addr: u16) -> u8 {
+        match self.mapper {
+            208 => self.read_prg_low_mapper208(addr),
+            225 => self.read_prg_low_mapper225(addr),
+            243 => self.read_prg_low_mapper243(addr),
+            _ => 0,
+        }
+    }
+
     pub fn write_prg_ram(&mut self, addr: u16, data: u8) {
         match self.mapper {
+            46 => self.write_prg_mapper46_outer(addr, data),
+            38 => self.write_prg_mapper38(addr, data),
             87 => self.write_prg_mapper87(addr, data),
+            86 => self.write_prg_mapper86(addr, data),
+            101 => self.write_prg_mapper101(addr, data),
+            15 => self.write_prg_ram_mapper15(addr, data),
+            208 => self.write_prg_ram_mapper208(addr, data),
+            80 | 207 => self.write_prg_ram_taito_x1005(addr, data),
+            82 => self.write_prg_ram_taito_x1017(addr, data),
+            140 => self.write_prg_mapper140(addr, data),
             1 => self.write_prg_ram_mmc1(addr, data),
             34 if self.mapper34_nina001 => self.write_prg_ram_nina001(addr, data),
-            4 => self.write_prg_ram_mmc3(addr, data),
+            184 => self.write_prg_mapper184(addr, data),
+            227 => {
+                let offset = (addr - 0x6000) as usize;
+                if offset < self.prg_ram.len() {
+                    self.prg_ram[offset] = data;
+                }
+            }
+            4 | 74 | 118 | 119 | 192 | 194 | 245 | 250 => self.write_prg_ram_mmc3(addr, data),
+            68 => self.write_prg_ram_sunsoft4(addr, data),
+            246 => self.write_prg_ram_mapper246(addr, data),
+            241 => {
+                let offset = (addr - 0x6000) as usize;
+                if offset < self.prg_ram.len() {
+                    self.prg_ram[offset] = data;
+                }
+            }
+            240 => {
+                let offset = (addr - 0x6000) as usize;
+                if offset < self.prg_ram.len() {
+                    self.prg_ram[offset] = data;
+                }
+            }
             9 | 10 => self.write_prg_ram_mmc2(addr, data),
             16 => self.write_prg_ram_bandai(addr, data),
             69 => self.write_prg_ram_fme7(addr, data),
@@ -375,6 +407,15 @@ impl Cartridge {
 
     pub fn mirroring(&self) -> Mirroring {
         self.mirroring
+    }
+
+    pub fn on_reset(&mut self) {
+        if self.mapper == 230 {
+            self.mapper230_contra_mode = !self.mapper230_contra_mode;
+            if self.mapper230_contra_mode {
+                self.mirroring = Mirroring::Vertical;
+            }
+        }
     }
 
     pub fn chr_rom_size(&self) -> usize {
@@ -392,6 +433,16 @@ impl Cartridge {
     pub fn get_prg_bank(&self) -> u8 {
         if let Some(ref mmc1) = self.mmc1 {
             mmc1.prg_bank
+        } else if let Some(ref vrc1) = self.vrc1 {
+            vrc1.prg_banks[0]
+        } else if let Some(ref sunsoft4) = self.sunsoft4 {
+            sunsoft4.prg_bank
+        } else if let Some(ref taito_tc0190) = self.taito_tc0190 {
+            taito_tc0190.prg_banks[0]
+        } else if let Some(ref taito_x1005) = self.taito_x1005 {
+            taito_x1005.prg_banks[0]
+        } else if let Some(ref taito_x1017) = self.taito_x1017 {
+            taito_x1017.prg_banks[0]
         } else {
             self.prg_bank
         }
@@ -400,6 +451,16 @@ impl Cartridge {
     pub fn get_chr_bank(&self) -> u8 {
         if let Some(ref mmc1) = self.mmc1 {
             mmc1.chr_bank_0
+        } else if let Some(ref vrc1) = self.vrc1 {
+            vrc1.chr_bank_0
+        } else if let Some(ref sunsoft4) = self.sunsoft4 {
+            sunsoft4.chr_banks[0]
+        } else if let Some(ref taito_tc0190) = self.taito_tc0190 {
+            taito_tc0190.chr_banks[0]
+        } else if let Some(ref taito_x1005) = self.taito_x1005 {
+            taito_x1005.chr_banks[0]
+        } else if let Some(ref taito_x1017) = self.taito_x1017 {
+            taito_x1017.chr_banks[0]
         } else {
             self.chr_bank
         }
@@ -410,6 +471,21 @@ impl Cartridge {
         if let Some(ref mut mmc1) = self.mmc1 {
             mmc1.prg_bank = bank & 0x0F;
         }
+        if let Some(ref mut vrc1) = self.vrc1 {
+            vrc1.prg_banks[0] = bank & 0x0F;
+        }
+        if let Some(ref mut sunsoft4) = self.sunsoft4 {
+            sunsoft4.prg_bank = bank & 0x0F;
+        }
+        if let Some(ref mut taito_tc0190) = self.taito_tc0190 {
+            taito_tc0190.prg_banks[0] = bank;
+        }
+        if let Some(ref mut taito_x1005) = self.taito_x1005 {
+            taito_x1005.prg_banks[0] = bank;
+        }
+        if let Some(ref mut taito_x1017) = self.taito_x1017 {
+            taito_x1017.prg_banks[0] = bank;
+        }
     }
 
     pub fn set_chr_bank(&mut self, bank: u8) {
@@ -418,6 +494,84 @@ impl Cartridge {
             mmc1.chr_bank_0 = bank;
             mmc1.chr_bank_1 = bank;
         }
+        if let Some(ref mut vrc1) = self.vrc1 {
+            vrc1.chr_bank_0 = bank & 0x1F;
+        }
+        if let Some(ref mut sunsoft4) = self.sunsoft4 {
+            sunsoft4.chr_banks[0] = bank;
+        }
+        if let Some(ref mut taito_tc0190) = self.taito_tc0190 {
+            taito_tc0190.chr_banks[0] = bank;
+        }
+        if let Some(ref mut taito_x1005) = self.taito_x1005 {
+            taito_x1005.chr_banks[0] = bank;
+        }
+        if let Some(ref mut taito_x1017) = self.taito_x1017 {
+            taito_x1017.chr_banks[0] = bank;
+        }
+    }
+
+    pub fn read_nametable_byte(
+        &self,
+        physical_nt: usize,
+        offset: usize,
+        internal: &[[u8; 1024]; 2],
+    ) -> u8 {
+        if offset >= 1024 {
+            return 0;
+        }
+
+        if let Some(sunsoft4) = self.sunsoft4.as_ref() {
+            if sunsoft4.nametable_chr_rom {
+                return self.read_sunsoft4_nametable_chr(physical_nt & 1, offset);
+            }
+        }
+
+        internal[physical_nt & 1][offset]
+    }
+
+    pub fn resolve_nametable(&self, logical_nt: usize) -> Option<usize> {
+        if self.mapper == 118 {
+            if let Some(mmc3) = self.mmc3.as_ref() {
+                let chr_a12_invert = (mmc3.bank_select >> 7) & 1;
+                let physical_nt = if chr_a12_invert == 0 {
+                    match logical_nt & 3 {
+                        0 | 1 => (mmc3.bank_registers[0] >> 7) as usize,
+                        2 | 3 => (mmc3.bank_registers[1] >> 7) as usize,
+                        _ => 0,
+                    }
+                } else {
+                    match logical_nt & 3 {
+                        0 => (mmc3.bank_registers[2] >> 7) as usize,
+                        1 => (mmc3.bank_registers[3] >> 7) as usize,
+                        2 => (mmc3.bank_registers[4] >> 7) as usize,
+                        3 => (mmc3.bank_registers[5] >> 7) as usize,
+                        _ => 0,
+                    }
+                };
+                return Some(physical_nt & 1);
+            }
+        }
+
+        if self.mapper == 207 {
+            if let Some(taito) = self.taito_x1005.as_ref() {
+                let physical_nt = match logical_nt & 3 {
+                    0 | 1 => (taito.chr_banks[0] >> 7) as usize,
+                    2 | 3 => (taito.chr_banks[1] >> 7) as usize,
+                    _ => 0,
+                };
+                return Some(physical_nt & 1);
+            }
+        }
+
+        None
+    }
+
+    pub fn nametable_writes_to_internal_vram(&self) -> bool {
+        self.sunsoft4
+            .as_ref()
+            .map(|sunsoft4| !sunsoft4.nametable_chr_rom)
+            .unwrap_or(true)
     }
 
     pub fn has_battery_save(&self) -> bool {
@@ -456,628 +610,7 @@ impl Cartridge {
             Some(&mut self.prg_ram)
         }
     }
-
-    pub fn snapshot_state(&self) -> CartridgeState {
-        let mmc1 = self.mmc1.as_ref().map(|m| Mmc1State {
-            shift_register: m.shift_register,
-            shift_count: m.shift_count,
-            control: m.control,
-            chr_bank_0: m.chr_bank_0,
-            chr_bank_1: m.chr_bank_1,
-            prg_bank: m.prg_bank,
-            prg_ram_disable: m.prg_ram_disable,
-        });
-
-        let mmc2 = self.mmc2.as_ref().map(|m| Mmc2State {
-            prg_bank: m.prg_bank,
-            chr_bank_0_fd: m.chr_bank_0_fd,
-            chr_bank_0_fe: m.chr_bank_0_fe,
-            chr_bank_1_fd: m.chr_bank_1_fd,
-            chr_bank_1_fe: m.chr_bank_1_fe,
-            latch_0: m.latch_0.get(),
-            latch_1: m.latch_1.get(),
-        });
-
-        let mmc3 = self.mmc3.as_ref().map(|m| Mmc3State {
-            bank_select: m.bank_select,
-            bank_registers: m.bank_registers,
-            irq_latch: m.irq_latch,
-            irq_counter: m.irq_counter,
-            irq_reload: m.irq_reload,
-            irq_enabled: m.irq_enabled,
-            irq_pending: m.irq_pending.get(),
-            prg_ram_enabled: m.prg_ram_enabled,
-            prg_ram_write_protect: m.prg_ram_write_protect,
-        });
-
-        let fme7 = self.fme7.as_ref().map(|f| Fme7State {
-            command: f.command,
-            chr_banks: f.chr_banks,
-            prg_banks: f.prg_banks,
-            prg_bank_6000: f.prg_bank_6000,
-            prg_ram_enabled: f.prg_ram_enabled,
-            prg_ram_select: f.prg_ram_select,
-            irq_counter: f.irq_counter,
-            irq_counter_enabled: f.irq_counter_enabled,
-            irq_enabled: f.irq_enabled,
-            irq_pending: f.irq_pending.get(),
-        });
-
-        let bandai_fcg = self.bandai_fcg.as_ref().map(|b| BandaiFcgState {
-            chr_banks: b.chr_banks,
-            prg_bank: b.prg_bank,
-            irq_counter: b.irq_counter,
-            irq_latch: b.irq_latch,
-            irq_enabled: b.irq_enabled,
-            irq_pending: b.irq_pending.get(),
-        });
-
-        let mapper34 = if self.mapper == 34 {
-            Some(Mapper34State {
-                nina001: self.mapper34_nina001,
-                chr_bank_1: self.chr_bank_1,
-            })
-        } else {
-            None
-        };
-
-        let mapper93 = if self.mapper == 93 {
-            Some(Mapper93State {
-                chr_ram_enabled: self.mapper93_chr_ram_enabled,
-            })
-        } else {
-            None
-        };
-
-        CartridgeState {
-            mapper: self.mapper,
-            mirroring: self.mirroring,
-            prg_bank: self.get_prg_bank(),
-            chr_bank: self.get_chr_bank(),
-            prg_ram: self.prg_ram.clone(),
-            chr_ram: self.chr_ram.clone(),
-            has_valid_save_data: self.has_valid_save_data,
-            mmc1,
-            mmc2,
-            mmc3,
-            fme7,
-            bandai_fcg,
-            mapper34,
-            mapper93,
-        }
-    }
-
-    pub fn restore_state(&mut self, state: &CartridgeState) {
-        if state.mapper != self.mapper {
-            return;
-        }
-
-        self.mirroring = state.mirroring;
-        self.set_prg_bank(state.prg_bank);
-        self.set_chr_bank(state.chr_bank);
-        if let Some(saved) = state.mapper34.as_ref() {
-            self.mapper34_nina001 = saved.nina001;
-            self.chr_bank_1 = saved.chr_bank_1;
-        }
-        if let Some(saved) = state.mapper93.as_ref() {
-            self.mapper93_chr_ram_enabled = saved.chr_ram_enabled;
-        }
-        self.has_valid_save_data = state.has_valid_save_data;
-
-        let prg_len = self.prg_ram.len().min(state.prg_ram.len());
-        if prg_len > 0 {
-            self.prg_ram[..prg_len].copy_from_slice(&state.prg_ram[..prg_len]);
-        }
-
-        let chr_len = self.chr_ram.len().min(state.chr_ram.len());
-        if chr_len > 0 {
-            self.chr_ram[..chr_len].copy_from_slice(&state.chr_ram[..chr_len]);
-        }
-
-        if let (Some(ref mut mmc1), Some(saved)) = (self.mmc1.as_mut(), state.mmc1.as_ref()) {
-            mmc1.shift_register = saved.shift_register;
-            mmc1.shift_count = saved.shift_count;
-            mmc1.control = saved.control;
-            mmc1.chr_bank_0 = saved.chr_bank_0;
-            mmc1.chr_bank_1 = saved.chr_bank_1;
-            mmc1.prg_bank = saved.prg_bank;
-            mmc1.prg_ram_disable = saved.prg_ram_disable;
-        }
-
-        if let (Some(ref mut mmc2), Some(saved)) = (self.mmc2.as_mut(), state.mmc2.as_ref()) {
-            mmc2.prg_bank = saved.prg_bank;
-            mmc2.chr_bank_0_fd = saved.chr_bank_0_fd;
-            mmc2.chr_bank_0_fe = saved.chr_bank_0_fe;
-            mmc2.chr_bank_1_fd = saved.chr_bank_1_fd;
-            mmc2.chr_bank_1_fe = saved.chr_bank_1_fe;
-            mmc2.latch_0.set(saved.latch_0);
-            mmc2.latch_1.set(saved.latch_1);
-        }
-
-        if let (Some(ref mut mmc3), Some(saved)) = (self.mmc3.as_mut(), state.mmc3.as_ref()) {
-            mmc3.bank_select = saved.bank_select;
-            mmc3.bank_registers = saved.bank_registers;
-            mmc3.irq_latch = saved.irq_latch;
-            mmc3.irq_counter = saved.irq_counter;
-            mmc3.irq_reload = saved.irq_reload;
-            mmc3.irq_enabled = saved.irq_enabled;
-            mmc3.irq_pending.set(saved.irq_pending);
-            mmc3.prg_ram_enabled = saved.prg_ram_enabled;
-            mmc3.prg_ram_write_protect = saved.prg_ram_write_protect;
-        }
-
-        if let (Some(ref mut fme7), Some(saved)) = (self.fme7.as_mut(), state.fme7.as_ref()) {
-            fme7.command = saved.command;
-            fme7.chr_banks = saved.chr_banks;
-            fme7.prg_banks = saved.prg_banks;
-            fme7.prg_bank_6000 = saved.prg_bank_6000;
-            fme7.prg_ram_enabled = saved.prg_ram_enabled;
-            fme7.prg_ram_select = saved.prg_ram_select;
-            fme7.irq_counter = saved.irq_counter;
-            fme7.irq_counter_enabled = saved.irq_counter_enabled;
-            fme7.irq_enabled = saved.irq_enabled;
-            fme7.irq_pending.set(saved.irq_pending);
-        }
-
-        if let (Some(ref mut bandai), Some(saved)) =
-            (self.bandai_fcg.as_mut(), state.bandai_fcg.as_ref())
-        {
-            bandai.chr_banks = saved.chr_banks;
-            bandai.prg_bank = saved.prg_bank;
-            bandai.irq_counter = saved.irq_counter;
-            bandai.irq_latch = saved.irq_latch;
-            bandai.irq_enabled = saved.irq_enabled;
-            bandai.irq_pending.set(saved.irq_pending);
-        }
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_mmc1_cart() -> Cartridge {
-        Cartridge {
-            prg_rom: vec![0; 0x8000],
-            chr_rom: vec![0; 0x2000],
-            chr_ram: vec![0; 0x2000],
-            prg_ram: vec![0; 0x2000],
-            has_valid_save_data: true,
-            mapper: 1,
-            mirroring: Mirroring::Vertical,
-            has_battery: true,
-            chr_bank: 0,
-            chr_bank_1: 1,
-            prg_bank: 0,
-            mapper34_nina001: false,
-            mapper93_chr_ram_enabled: true,
-            mapper78_hv_mirroring: false,
-            mmc1: Some(Mmc1::new()),
-            mmc2: None,
-            mmc3: None,
-            fme7: None,
-            bandai_fcg: None,
-        }
-    }
-
-    fn make_simple_bank_cart(mapper: u8, prg_banks_32k: usize, chr_banks_8k: usize) -> Cartridge {
-        let mut prg_rom = vec![0; prg_banks_32k * 0x8000];
-        for bank in 0..prg_banks_32k {
-            let fill = bank as u8;
-            prg_rom[bank * 0x8000..(bank + 1) * 0x8000].fill(fill);
-        }
-
-        let mut chr_rom = vec![0; chr_banks_8k * 0x2000];
-        for bank in 0..chr_banks_8k {
-            let fill = 0x40 | bank as u8;
-            chr_rom[bank * 0x2000..(bank + 1) * 0x2000].fill(fill);
-        }
-
-        Cartridge {
-            prg_rom,
-            chr_rom,
-            chr_ram: vec![],
-            prg_ram: vec![],
-            has_valid_save_data: false,
-            mapper,
-            mirroring: Mirroring::Horizontal,
-            has_battery: false,
-            chr_bank: 0,
-            chr_bank_1: 1,
-            prg_bank: 0,
-            mapper34_nina001: false,
-            mapper93_chr_ram_enabled: true,
-            mapper78_hv_mirroring: false,
-            mmc1: None,
-            mmc2: None,
-            mmc3: None,
-            fme7: None,
-            bandai_fcg: None,
-        }
-    }
-
-    fn make_camerica_cart() -> Cartridge {
-        let mut prg_rom = vec![0; 8 * 0x4000];
-        for bank in 0..8 {
-            prg_rom[bank * 0x4000..(bank + 1) * 0x4000].fill(bank as u8);
-        }
-
-        Cartridge {
-            prg_rom,
-            chr_rom: vec![0; 0x2000],
-            chr_ram: vec![],
-            prg_ram: vec![],
-            has_valid_save_data: false,
-            mapper: 71,
-            mirroring: Mirroring::Horizontal,
-            has_battery: false,
-            chr_bank: 0,
-            chr_bank_1: 1,
-            prg_bank: 0,
-            mapper34_nina001: false,
-            mapper93_chr_ram_enabled: true,
-            mapper78_hv_mirroring: false,
-            mmc1: None,
-            mmc2: None,
-            mmc3: None,
-            fme7: None,
-            bandai_fcg: None,
-        }
-    }
-
-    fn make_uxrom_like_cart(mapper: u8, prg_banks_16k: usize, chr_banks_8k: usize) -> Cartridge {
-        let mut prg_rom = vec![0; prg_banks_16k * 0x4000];
-        for bank in 0..prg_banks_16k {
-            prg_rom[bank * 0x4000..(bank + 1) * 0x4000].fill(bank as u8);
-        }
-
-        let mut chr_rom = vec![0; chr_banks_8k * 0x2000];
-        for bank in 0..chr_banks_8k {
-            chr_rom[bank * 0x2000..(bank + 1) * 0x2000].fill(0x70 | bank as u8);
-        }
-
-        Cartridge {
-            prg_rom,
-            chr_rom,
-            chr_ram: vec![],
-            prg_ram: vec![],
-            has_valid_save_data: false,
-            mapper,
-            mirroring: Mirroring::Horizontal,
-            has_battery: false,
-            chr_bank: 0,
-            chr_bank_1: 1,
-            prg_bank: 0,
-            mapper34_nina001: false,
-            mapper93_chr_ram_enabled: true,
-            mapper78_hv_mirroring: false,
-            mmc1: None,
-            mmc2: None,
-            mmc3: None,
-            fme7: None,
-            bandai_fcg: None,
-        }
-    }
-
-    fn make_mapper78_cart(hv_mirroring: bool) -> Cartridge {
-        let mut cart = make_uxrom_like_cart(78, 8, 16);
-        cart.mapper78_hv_mirroring = hv_mirroring;
-        cart.mirroring = if hv_mirroring {
-            Mirroring::Horizontal
-        } else {
-            Mirroring::OneScreenLower
-        };
-        cart
-    }
-
-    fn make_nina001_cart() -> Cartridge {
-        let mut prg_rom = vec![0; 4 * 0x8000];
-        for bank in 0..4 {
-            prg_rom[bank * 0x8000..(bank + 1) * 0x8000].fill(bank as u8);
-        }
-
-        let mut chr_rom = vec![0; 4 * 0x1000];
-        for bank in 0..4 {
-            chr_rom[bank * 0x1000..(bank + 1) * 0x1000].fill(0x50 | bank as u8);
-        }
-
-        Cartridge {
-            prg_rom,
-            chr_rom,
-            chr_ram: vec![],
-            prg_ram: vec![0; 0x2000],
-            has_valid_save_data: false,
-            mapper: 34,
-            mirroring: Mirroring::Horizontal,
-            has_battery: false,
-            chr_bank: 0,
-            chr_bank_1: 1,
-            prg_bank: 0,
-            mapper34_nina001: true,
-            mapper93_chr_ram_enabled: true,
-            mapper78_hv_mirroring: false,
-            mmc1: None,
-            mmc2: None,
-            mmc3: None,
-            fme7: None,
-            bandai_fcg: None,
-        }
-    }
-
-    #[test]
-    fn snapshot_and_restore_keeps_mmc1_and_ram_state() {
-        let mut cart = make_mmc1_cart();
-        {
-            let mmc1 = cart.mmc1.as_mut().unwrap();
-            mmc1.shift_register = 0x1B;
-            mmc1.shift_count = 3;
-            mmc1.control = 0x12;
-            mmc1.chr_bank_0 = 7;
-            mmc1.chr_bank_1 = 9;
-            mmc1.prg_bank = 5;
-            mmc1.prg_ram_disable = true;
-        }
-        cart.prg_ram[0x10] = 0xAA;
-        cart.chr_ram[0x20] = 0x55;
-
-        let snapshot = cart.snapshot_state();
-
-        cart.mirroring = Mirroring::Horizontal;
-        cart.has_valid_save_data = false;
-        cart.prg_ram.fill(0);
-        cart.chr_ram.fill(0);
-        {
-            let mmc1 = cart.mmc1.as_mut().unwrap();
-            mmc1.shift_register = 0x10;
-            mmc1.shift_count = 0;
-            mmc1.control = 0x0C;
-            mmc1.chr_bank_0 = 0;
-            mmc1.chr_bank_1 = 0;
-            mmc1.prg_bank = 0;
-            mmc1.prg_ram_disable = false;
-        }
-
-        cart.restore_state(&snapshot);
-
-        assert_eq!(cart.mirroring, Mirroring::Vertical);
-        assert!(cart.has_valid_save_data);
-        assert_eq!(cart.prg_ram[0x10], 0xAA);
-        assert_eq!(cart.chr_ram[0x20], 0x55);
-
-        let mmc1 = cart.mmc1.as_ref().unwrap();
-        assert_eq!(mmc1.shift_register, 0x1B);
-        assert_eq!(mmc1.shift_count, 3);
-        assert_eq!(mmc1.control, 0x12);
-        assert_eq!(mmc1.chr_bank_0, 7);
-        assert_eq!(mmc1.chr_bank_1, 9);
-        assert_eq!(mmc1.prg_bank, 5);
-        assert!(mmc1.prg_ram_disable);
-    }
-
-    #[test]
-    fn restore_state_ignores_mapper_mismatch() {
-        let mut cart = make_mmc1_cart();
-        let mut state = cart.snapshot_state();
-        state.mapper = 2;
-
-        cart.prg_ram[0] = 0x11;
-        cart.restore_state(&state);
-        assert_eq!(cart.prg_ram[0], 0x11);
-    }
-
-    #[test]
-    fn mapper_11_switches_prg_and_chr_banks() {
-        let mut cart = make_simple_bank_cart(11, 4, 16);
-
-        cart.write_prg(0x8000, 0xA1);
-
-        assert_eq!(cart.read_prg(0x8000), 1);
-        assert_eq!(cart.read_prg(0xFFFF), 1);
-        assert_eq!(cart.read_chr(0x0000), 0x4A);
-        assert_eq!(cart.read_chr(0x1FFF), 0x4A);
-    }
-
-    #[test]
-    fn mapper_66_switches_prg_and_chr_banks() {
-        let mut cart = make_simple_bank_cart(66, 4, 4);
-
-        cart.write_prg(0x8000, 0x32);
-
-        assert_eq!(cart.read_prg(0x8000), 3);
-        assert_eq!(cart.read_prg(0xBFFF), 3);
-        assert_eq!(cart.read_chr(0x0000), 0x42);
-        assert_eq!(cart.read_chr(0x1FFF), 0x42);
-    }
-
-    #[test]
-    fn mapper_34_bnrom_switches_32k_prg_bank() {
-        let mut cart = make_simple_bank_cart(34, 4, 1);
-        cart.prg_rom[0] = 0xFF;
-
-        cart.write_prg(0x8000, 0x02);
-
-        assert_eq!(cart.read_prg(0x8000), 2);
-        assert_eq!(cart.read_prg(0xFFFF), 2);
-        assert_eq!(cart.read_chr(0x0000), 0x40);
-    }
-
-    #[test]
-    fn mapper_34_nina001_switches_prg_and_chr_halves() {
-        let mut cart = make_nina001_cart();
-
-        cart.write_prg_ram(0x7FFD, 0x03);
-        cart.write_prg_ram(0x7FFE, 0x01);
-        cart.write_prg_ram(0x7FFF, 0x02);
-
-        assert_eq!(cart.read_prg(0x8000), 3);
-        assert_eq!(cart.read_prg_ram(0x7FFD), 0x03);
-        assert_eq!(cart.read_chr(0x0000), 0x51);
-        assert_eq!(cart.read_chr(0x1000), 0x52);
-
-        let snapshot = cart.snapshot_state();
-        cart.prg_bank = 0;
-        cart.chr_bank = 0;
-        cart.chr_bank_1 = 1;
-        cart.restore_state(&snapshot);
-
-        assert_eq!(cart.prg_bank, 3);
-        assert_eq!(cart.chr_bank, 1);
-        assert_eq!(cart.chr_bank_1, 2);
-    }
-
-    #[test]
-    fn mapper_71_switches_low_prg_bank_and_mirroring() {
-        let mut cart = make_camerica_cart();
-
-        cart.write_prg(0xC000, 0x03);
-        cart.write_prg(0x9000, 0x10);
-
-        assert_eq!(cart.read_prg(0x8000), 3);
-        assert_eq!(cart.read_prg(0xBFFF), 3);
-        assert_eq!(cart.read_prg(0xC000), 7);
-        assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
-    }
-
-    #[test]
-    fn mapper_79_switches_32k_prg_and_chr_banks_via_low_address_latch() {
-        let mut cart = make_simple_bank_cart(79, 2, 8);
-
-        cart.write_prg(0x4100, 0x0B);
-
-        assert_eq!(cart.read_prg(0x8000), 1);
-        assert_eq!(cart.read_prg(0xFFFF), 1);
-        assert_eq!(cart.read_chr(0x0000), 0x43);
-    }
-
-    #[test]
-    fn mapper_78_switches_prg_chr_and_one_screen_mirroring() {
-        let mut cart = make_mapper78_cart(false);
-        cart.prg_rom[0] = 0xFF;
-
-        cart.write_prg(0x8000, 0x9A);
-
-        assert_eq!(cart.read_prg(0x8000), 2);
-        assert_eq!(cart.read_prg(0xC000), 7);
-        assert_eq!(cart.read_chr(0x0000), 0x79);
-        assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
-    }
-
-    #[test]
-    fn mapper_78_header_variant_uses_horizontal_vertical_mirroring() {
-        let mut cart = make_mapper78_cart(true);
-        cart.prg_rom[0] = 0xFF;
-
-        cart.write_prg(0x8000, 0x08);
-        assert_eq!(cart.mirroring(), Mirroring::Vertical);
-
-        cart.write_prg(0x8000, 0x00);
-        assert_eq!(cart.mirroring(), Mirroring::Horizontal);
-    }
-
-    #[test]
-    fn mapper_94_switches_prg_bank_from_upper_bits() {
-        let mut cart = make_uxrom_like_cart(94, 8, 1);
-        cart.prg_rom[0] = 0xFF;
-
-        cart.write_prg(0x8000, 0x14);
-
-        assert_eq!(cart.read_prg(0x8000), 5);
-        assert_eq!(cart.read_prg(0xC000), 7);
-        assert_eq!(cart.read_chr(0x0000), 0x70);
-    }
-
-    #[test]
-    fn mapper_89_switches_prg_chr_and_one_screen_mirroring() {
-        let mut cart = make_uxrom_like_cart(89, 8, 16);
-        cart.prg_rom[0] = 0xFF;
-
-        cart.write_prg(0x8000, 0x9D);
-
-        assert_eq!(cart.read_prg(0x8000), 1);
-        assert_eq!(cart.read_prg(0xC000), 7);
-        assert_eq!(cart.read_chr(0x0000), 0x7D);
-        assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
-    }
-
-    #[test]
-    fn mapper_93_switches_prg_and_restores_chr_ram_enable_state() {
-        let mut cart = make_uxrom_like_cart(93, 8, 1);
-        cart.prg_rom[0] = 0xFF;
-
-        cart.write_chr(0x0010, 0x44);
-        assert_eq!(cart.read_chr(0x0010), 0x44);
-
-        cart.write_prg(0x8000, 0x20);
-        assert_eq!(cart.read_prg(0x8000), 2);
-        assert_eq!(cart.read_chr(0x0010), 0xFF);
-
-        let snapshot = cart.snapshot_state();
-
-        cart.write_prg(0xC000, 0x21);
-        assert_eq!(cart.read_chr(0x0010), 0x44);
-
-        cart.restore_state(&snapshot);
-        assert_eq!(cart.read_chr(0x0010), 0xFF);
-    }
-
-    #[test]
-    fn mapper_70_switches_prg_and_chr_banks() {
-        let mut cart = make_uxrom_like_cart(70, 8, 16);
-        cart.prg_rom[0] = 0xFF;
-
-        cart.write_prg(0x8000, 0x21);
-
-        assert_eq!(cart.read_prg(0x8000), 2);
-        assert_eq!(cart.read_prg(0xC000), 7);
-        assert_eq!(cart.read_chr(0x0000), 0x71);
-        assert_eq!(cart.mirroring(), Mirroring::Horizontal);
-    }
-
-    #[test]
-    fn mapper_152_switches_prg_chr_and_mirroring() {
-        let mut cart = make_uxrom_like_cart(152, 8, 16);
-        cart.prg_rom[0] = 0xFF;
-
-        cart.write_prg(0x8000, 0xB2);
-
-        assert_eq!(cart.read_prg(0x8000), 3);
-        assert_eq!(cart.read_prg(0xC000), 7);
-        assert_eq!(cart.read_chr(0x0000), 0x72);
-        assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
-    }
-
-    #[test]
-    fn mapper_146_matches_mapper_79_latch_layout() {
-        let mut cart = make_simple_bank_cart(146, 2, 8);
-
-        cart.write_prg(0x5F00, 0x0C);
-
-        assert_eq!(cart.read_prg(0x8000), 1);
-        assert_eq!(cart.read_chr(0x0000), 0x44);
-    }
-
-    #[test]
-    fn mapper_148_switches_32k_prg_and_chr_banks_with_bus_conflicts() {
-        let mut cart = make_simple_bank_cart(148, 2, 8);
-        cart.prg_rom[0] = 0x09;
-
-        cart.write_prg(0x8000, 0x0B);
-
-        assert_eq!(cart.read_prg(0x8000), 1);
-        assert_eq!(cart.read_prg(0xFFFF), 1);
-        assert_eq!(cart.read_chr(0x0000), 0x41);
-    }
-
-    #[test]
-    fn mapper_180_switches_upper_prg_bank_only() {
-        let mut cart = make_uxrom_like_cart(180, 8, 1);
-        cart.prg_rom[1] = 0xFF;
-
-        cart.write_prg(0xC001, 0x03);
-
-        assert_eq!(cart.read_prg(0x8000), 0);
-        assert_eq!(cart.read_prg(0xBFFF), 0);
-        assert_eq!(cart.read_prg(0xC000), 3);
-        assert_eq!(cart.read_prg(0xFFFF), 3);
-    }
-}
+mod tests;

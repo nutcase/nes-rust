@@ -491,6 +491,9 @@ impl Ppu {
         cartridge: Option<&crate::cartridge::Cartridge>,
     ) -> usize {
         if let Some(cart) = cartridge {
+            if let Some(table) = cart.resolve_nametable(logical_nt) {
+                return table;
+            }
             match cart.mirroring() {
                 crate::cartridge::Mirroring::Vertical => match logical_nt & 3 {
                     0 | 2 => 0,
@@ -502,12 +505,40 @@ impl Ppu {
                     2 | 3 => 1,
                     _ => 0,
                 },
+                crate::cartridge::Mirroring::HorizontalSwapped => match logical_nt & 3 {
+                    0 | 1 => 1,
+                    2 | 3 => 0,
+                    _ => 0,
+                },
+                crate::cartridge::Mirroring::ThreeScreenLower => match logical_nt & 3 {
+                    0 | 1 | 2 => 0,
+                    3 => 1,
+                    _ => 0,
+                },
                 crate::cartridge::Mirroring::FourScreen => logical_nt & 1,
                 crate::cartridge::Mirroring::OneScreenLower => 0,
                 crate::cartridge::Mirroring::OneScreenUpper => 1,
             }
         } else {
             logical_nt & 1
+        }
+    }
+
+    #[inline]
+    fn read_nametable_byte(
+        &self,
+        physical_nt: usize,
+        offset: usize,
+        cartridge: Option<&crate::cartridge::Cartridge>,
+    ) -> u8 {
+        if offset >= 1024 {
+            return 0;
+        }
+
+        if let Some(cart) = cartridge {
+            cart.read_nametable_byte(physical_nt, offset, &self.nametable)
+        } else {
+            self.nametable[physical_nt & 1][offset]
         }
     }
 
@@ -585,11 +616,7 @@ impl Ppu {
 
                 let physical_nt = self.cached_nt_map[tile_nt & 3] as usize;
                 let nt_addr = coarse_y * 32 + tile_cx;
-                let tile_id = if nt_addr < 1024 {
-                    self.nametable[physical_nt][nt_addr]
-                } else {
-                    0
-                };
+                let tile_id = self.read_nametable_byte(physical_nt, nt_addr, cartridge);
 
                 let pattern_table = if self.control.contains(PpuControl::BG_PATTERN) {
                     0x1000u16
@@ -624,11 +651,8 @@ impl Ppu {
                         let attr_x = tile_cx >> 2;
                         let attr_y = coarse_y >> 2;
                         let attr_offset = 960 + (attr_y << 3) + attr_x;
-                        let attr_byte = if attr_offset < 1024 {
-                            self.nametable[physical_nt][attr_offset]
-                        } else {
-                            0
-                        };
+                        let attr_byte =
+                            self.read_nametable_byte(physical_nt, attr_offset, cartridge);
 
                         let block_x = (tile_cx & 3) >> 1;
                         let block_y = (coarse_y & 3) >> 1;
@@ -711,6 +735,8 @@ impl Ppu {
             match cart.mirroring() {
                 crate::cartridge::Mirroring::Vertical => self.cached_nt_map = [0, 1, 0, 1],
                 crate::cartridge::Mirroring::Horizontal => self.cached_nt_map = [0, 0, 1, 1],
+                crate::cartridge::Mirroring::HorizontalSwapped => self.cached_nt_map = [1, 1, 0, 0],
+                crate::cartridge::Mirroring::ThreeScreenLower => self.cached_nt_map = [0, 0, 0, 1],
                 crate::cartridge::Mirroring::FourScreen => self.cached_nt_map = [0, 1, 0, 1],
                 crate::cartridge::Mirroring::OneScreenLower => self.cached_nt_map = [0, 0, 0, 0],
                 crate::cartridge::Mirroring::OneScreenUpper => self.cached_nt_map = [1, 1, 1, 1],
@@ -858,7 +884,7 @@ impl Ppu {
         let physical_nt = self.resolve_nametable(logical_nt, cartridge);
         let nt_addr = coarse_y * 32 + coarse_x;
         if nt_addr < 1024 {
-            let tile_id = self.nametable[physical_nt][nt_addr];
+            let tile_id = self.read_nametable_byte(physical_nt, nt_addr, cartridge);
             let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
             if tile_addr < 0x2000 {
                 cart.read_chr(tile_addr);
@@ -875,7 +901,7 @@ impl Ppu {
         let next_physical = self.resolve_nametable(next_nt, cartridge);
         let next_nt_addr = coarse_y * 32 + next_cx;
         if next_nt_addr < 1024 {
-            let tile_id = self.nametable[next_physical][next_nt_addr];
+            let tile_id = self.read_nametable_byte(next_physical, next_nt_addr, cartridge);
             let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
             if tile_addr < 0x2000 {
                 cart.read_chr(tile_addr);
@@ -909,7 +935,7 @@ impl Ppu {
             let physical_nt = self.resolve_nametable(logical_nt, cartridge);
             let nt_addr = coarse_y * 32 + coarse_x;
             if nt_addr < 1024 {
-                let tile_id = self.nametable[physical_nt][nt_addr];
+                let tile_id = self.read_nametable_byte(physical_nt, nt_addr, cartridge);
                 let tile_addr = pattern_table + (tile_id as u16 * 16) + fine_y;
                 if tile_addr < 0x2000 {
                     cart.read_chr(tile_addr);
@@ -963,11 +989,7 @@ impl Ppu {
                         let logical_nt = (offset_in_nt >> 10) & 3;
                         let table = self.resolve_nametable(logical_nt, cartridge);
                         let offset = offset_in_nt & 0x3FF;
-                        self.read_buffer = if offset < 1024 {
-                            self.nametable[table][offset]
-                        } else {
-                            0
-                        };
+                        self.read_buffer = self.read_nametable_byte(table, offset, cartridge);
                     }
                     self.palette[mirrored_addr]
                 } else {
@@ -986,11 +1008,7 @@ impl Ppu {
                         let logical_nt = (addr >> 10) & 3;
                         let table = self.resolve_nametable(logical_nt, cartridge);
                         let offset = addr & 0x3FF;
-                        self.read_buffer = if offset < 1024 {
-                            self.nametable[table][offset]
-                        } else {
-                            0
-                        };
+                        self.read_buffer = self.read_nametable_byte(table, offset, cartridge);
                     } else if effective_v < 0x2000 {
                         // CHR-ROM/CHR-RAM read
                         if let Some(cart) = cartridge {
@@ -1097,27 +1115,14 @@ impl Ppu {
                     let offset = addr & 0x3FF;
 
                     if offset < 1024 {
-                        let physical_nt = if let Some(cart) = cartridge {
-                            match cart.mirroring() {
-                                crate::cartridge::Mirroring::Vertical => match nt_index {
-                                    0 | 2 => 0,
-                                    1 | 3 => 1,
-                                    _ => 0,
-                                },
-                                crate::cartridge::Mirroring::Horizontal => match nt_index {
-                                    0 | 1 => 0,
-                                    2 | 3 => 1,
-                                    _ => 0,
-                                },
-                                crate::cartridge::Mirroring::FourScreen => nt_index & 1,
-                                crate::cartridge::Mirroring::OneScreenLower => 0,
-                                crate::cartridge::Mirroring::OneScreenUpper => 1,
-                            }
-                        } else {
-                            nt_index & 1
-                        };
+                        let physical_nt = self.resolve_nametable(nt_index, cartridge);
 
-                        self.nametable[physical_nt][offset] = data;
+                        if cartridge
+                            .map(|cart| cart.nametable_writes_to_internal_vram())
+                            .unwrap_or(true)
+                        {
+                            self.nametable[physical_nt][offset] = data;
+                        }
                     }
                 } else if write_v < 0x2000 {
                     // CHR write (for CHR RAM)

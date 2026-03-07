@@ -22,6 +22,8 @@ impl TestBus {
 }
 
 impl CpuBus for TestBus {
+    fn on_reset(&mut self) {}
+
     fn read(&mut self, addr: u16) -> u8 {
         self.memory[addr as usize]
     }

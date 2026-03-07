@@ -247,6 +247,12 @@ impl Bus {
 }
 
 impl CpuBus for Bus {
+    fn on_reset(&mut self) {
+        if let Some(ref mut cartridge) = self.cartridge {
+            cartridge.on_reset();
+        }
+    }
+
     fn read(&mut self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x1FFF => self.memory.read(addr),
@@ -257,6 +263,13 @@ impl CpuBus for Bus {
             0x4000..=0x4013 | 0x4015 => self.apu.read_register(addr),
             0x4016 => self.read_controller(),
             0x4017 => 0,
+            0x4020..=0x5FFF => {
+                if let Some(ref cartridge) = self.cartridge {
+                    cartridge.read_prg_low(addr)
+                } else {
+                    0
+                }
+            }
             0x6000..=0x7FFF => {
                 if let Some(ref cartridge) = self.cartridge {
                     cartridge.read_prg_ram(addr)
@@ -265,8 +278,8 @@ impl CpuBus for Bus {
                 }
             }
             0x8000..=0xFFFF => {
-                if let Some(ref cartridge) = self.cartridge {
-                    cartridge.read_prg(addr)
+                if let Some(ref mut cartridge) = self.cartridge {
+                    cartridge.read_prg_cpu(addr)
                 } else {
                     0
                 }
@@ -310,8 +323,8 @@ impl CpuBus for Bus {
                             }
                         }
                         0x8000..=0xFFFF => {
-                            if let Some(ref cartridge) = self.cartridge {
-                                cartridge.read_prg(src)
+                            if let Some(ref mut cartridge) = self.cartridge {
+                                cartridge.read_prg_cpu(src)
                             } else {
                                 0
                             }
