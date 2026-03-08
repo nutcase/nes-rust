@@ -1,82 +1,78 @@
-# NES Emulator
+# NES Emulator (Rust)
 
-A cycle-accurate NES (Nintendo Entertainment System / Famicom) emulator written in Rust.
+Rust implementation of a Nintendo Entertainment System / Famicom emulator (6502 + PPU + APU + mapper layer).
 
-## Features
+Current focus is compatibility-first execution with broad mapper coverage, SDL front-ends, save states, and cheat/debug tooling for rapid iteration.
 
-- Cycle-accurate CPU (6502) and PPU emulation
-- Audio support with pulse, triangle, noise, and DMC channels
-- Multiple mapper support (138 mapper IDs including MMC1/MMC3/MMC5/FME-7, Namco 163/175/340, Jaleco SS 88006, Bandai FCG, Irem G-101/H-3001, Sachen boards, Sunsoft boards, Taito boards, VRC1/VRC2/VRC3/VRC4/VRC6, and multicart boards)
-- Save states (4 slots)
-- Battery-backed SRAM persistence
-- SDL2-based graphics and audio
-- Cheat tool with memory search, hex viewer, and egui side panel
+## Implemented
+- 6502 CPU core with official opcodes, broad unofficial opcode coverage, IRQ/NMI handling, and JAM/KIL halt behaviour.
+- PPU background + sprite rendering pipeline, sprite 0 hit / overflow, odd-frame timing, mirroring control, and mapper-driven nametable routing.
+- APU pulse/triangle/noise/DMC path plus cartridge expansion audio currently used by Sunsoft 5B, Namco 163, and VRC6 boards.
+- Cartridge loader with battery-backed SRAM, save-state integration, and support for 138 iNES mapper IDs.
+- Plain SDL front-end (`cargo run --`) and cheat-panel front-end (`./run.sh` or `cargo run --example nes_emulator --features cheat-ui`).
+- Headless frame runner for scripted capture/regression work (`headless_test`).
 
-## Requirements
-
-- Rust (2021 edition)
-- SDL2 library
-
-### macOS (Homebrew)
-
+## Quick Start
+Preferred launcher:
 ```bash
-brew install sdl2
+./run.sh
+./run.sh "roms/<game>.nes"
 ```
 
-### Ubuntu/Debian
-
+Direct CLI:
 ```bash
+cargo run -- roms/<game>.nes
+cargo run --example nes_emulator --features cheat-ui -- roms/<game>.nes
+cargo run --bin headless_test -- roms/<game>.nes --frames 120 --capture 0
+```
+
+- If no ROM path is provided, both SDL front-ends scan `roms/` and show a selector.
+- SRAM saves are written as `<rom>.sav` next to the ROM.
+- Save states are written under `states/<rom_stem>.slotN.sav`.
+- Cheat files are written under `cheats/<rom_stem>.json` when using the cheat UI.
+
+## SDL Front-Ends
+Plain SDL (`cargo run --`):
+- D-pad: arrow keys
+- A / B: `Z` / `X`
+- Start / Select: `Enter` / `Space`
+- Save state: `Ctrl + 1..4`
+- Load state: `1..4`
+
+Cheat UI (`./run.sh` or `cargo run --example nes_emulator --features cheat-ui`):
+- Same game controls and save/load hotkeys as the plain SDL front-end
+- Toggle cheat panel: `Tab`
+- Tabs: `Hex Viewer`, `Cheat Search`
+- Pause emulation: panel checkbox
+- The cheat panel accepts ASCII text input only; IME composition is intentionally disabled while it is focused
+
+## Build Notes
+- SDL2 is required.
+- On macOS, `.cargo/config.toml` adds Homebrew library search paths for `/opt/homebrew/lib` and `/usr/local/lib`.
+- `run.sh` also exports Homebrew include/library paths and builds the `cheat-ui` example before launch.
+
+Install SDL2:
+```bash
+brew install sdl2
 sudo apt-get install libsdl2-dev
 ```
 
-## Building
-
+## Development Commands
 ```bash
-cargo build --release
+cargo fmt
+cargo clippy
+cargo test
+cargo run -- roms/<game>.nes
+cargo run --example nes_emulator --features cheat-ui -- roms/<game>.nes
+cargo run --bin headless_test -- roms/<game>.nes --frames 300 --capture 120
 ```
 
-## Running
+## Known Limitations
+- Mapper coverage is broad but still incomplete, and NES 2.0 submapper handling is still limited.
+- Exact timing for some rare boards and expansion-audio edge cases is still being refined.
+- Compatibility is strongest on iNES ROMs covered by the mapper table below; unsupported boards will not boot correctly.
 
-```bash
-# Using the run script (macOS, cheat UI enabled)
-./run.sh
-
-# With a specific ROM
-./run.sh roms/game.nes
-
-# Without cheat UI (plain SDL2 version)
-cargo build --release
-./target/release/nes-emulator <path-to-rom.nes>
-```
-
-## Controls
-
-| NES Button | Keyboard |
-|------------|----------|
-| D-Pad      | Arrow Keys |
-| A          | Z |
-| B          | X |
-| Start      | Enter |
-| Select     | Space |
-
-### Save States
-
-- **Save**: Ctrl + 1/2/3/4
-- **Load**: 1/2/3/4
-
-### Cheat Panel
-
-- **Toggle panel**: Tab
-- **Pause emulation**: Pause checkbox in panel
-
-The cheat panel provides two tabs:
-
-- **Hex Viewer** — Browse and edit CPU RAM / SRAM in real time
-- **Cheat Search** — Snapshot-based memory search to find and freeze values (lives, health, etc.)
-
-Cheats are saved/loaded as JSON in the `cheats/` directory.
-
-## Supported Mappers
+## Mapper Coverage
 
 | Mapper | Name | Examples |
 |--------|------|----------|
@@ -218,21 +214,6 @@ Cheats are saved/loaded as JSON in the `cheats/` directory.
 | 248 | Alias of 115 | MMC3 multicarts |
 | 250 | Nitra MMC3 wiring | Time Diver Avenger, Queen Bee V |
 | 255 | 110-in-1 / 255 multicart | 110-in-1 |
-
-## Architecture
-
-The emulator follows the NES hardware architecture:
-
-- **CPU**: MOS 6502 processor (unofficial opcodes supported)
-- **PPU**: Picture Processing Unit for graphics rendering
-- **APU**: Audio Processing Unit for sound generation
-- **Bus**: Central interconnect with memory-mapped I/O
-
-### Timing
-
-- CPU clock: ~1.79 MHz
-- PPU clock: 3× CPU clock
-- Frame rate: 60 FPS (NTSC)
 
 ## License
 
