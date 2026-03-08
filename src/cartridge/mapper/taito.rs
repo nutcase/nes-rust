@@ -1,9 +1,17 @@
+use std::cell::Cell;
+
 use super::super::{Cartridge, Mirroring};
 
 #[derive(Debug, Clone)]
 pub(in crate::cartridge) struct TaitoTc0190 {
     pub(in crate::cartridge) prg_banks: [u8; 2],
     pub(in crate::cartridge) chr_banks: [u8; 6],
+    pub(in crate::cartridge) irq_latch: u8,
+    pub(in crate::cartridge) irq_counter: u8,
+    pub(in crate::cartridge) irq_reload: bool,
+    pub(in crate::cartridge) irq_enabled: bool,
+    pub(in crate::cartridge) irq_pending: Cell<bool>,
+    pub(in crate::cartridge) irq_delay: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +34,38 @@ impl TaitoTc0190 {
         Self {
             prg_banks: [0, 1],
             chr_banks: [0, 1, 2, 3, 4, 5],
+            irq_latch: 0,
+            irq_counter: 0,
+            irq_reload: false,
+            irq_enabled: false,
+            irq_pending: Cell::new(false),
+            irq_delay: 0,
+        }
+    }
+
+    pub(in crate::cartridge) fn clock_irq_mut(&mut self) {
+        let counter_was_zero = self.irq_counter == 0;
+        if counter_was_zero || self.irq_reload {
+            self.irq_counter = self.irq_latch;
+            self.irq_reload = false;
+        } else {
+            self.irq_counter = self.irq_counter.wrapping_sub(1);
+        }
+
+        if self.irq_counter == 0 && self.irq_enabled {
+            self.irq_delay = 4;
+        }
+    }
+
+    pub(in crate::cartridge) fn clock_irq_delay_mut(&mut self, cycles: u32) {
+        for _ in 0..cycles {
+            if self.irq_delay == 0 {
+                break;
+            }
+            self.irq_delay -= 1;
+            if self.irq_delay == 0 && self.irq_enabled {
+                self.irq_pending.set(true);
+            }
         }
     }
 }
@@ -220,6 +260,61 @@ impl Cartridge {
                 }
                 0xA003 => {
                     taito.chr_banks[5] = data;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(in crate::cartridge) fn write_prg_mapper48(&mut self, addr: u16, data: u8) {
+        if let Some(taito) = self.taito_tc0190.as_mut() {
+            match addr & 0xF003 {
+                0x8000 => {
+                    taito.prg_banks[0] = data & 0x3F;
+                    self.prg_bank = taito.prg_banks[0];
+                }
+                0x8001 => {
+                    taito.prg_banks[1] = data & 0x3F;
+                }
+                0x8002 => {
+                    taito.chr_banks[0] = data;
+                    self.chr_bank = data;
+                }
+                0x8003 => {
+                    taito.chr_banks[1] = data;
+                }
+                0xA000 => {
+                    taito.chr_banks[2] = data;
+                }
+                0xA001 => {
+                    taito.chr_banks[3] = data;
+                }
+                0xA002 => {
+                    taito.chr_banks[4] = data;
+                }
+                0xA003 => {
+                    taito.chr_banks[5] = data;
+                }
+                0xC000 => {
+                    taito.irq_latch = !data;
+                }
+                0xC001 => {
+                    taito.irq_reload = true;
+                }
+                0xC002 => {
+                    taito.irq_enabled = true;
+                }
+                0xC003 => {
+                    taito.irq_enabled = false;
+                    taito.irq_pending.set(false);
+                    taito.irq_delay = 0;
+                }
+                0xE000 => {
+                    self.mirroring = if data & 0x40 != 0 {
+                        Mirroring::Horizontal
+                    } else {
+                        Mirroring::Vertical
+                    };
                 }
                 _ => {}
             }

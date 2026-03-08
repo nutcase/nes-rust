@@ -295,14 +295,8 @@ impl CpuBus for Bus {
             }
             0x2000..=0x3FFF => {
                 let mirrored = 0x2000 + (addr & 0x07);
-                if let Some((chr_addr, chr_data)) =
-                    self.ppu
-                        .write_register(mirrored, data, self.cartridge.as_ref())
-                {
-                    if let Some(ref mut cartridge) = self.cartridge {
-                        cartridge.write_chr(chr_addr, chr_data);
-                    }
-                }
+                self.ppu
+                    .write_register(mirrored, data, self.cartridge.as_mut());
             }
             0x4000..=0x4013 | 0x4015 | 0x4017 => {
                 self.apu.write_register(addr, data);
@@ -345,6 +339,9 @@ impl CpuBus for Bus {
                     self.controller_state = self.controller as u16;
                 }
                 self.strobe = new_strobe;
+                if let Some(ref mut cartridge) = self.cartridge {
+                    cartridge.write_prg_low(addr, data);
+                }
             }
             0x4020..=0xFFFF => {
                 if let Some(ref mut cartridge) = self.cartridge {

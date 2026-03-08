@@ -1,6 +1,400 @@
 use super::*;
 
 #[test]
+fn mapper_5_uses_fill_mode_exram_attributes_and_scanline_irq() {
+    let mut cart = make_mmc5_cart();
+    let mut ppu = crate::ppu::Ppu::new();
+
+    ppu.nametable[0][0] = 0x21;
+    ppu.nametable[1][0] = 0x42;
+
+    cart.write_prg(0x5105, 0b11_10_01_00);
+    cart.write_prg(0x5106, 0x66);
+    cart.write_prg(0x5107, 0x03);
+    cart.write_prg(0x5C00, 0x33);
+
+    assert_eq!(cart.resolve_nametable(0), Some(0));
+    assert_eq!(cart.resolve_nametable(3), Some(3));
+    assert_eq!(cart.read_nametable_byte(0, 0, &ppu.nametable), 0x21);
+    assert_eq!(cart.read_nametable_byte(1, 0, &ppu.nametable), 0x42);
+    assert_eq!(cart.read_nametable_byte(2, 0, &ppu.nametable), 0x33);
+    assert_eq!(cart.read_nametable_byte(3, 0, &ppu.nametable), 0x66);
+    assert_eq!(cart.read_nametable_byte(3, 960, &ppu.nametable), 0xFF);
+
+    cart.write_prg(0x5104, 0x01);
+    cart.write_prg(0x5105, 0x00);
+    cart.write_prg(0x5C00, 0b10_001011);
+    cart.notify_ppumask_mmc5(0x18);
+    ppu.nametable[0][0] = 0x04;
+
+    assert_eq!(cart.read_nametable_byte(0, 0, &ppu.nametable), 0x04);
+    assert_eq!(cart.read_nametable_byte(0, 960, &ppu.nametable), 0x02);
+    assert_eq!(cart.read_chr(0x0040), 0xAC);
+
+    cart.write_prg(0x5203, 0x02);
+    cart.write_prg(0x5204, 0x80);
+    cart.mmc5_scanline_tick();
+    cart.mmc5_scanline_tick();
+    assert!(!cart.irq_pending());
+    cart.mmc5_scanline_tick();
+    assert!(cart.irq_pending());
+    assert_eq!(cart.read_prg_low(0x5204), 0xC0);
+    assert_eq!(cart.read_prg_low(0x5204), 0x40);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x5C00, 0x00);
+    cart.notify_ppumask_mmc5(0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg_low(0x5204), 0x40);
+    assert_eq!(cart.read_prg_low(0x5C00), 0x00);
+    cart.write_prg(0x5104, 0x02);
+    assert_eq!(cart.read_prg_low(0x5C00), 0b10_001011);
+}
+
+#[test]
+fn mapper_19_uses_nametable_alias_irq_and_audio() {
+    let mut cart = make_mapper19_cart();
+    let ppu = crate::ppu::Ppu::new();
+
+    cart.write_prg(0xC000, 0xE0);
+    cart.write_prg(0xC800, 0xE1);
+    cart.write_prg(0xD000, 0x07);
+    cart.write_prg(0xD800, 0xE0);
+
+    cart.write_nametable_byte(0, 0x012, &mut [[0; 1024]; 2], 0x44);
+    cart.write_nametable_byte(1, 0x012, &mut [[0; 1024]; 2], 0x55);
+    assert_eq!(cart.read_nametable_byte(0, 0x012, &ppu.nametable), 0x44);
+    assert_eq!(cart.read_nametable_byte(1, 0x012, &ppu.nametable), 0x55);
+    assert_eq!(cart.read_nametable_byte(2, 0x012, &ppu.nametable), 0x87);
+
+    cart.write_prg(0x8000, 0xE0);
+    cart.write_prg(0x8800, 0xE1);
+    cart.write_chr(0x0012, 0x66);
+    cart.write_chr(0x0412, 0x77);
+    assert_eq!(cart.read_chr(0x0012), 0x66);
+    assert_eq!(cart.read_chr(0x0412), 0x77);
+
+    cart.write_prg_low(0x5000, 0xFD);
+    cart.write_prg_low(0x5800, 0xFF);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+    assert_eq!(cart.read_prg_low(0x5800), 0xFF);
+    cart.acknowledge_irq();
+    assert!(!cart.irq_pending());
+
+    cart.write_prg(0xE000, 0x03);
+    cart.write_prg(0xF800, 0x40);
+    for (addr, value) in [
+        (0x00, 0x10),
+        (0x01, 0x00),
+        (0x02, 0x00),
+        (0x03, 0x00),
+        (0x04, 0xFC),
+        (0x05, 0x00),
+        (0x06, 0x00),
+        (0x07, 0x0F),
+        (0x7F, 0x70),
+    ] {
+        cart.write_prg(0xF800, 0x40 | addr);
+        cart.write_prg_low(0x4800, value);
+    }
+    cart.write_prg(0xF800, 0x40);
+    cart.write_prg_low(0x4800, 0x98);
+
+    let mut non_zero = false;
+    for _ in 0..64 {
+        if cart.clock_expansion_audio().abs() > f32::EPSILON {
+            non_zero = true;
+            break;
+        }
+    }
+    assert!(non_zero);
+}
+
+#[test]
+fn mapper_18_uses_irq_width_control_and_mirroring() {
+    let mut cart = make_mapper18_cart();
+
+    cart.write_prg(0xF002, 0x00);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+    cart.write_prg(0xF002, 0x01);
+    assert_eq!(cart.mirroring(), Mirroring::Vertical);
+    cart.write_prg(0xF002, 0x02);
+    assert_eq!(cart.mirroring(), Mirroring::OneScreenLower);
+    cart.write_prg(0xF002, 0x03);
+    assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
+
+    cart.write_prg(0xE000, 0x0);
+    cart.write_prg(0xE001, 0x0);
+    cart.write_prg(0xE002, 0x0);
+    cart.write_prg(0xE003, 0x1);
+    cart.write_prg(0xF000, 0);
+    cart.write_prg(0xF001, 0x03);
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    cart.write_prg(0xF000, 0);
+    assert!(!cart.irq_pending());
+
+    cart.write_prg(0xE000, 0x2);
+    cart.write_prg(0xE001, 0x0);
+    cart.write_prg(0xE002, 0x0);
+    cart.write_prg(0xE003, 0x0);
+    cart.write_prg(0xF000, 0);
+    cart.write_prg(0xF001, 0x09);
+    cart.clock_irq_counter_cycles(2);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_210_uses_namco340_mirroring_control() {
+    let mut cart = make_mapper210_cart(true);
+
+    cart.write_prg(0xE000, 0x00);
+    assert_eq!(cart.mirroring(), Mirroring::OneScreenLower);
+    cart.write_prg(0xE000, 0x40);
+    assert_eq!(cart.mirroring(), Mirroring::Vertical);
+    cart.write_prg(0xE000, 0x80);
+    assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
+    cart.write_prg(0xE000, 0xC0);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    cart.write_prg(0xE800, 0x06);
+    cart.write_prg(0xF000, 0x07);
+    assert_eq!(cart.read_prg(0xA000), 6);
+    assert_eq!(cart.read_prg(0xC000), 7);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0xE000, 0x01);
+    cart.write_prg(0xE800, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+    assert_eq!(cart.read_prg(0xA000), 6);
+}
+
+#[test]
+fn mapper_21_uses_vrc4_irq_and_restores_state() {
+    let mut cart = make_mapper21_cart();
+
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x9000, 0x03);
+    cart.write_prg(0xF000, 0x0E);
+    cart.write_prg(0xF040, 0x0F);
+    cart.write_prg(0xF004, 0x07);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0x9000, 0x00);
+    cart.write_prg(0xF004, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 2);
+    assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
+    cart.acknowledge_irq();
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_22_ignores_vrc4_irq_registers_and_restores_state() {
+    let mut cart = make_mapper22_cart();
+
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x9000, 0x01);
+    cart.write_prg(0xF000, 0x0E);
+    cart.write_prg(0xF002, 0x07);
+    cart.clock_irq_counter_cycles(16);
+    assert!(!cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0x9000, 0x00);
+    cart.write_prg_ram(0x6000, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 2);
+    assert_eq!(cart.read_prg_ram(0x6000), 0x60);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+    assert!(!cart.irq_pending());
+}
+
+#[test]
+fn mapper_23_uses_vrc2_latch_and_vrc4_irq() {
+    let mut cart = make_mapper23_cart();
+
+    cart.write_prg_ram(0x6000, 0x01);
+    assert_eq!(cart.read_prg_ram(0x6000), 0x61);
+    assert_eq!(cart.read_prg_ram(0x7000), 0x70);
+
+    cart.write_prg(0x9000, 0xFF);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    cart.write_prg(0xF000, 0x0E);
+    cart.write_prg(0xF004, 0x0F);
+    cart.write_prg(0xF008, 0x07);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    cart.acknowledge_irq();
+    assert!(!cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x9008, 0x03);
+    cart.write_prg(0xF008, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg_ram(0x6000), 0x61);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_26_uses_vrc6_irq_audio_and_restores_state() {
+    fn reg_addr(reg: u16) -> u16 {
+        (reg & !0x0003) | (((reg & 0x0001) << 1) | ((reg & 0x0002) >> 1))
+    }
+
+    let mut cart = make_mapper24_26_cart(26);
+
+    cart.write_prg(reg_addr(0x8000), 0x02);
+    cart.write_prg(reg_addr(0xB003), 0x8C);
+    cart.write_prg_ram(0x6002, 0x77);
+
+    cart.write_prg(reg_addr(0xF000), 0xFE);
+    cart.write_prg(reg_addr(0xF001), 0x07);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    cart.write_prg(reg_addr(0x9000), 0x8F);
+    cart.write_prg(reg_addr(0x9001), 0x00);
+    cart.write_prg(reg_addr(0x9002), 0x80);
+    cart.write_prg(reg_addr(0x9003), 0x00);
+
+    let mut non_zero = false;
+    for _ in 0..16 {
+        if cart.clock_expansion_audio().abs() > f32::EPSILON {
+            non_zero = true;
+            break;
+        }
+    }
+    assert!(non_zero);
+
+    let snapshot = cart.snapshot_state();
+
+    cart.write_prg(reg_addr(0x8000), 0x00);
+    cart.write_prg(reg_addr(0xB003), 0x00);
+    cart.write_prg_ram(0x6002, 0x00);
+    cart.write_prg(reg_addr(0x9002), 0x00);
+    cart.acknowledge_irq();
+
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 0x04);
+    assert_eq!(cart.read_prg_ram(0x6002), 0x77);
+    assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
+    assert!(cart.irq_pending());
+
+    let mut restored_non_zero = false;
+    for _ in 0..16 {
+        if cart.clock_expansion_audio().abs() > f32::EPSILON {
+            restored_non_zero = true;
+            break;
+        }
+    }
+    assert!(restored_non_zero);
+}
+
+#[test]
+fn mapper_25_supports_vrc2c_battery_ram_and_vrc4d_irq() {
+    let mut cart = make_mapper25_cart(true);
+
+    cart.write_prg_ram(0x6002, 0x77);
+    assert_eq!(cart.read_prg_ram(0x6002), 0x77);
+
+    cart.write_prg(0x9000, 0x01);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    cart.write_prg(0xF000, 0x0E);
+    cart.write_prg(0xF008, 0x0F);
+    cart.write_prg(0xF004, 0x07);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    cart.acknowledge_irq();
+    assert!(!cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg_ram(0x6002, 0x00);
+    cart.write_prg(0xF004, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg_ram(0x6002), 0x77);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_64_supports_scanline_and_cycle_irq_modes() {
+    let mut cart = make_mapper64_cart();
+
+    cart.write_prg(0xC000, 0x00);
+    cart.write_prg(0xC001, 0x00);
+    cart.write_prg(0xE001, 0x00);
+
+    cart.clock_irq_counter();
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(3);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    cart.write_prg(0xE000, 0x00);
+    assert!(!cart.irq_pending());
+
+    cart.write_prg(0xC001, 0x01);
+    cart.write_prg(0xE001, 0x00);
+    cart.clock_irq_counter();
+    cart.clock_irq_counter();
+    assert!(!cart.irq_pending());
+
+    cart.clock_irq_counter_cycles(7);
+    assert!(!cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    cart.write_prg(0xE000, 0x00);
+    cart.restore_state(&snapshot);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+}
+
+#[test]
 fn mapper_206_uses_namco108_bank_layout() {
     let mut cart = make_namco108_cart(206, 8, 16);
 
@@ -71,6 +465,488 @@ fn mapper_208_switches_prg_protection_and_chr_banks() {
 }
 
 #[test]
+fn mapper_40_switches_c000_bank_and_fixed_cycle_irq() {
+    let mut cart = make_mapper40_cart();
+
+    cart.write_prg(0xE000, 0x03);
+
+    assert_eq!(cart.read_prg_ram(0x6000), 6);
+    assert_eq!(cart.read_prg(0x8000), 4);
+    assert_eq!(cart.read_prg(0xA000), 5);
+    assert_eq!(cart.read_prg(0xC000), 3);
+    assert_eq!(cart.read_prg(0xE000), 7);
+
+    cart.write_prg(0xA000, 0x00);
+    cart.clock_irq_counter_cycles(4095);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x8000, 0x00);
+    assert!(!cart.irq_pending());
+
+    cart.restore_state(&snapshot);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_50_uses_scrambled_c000_bank_and_fixed_cycle_irq() {
+    let mut cart = make_mapper50_cart();
+
+    cart.write_prg(0x4020, 0x07);
+
+    assert_eq!(cart.read_prg_ram(0x6000), 15);
+    assert_eq!(cart.read_prg(0x8000), 8);
+    assert_eq!(cart.read_prg(0xA000), 9);
+    assert_eq!(cart.read_prg(0xC000), 7);
+    assert_eq!(cart.read_prg(0xE000), 11);
+
+    cart.write_prg(0x4120, 0x01);
+    cart.clock_irq_counter_cycles(4096);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x4120, 0x00);
+    assert!(!cart.irq_pending());
+
+    cart.restore_state(&snapshot);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_59_latches_address_modes_and_unlocks_on_reset() {
+    let mut cart = make_mapper59_cart();
+
+    cart.write_prg(0x80BD, 0x00);
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xC000), 3);
+    assert_eq!(cart.read_chr(0x0000), 0x45);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x8122, 0x00);
+    assert_eq!(cart.read_prg(0x8000), 0);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_chr(0x0000), 0x45);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    cart.write_prg(0x8222, 0x00);
+    assert_eq!(cart.read_prg(0x8000), 2);
+    assert_eq!(cart.read_prg(0xC000), 3);
+    assert_eq!(cart.read_chr(0x0000), 0x42);
+    assert_eq!(cart.mirroring(), Mirroring::Vertical);
+
+    cart.write_prg(0x80BD, 0x00);
+    assert_eq!(cart.read_prg(0x8000), 2);
+    assert_eq!(cart.read_chr(0x0000), 0x42);
+
+    cart.on_reset();
+    cart.write_prg(0x80BD, 0x00);
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xC000), 3);
+    assert_eq!(cart.read_chr(0x0000), 0x45);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+}
+
+#[test]
+fn mapper_60_cycles_through_four_nrom_games_on_reset() {
+    let mut cart = make_mapper60_cart();
+
+    assert_eq!(cart.read_prg(0x8000), 0);
+    assert_eq!(cart.read_prg(0xC000), 0);
+    assert_eq!(cart.read_chr(0x0000), 0x50);
+
+    cart.on_reset();
+    assert_eq!(cart.read_prg(0x8000), 1);
+    assert_eq!(cart.read_prg(0xC000), 1);
+    assert_eq!(cart.read_chr(0x0000), 0x51);
+
+    cart.on_reset();
+    assert_eq!(cart.read_prg(0x8000), 2);
+    assert_eq!(cart.read_prg(0xC000), 2);
+    assert_eq!(cart.read_chr(0x0000), 0x52);
+
+    let snapshot = cart.snapshot_state();
+
+    cart.on_reset();
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xC000), 3);
+    assert_eq!(cart.read_chr(0x0000), 0x53);
+
+    cart.on_reset();
+    assert_eq!(cart.read_prg(0x8000), 0);
+    assert_eq!(cart.read_prg(0xC000), 0);
+    assert_eq!(cart.read_chr(0x0000), 0x50);
+
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_prg(0x8000), 2);
+    assert_eq!(cart.read_prg(0xC000), 2);
+    assert_eq!(cart.read_chr(0x0000), 0x52);
+}
+
+#[test]
+fn mapper_61_latches_prg_chr_and_mirroring_modes() {
+    let mut cart = make_mapper61_cart();
+
+    cart.write_prg(0x89B5, 0x00);
+    assert_eq!(cart.read_prg(0x8000), 11);
+    assert_eq!(cart.read_prg(0xC000), 11);
+    assert_eq!(cart.read_chr(0x0000), 0x49);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    let snapshot = cart.snapshot_state();
+
+    cart.write_prg(0x83C2, 0x00);
+    assert_eq!(cart.read_prg(0x8000), 4);
+    assert_eq!(cart.read_prg(0xC000), 5);
+    assert_eq!(cart.read_chr(0x0000), 0x43);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_prg(0x8000), 11);
+    assert_eq!(cart.read_prg(0xC000), 11);
+    assert_eq!(cart.read_chr(0x0000), 0x49);
+}
+
+#[test]
+fn mapper_77_routes_two_nametables_to_chr_ram_and_two_to_internal_vram() {
+    let mut cart = make_mapper77_cart();
+    let mut ppu = crate::ppu::Ppu::new();
+
+    ppu.v = 0x2000;
+    ppu.write_register(0x2007, 0x55, Some(&mut cart));
+    ppu.v = 0x2400;
+    ppu.write_register(0x2007, 0x66, Some(&mut cart));
+    ppu.v = 0x2800;
+    ppu.write_register(0x2007, 0x77, Some(&mut cart));
+    ppu.v = 0x2C00;
+    ppu.write_register(0x2007, 0x88, Some(&mut cart));
+
+    assert_eq!(cart.read_nametable_byte(0, 0, &ppu.nametable), 0x55);
+    assert_eq!(cart.read_nametable_byte(1, 0, &ppu.nametable), 0x66);
+    assert_eq!(cart.read_nametable_byte(2, 0, &ppu.nametable), 0x77);
+    assert_eq!(cart.read_nametable_byte(3, 0, &ppu.nametable), 0x88);
+    assert_eq!(ppu.nametable[0][0], 0x77);
+    assert_eq!(ppu.nametable[1][0], 0x88);
+}
+
+#[test]
+fn mapper_99_uses_cartridge_four_screen_nametables() {
+    let mut cart = make_mapper99_cart();
+    let mut ppu = crate::ppu::Ppu::new();
+
+    ppu.v = 0x2000;
+    ppu.write_register(0x2007, 0x11, Some(&mut cart));
+    ppu.v = 0x2400;
+    ppu.write_register(0x2007, 0x22, Some(&mut cart));
+    ppu.v = 0x2800;
+    ppu.write_register(0x2007, 0x33, Some(&mut cart));
+    ppu.v = 0x2C00;
+    ppu.write_register(0x2007, 0x44, Some(&mut cart));
+
+    assert_eq!(cart.read_nametable_byte(0, 0, &ppu.nametable), 0x11);
+    assert_eq!(cart.read_nametable_byte(1, 0, &ppu.nametable), 0x22);
+    assert_eq!(cart.read_nametable_byte(2, 0, &ppu.nametable), 0x33);
+    assert_eq!(cart.read_nametable_byte(3, 0, &ppu.nametable), 0x44);
+    assert_eq!(ppu.nametable[0][0], 0);
+    assert_eq!(ppu.nametable[1][0], 0);
+}
+
+#[test]
+fn mapper_137_custom_mirroring_and_state_restore() {
+    let mut cart = make_mapper137_cart();
+
+    cart.write_prg(0x4100, 7);
+    cart.write_prg(0x4101, 0x00);
+    assert_eq!(cart.resolve_nametable(0), Some(0));
+    assert_eq!(cart.resolve_nametable(1), Some(1));
+    assert_eq!(cart.resolve_nametable(2), Some(1));
+    assert_eq!(cart.resolve_nametable(3), Some(1));
+
+    let snapshot = cart.snapshot_state();
+
+    cart.write_prg(0x4100, 7);
+    cart.write_prg(0x4101, 0x06);
+    assert_eq!(cart.resolve_nametable(0), None);
+    assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
+
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.resolve_nametable(0), Some(0));
+    assert_eq!(cart.resolve_nametable(3), Some(1));
+    assert_eq!(cart.read_prg_low(0x4101), 0x00);
+}
+
+#[test]
+fn mapper_67_switches_chr_prg_mirroring_and_cycle_irq() {
+    let mut cart = make_mapper67_cart();
+
+    cart.write_prg(0x8800, 0x01);
+    cart.write_prg(0x9800, 0x02);
+    cart.write_prg(0xA800, 0x03);
+    cart.write_prg(0xB800, 0x04);
+    cart.write_prg(0xE800, 0x03);
+    cart.write_prg(0xF800, 0x03);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xC000), 7);
+    assert_eq!(cart.read_chr(0x0000), 0x71);
+    assert_eq!(cart.read_chr(0x0800), 0x72);
+    assert_eq!(cart.read_chr(0x1000), 0x73);
+    assert_eq!(cart.read_chr(0x1800), 0x74);
+    assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
+
+    cart.write_prg(0xC800, 0x00);
+    cart.write_prg(0xC800, 0x02);
+    cart.write_prg(0xD800, 0x10);
+    cart.clock_irq_counter_cycles(2);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x8000, 0x00);
+    assert!(!cart.irq_pending());
+
+    cart.restore_state(&snapshot);
+    assert!(cart.irq_pending());
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_chr(0x1800), 0x74);
+}
+
+#[test]
+fn mapper_185_disables_chr_for_initial_probe_reads_after_reset() {
+    let mut cart = make_mapper185_cart();
+
+    cart.write_prg(0x8000, 0x02);
+    assert_eq!(cart.read_chr(0x0000), 0);
+
+    let snapshot = cart.snapshot_state();
+    assert_eq!(cart.read_chr(0x0000), 0);
+    assert_eq!(cart.read_chr(0x0000), 0x62);
+
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_chr(0x0000), 0);
+    assert_eq!(cart.read_chr(0x0000), 0x62);
+
+    cart.on_reset();
+    assert_eq!(cart.read_chr(0x0000), 0);
+    assert_eq!(cart.read_chr(0x0000), 0);
+    assert_eq!(cart.read_chr(0x0000), 0x62);
+}
+
+#[test]
+fn mapper_189_uses_low_address_prg_bank_writes_with_mmc3_chr() {
+    let mut cart = make_mapper189_cart();
+
+    cart.write_prg(0x4100, 0xA4);
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x07);
+
+    assert_eq!(cart.read_prg(0x8000), 14);
+    assert_eq!(cart.read_prg(0xE000), 14);
+    assert_eq!(cart.read_chr(0x0000), 0x64);
+    assert_eq!(cart.read_chr(0x0400), 0x65);
+    assert_eq!(cart.read_chr(0x1000), 0x67);
+
+    let snapshot = cart.snapshot_state();
+
+    cart.write_prg_ram(0x6000, 0x93);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x01);
+    assert_eq!(cart.read_prg(0x8000), 11);
+    assert_eq!(cart.read_chr(0x1000), 0x61);
+
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_prg(0x8000), 14);
+    assert_eq!(cart.read_chr(0x0000), 0x64);
+    assert_eq!(cart.read_chr(0x0400), 0x65);
+    assert_eq!(cart.read_chr(0x1000), 0x67);
+}
+
+#[test]
+fn mapper_73_switches_prg_and_handles_16bit_and_8bit_irq_modes() {
+    let mut cart = make_vrc3_cart();
+
+    cart.write_prg(0xF000, 0x03);
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xC000), 7);
+
+    cart.write_prg_ram(0x6000, 0xA5);
+    assert_eq!(cart.read_prg_ram(0x6000), 0xA5);
+
+    cart.write_prg(0x8000, 0x0E);
+    cart.write_prg(0x9000, 0x0F);
+    cart.write_prg(0xA000, 0x0F);
+    cart.write_prg(0xB000, 0x0F);
+    cart.write_prg(0xC000, 0x02);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0xD000, 0x00);
+    assert!(!cart.irq_pending());
+
+    cart.restore_state(&snapshot);
+    assert!(cart.irq_pending());
+
+    cart.write_prg(0xD000, 0x00);
+    cart.write_prg(0x8000, 0x0E);
+    cart.write_prg(0x9000, 0x0F);
+    cart.write_prg(0xA000, 0x02);
+    cart.write_prg(0xB000, 0x01);
+    cart.write_prg(0xC000, 0x06);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+    assert_eq!(cart.vrc3.as_ref().unwrap().irq_counter, 0x12FE);
+}
+
+#[test]
+fn mapper_142_switches_four_8k_prg_slots_and_uses_vrc3_irq() {
+    let mut cart = make_mapper142_cart();
+
+    cart.write_prg(0xE000, 0x01);
+    cart.write_prg(0xF000, 0x03);
+    cart.write_prg(0xE000, 0x02);
+    cart.write_prg(0xF000, 0x04);
+    cart.write_prg(0xE000, 0x03);
+    cart.write_prg(0xF000, 0x05);
+    cart.write_prg(0xE000, 0x04);
+    cart.write_prg(0xF000, 0x06);
+
+    assert_eq!(cart.read_prg_ram(0x6000), 6);
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 5);
+    assert_eq!(cart.read_prg(0xE000), 15);
+
+    cart.write_chr(0x0123, 0xA5);
+    assert_eq!(cart.read_chr(0x0123), 0xA5);
+
+    cart.write_prg(0x8000, 0x0E);
+    cart.write_prg(0x9000, 0x0F);
+    cart.write_prg(0xA000, 0x0F);
+    cart.write_prg(0xB000, 0x0F);
+    cart.write_prg(0xC000, 0x02);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0xD000, 0x00);
+    cart.write_prg(0xE000, 0x01);
+    cart.write_prg(0xF000, 0x00);
+    assert!(!cart.irq_pending());
+    assert_eq!(cart.read_prg(0x8000), 0);
+
+    cart.restore_state(&snapshot);
+    assert!(cart.irq_pending());
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg_ram(0x6000), 6);
+}
+
+#[test]
+fn mapper_32_switches_prg_chr_and_prg_mode() {
+    let mut cart = make_mapper32_cart();
+
+    cart.write_prg(0x8000, 0x03);
+    cart.write_prg(0xA000, 0x04);
+    for index in 0..8 {
+        cart.write_prg(0xB000 + index as u16, 0x08 + index as u8);
+    }
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 6);
+    assert_eq!(cart.read_prg(0xE000), 7);
+    assert_eq!(cart.read_chr(0x0000), 0x38);
+    assert_eq!(cart.read_chr(0x1C00), 0x3F);
+
+    cart.write_prg(0x9000, 0x03);
+    assert_eq!(cart.read_prg(0x8000), 6);
+    assert_eq!(cart.read_prg(0xC000), 3);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0x9000, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 6);
+    assert_eq!(cart.read_prg(0xC000), 3);
+    assert_eq!(cart.read_chr(0x0000), 0x38);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+}
+
+#[test]
+fn mapper_42_switches_low_prg_bank_and_counts_cycle_irq() {
+    let mut cart = make_mapper42_cart();
+
+    cart.write_prg(0xE000, 0x27);
+
+    assert_eq!(cart.read_prg_ram(0x6000), 7);
+    assert_eq!(cart.read_prg(0x8000), 12);
+    assert_eq!(cart.read_prg(0xA000), 13);
+    assert_eq!(cart.read_prg(0xC000), 14);
+    assert_eq!(cart.read_prg(0xE000), 15);
+    assert_eq!(cart.mirroring(), Mirroring::Vertical);
+
+    cart.clock_irq_counter_cycles(24_575);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0xE000, 0x10);
+    assert_eq!(cart.read_prg_ram(0x6000), 0);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+    assert!(!cart.irq_pending());
+
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_prg_ram(0x6000), 7);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_43_maps_split_prg_layout_and_12bit_irq() {
+    let mut cart = make_mapper43_cart();
+
+    assert_eq!(cart.read_prg_low(0x5000), 0xF2);
+    assert_eq!(cart.read_prg_ram(0x6000), 2);
+    assert_eq!(cart.read_prg(0x8000), 1);
+    assert_eq!(cart.read_prg(0xA000), 0);
+    assert_eq!(cart.read_prg(0xE000), 0xE8);
+
+    cart.write_prg(0x4022, 0x01);
+    assert_eq!(cart.read_prg(0xC000), 3);
+    cart.write_prg(0x4022, 0x05);
+    assert_eq!(cart.read_prg(0xC000), 7);
+
+    cart.write_prg(0x4122, 0x01);
+    cart.clock_irq_counter_cycles(4095);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x4122, 0x00);
+    assert!(!cart.irq_pending());
+
+    cart.restore_state(&snapshot);
+    assert!(cart.irq_pending());
+    assert_eq!(cart.read_prg(0xC000), 7);
+}
+
+#[test]
 fn mapper_250_uses_address_lines_for_register_select_and_data() {
     let mut cart = make_mmc3_mixed_chr_cart(250, 8, 16, 0);
 
@@ -102,6 +978,358 @@ fn mapper_250_uses_address_lines_for_register_select_and_data() {
     assert_eq!(cart.read_chr(0x0000), 0x56);
     assert_eq!(cart.read_chr(0x0400), 0x57);
     assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+}
+
+#[test]
+fn mapper_65_switches_prg_chr_and_cycle_irq() {
+    let mut cart = make_mapper65_cart();
+
+    cart.write_prg(0x8000, 0x03);
+    cart.write_prg(0xA000, 0x04);
+    for index in 0..8 {
+        cart.write_prg(0xB000 + index as u16, 0x08 + index as u8);
+    }
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 14);
+    assert_eq!(cart.read_prg(0xE000), 15);
+    assert_eq!(cart.read_chr(0x0000), 0x98);
+    assert_eq!(cart.read_chr(0x1C00), 0x9F);
+
+    cart.write_prg(0x9000, 0x80);
+    cart.write_prg(0x9001, 0x80);
+    assert_eq!(cart.read_prg(0x8000), 14);
+    assert_eq!(cart.read_prg(0xC000), 3);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    cart.write_prg(0x9005, 0x00);
+    cart.write_prg(0x9006, 0x02);
+    cart.write_prg(0x9004, 0x00);
+    cart.write_prg(0x9003, 0x80);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x9003, 0x00);
+    assert!(!cart.irq_pending());
+
+    cart.restore_state(&snapshot);
+    assert!(cart.irq_pending());
+    assert_eq!(cart.read_prg(0xC000), 3);
+}
+
+#[test]
+fn mapper_103_switches_bank_ram_overlay_and_mirroring() {
+    let mut cart = make_mapper103_cart();
+
+    cart.write_prg(0x8000, 0x05);
+    cart.write_prg(0xF000, 0x10);
+    assert_eq!(cart.read_prg_ram(0x6000), 5);
+    assert_eq!(cart.read_prg(0x8000), 0xA1);
+    assert_eq!(cart.read_prg(0xB800), 0xB2);
+    assert_eq!(cart.read_prg(0xD800), 0xC3);
+
+    cart.write_prg(0xE000, 0x08);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    cart.write_prg(0xF000, 0x00);
+    cart.write_prg_ram(0x6000, 0x5A);
+    cart.write_prg(0xB800, 0xA5);
+    assert_eq!(cart.read_prg_ram(0x6000), 0xA5);
+    assert_eq!(cart.read_prg(0xB800), 0xA5);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0xF000, 0x10);
+    cart.write_prg_ram(0x6000, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg_ram(0x6000), 0xA5);
+    assert_eq!(cart.read_prg(0xB800), 0xA5);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+}
+
+#[test]
+fn mapper_153_uses_outer_prg_bank_chr_ram_and_wram_enable() {
+    let mut cart = make_mapper153_cart();
+
+    cart.write_prg(0x8000, 0x01);
+    cart.write_prg(0x8008, 0x03);
+    cart.write_prg(0x8009, 0x03);
+    cart.write_prg(0x800D, 0x40);
+
+    assert_eq!(cart.read_prg(0x8000), 19);
+    assert_eq!(cart.read_prg(0xC000), 31);
+    assert_eq!(cart.mirroring(), Mirroring::OneScreenUpper);
+
+    cart.write_prg_ram(0x6000, 0x5A);
+    assert_eq!(cart.read_prg_ram(0x6000), 0x5A);
+
+    cart.write_chr(0x1234, 0x77);
+    assert_eq!(cart.read_chr(0x1234), 0x77);
+
+    cart.write_prg(0x800B, 0x01);
+    cart.write_prg(0x800C, 0x00);
+    cart.write_prg(0x800A, 0x01);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x800D, 0x00);
+    assert_eq!(cart.read_prg_ram(0x6000), 0);
+
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_prg_ram(0x6000), 0x5A);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_159_uses_x24c01_eeprom_and_bandai_banks() {
+    let mut cart = make_mapper159_cart();
+
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x03);
+    cart.write_prg(0x8008, 0x05);
+    cart.write_prg(0x8009, 0x01);
+
+    assert_eq!(cart.read_prg(0x8000), 5);
+    assert_eq!(cart.read_prg(0xC000), 31);
+    assert_eq!(cart.read_chr(0x0000), 0x82);
+    assert_eq!(cart.read_chr(0x0400), 0x83);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+    assert_eq!(cart.read_prg_ram(0x6000), 0x10);
+
+    cart.write_prg(0x800B, 0x01);
+    cart.write_prg(0x800C, 0x00);
+    cart.write_prg(0x800A, 0x01);
+    cart.clock_irq_counter_cycles(1);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0x8008, 0x00);
+    cart.write_prg(0x8009, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 5);
+    assert_eq!(cart.read_chr(0x0000), 0x82);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_37_selects_prg_and_chr_windows_from_prg_ram_latch() {
+    let mut cart = make_mmc3_mixed_chr_cart(37, 32, 256, 0);
+
+    cart.write_prg(0x8000, 0x06);
+    cart.write_prg(0x8001, 0x05);
+    cart.write_prg(0x8000, 0x07);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x05);
+
+    assert_eq!(cart.read_prg(0x8000), 5);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 6);
+    assert_eq!(cart.read_prg(0xE000), 7);
+    assert_eq!(cart.read_chr(0x1000), 0x55);
+
+    cart.write_prg_ram(0x6000, 0x03);
+    assert_eq!(cart.read_prg(0x8000), 13);
+    assert_eq!(cart.read_prg(0xA000), 12);
+    assert_eq!(cart.read_prg(0xC000), 14);
+    assert_eq!(cart.read_prg(0xE000), 15);
+    assert_eq!(cart.read_chr(0x1000), 0x55);
+
+    cart.write_prg_ram(0x6000, 0x04);
+    assert_eq!(cart.read_prg(0x8000), 21);
+    assert_eq!(cart.read_prg(0xA000), 20);
+    assert_eq!(cart.read_prg(0xC000), 30);
+    assert_eq!(cart.read_prg(0xE000), 31);
+    assert_eq!(cart.read_chr(0x1000), 0xD5);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg_ram(0x6000, 0x00);
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_prg(0x8000), 21);
+    assert_eq!(cart.read_chr(0x1000), 0xD5);
+}
+
+#[test]
+fn mapper_47_switches_128k_blocks_only_when_prg_ram_is_writable() {
+    let mut cart = make_mmc3_mixed_chr_cart(47, 32, 256, 0);
+
+    cart.write_prg(0x8000, 0x06);
+    cart.write_prg(0x8001, 0x05);
+    cart.write_prg(0x8000, 0x07);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x05);
+
+    cart.write_prg(0xA001, 0x00);
+    cart.write_prg_ram(0x6000, 0x01);
+    assert_eq!(cart.read_prg(0x8000), 5);
+    assert_eq!(cart.read_chr(0x1000), 0x55);
+
+    cart.write_prg(0xA001, 0x80);
+    cart.write_prg_ram(0x6000, 0x01);
+    assert_eq!(cart.read_prg(0x8000), 21);
+    assert_eq!(cart.read_prg(0xA000), 20);
+    assert_eq!(cart.read_prg(0xC000), 30);
+    assert_eq!(cart.read_prg(0xE000), 31);
+    assert_eq!(cart.read_chr(0x1000), 0xD5);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg_ram(0x6000, 0x00);
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_prg(0x8000), 21);
+    assert_eq!(cart.read_chr(0x1000), 0xD5);
+}
+
+#[test]
+fn mapper_48_uses_taito_banking_and_delayed_irq() {
+    let mut cart = make_mapper48_cart();
+
+    cart.write_prg(0x8000, 0x03);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg(0x8002, 0x05);
+    cart.write_prg(0x8003, 0x06);
+    cart.write_prg(0xA000, 0x07);
+    cart.write_prg(0xA001, 0x08);
+    cart.write_prg(0xA002, 0x09);
+    cart.write_prg(0xA003, 0x0A);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 14);
+    assert_eq!(cart.read_prg(0xE000), 15);
+    assert_eq!(cart.read_chr(0x0000), 0x8A);
+    assert_eq!(cart.read_chr(0x0400), 0x8B);
+    assert_eq!(cart.read_chr(0x0800), 0x8C);
+    assert_eq!(cart.read_chr(0x0C00), 0x8D);
+    assert_eq!(cart.read_chr(0x1000), 0x87);
+    assert_eq!(cart.read_chr(0x1C00), 0x8A);
+
+    cart.write_prg(0xE000, 0x40);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    cart.write_prg(0xC000, 0xFE);
+    cart.write_prg(0xC001, 0x00);
+    cart.write_prg(0xC002, 0x00);
+    cart.clock_irq_counter();
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter();
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(3);
+    assert!(!cart.irq_pending());
+
+    let snapshot = cart.snapshot_state();
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+
+    cart.write_prg(0xC003, 0x00);
+    assert!(!cart.irq_pending());
+
+    cart.restore_state(&snapshot);
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter_cycles(1);
+    assert!(cart.irq_pending());
+}
+
+#[test]
+fn mapper_114_scrambles_registers_and_supports_override_modes() {
+    let mut cart = make_mapper114_cart(114);
+
+    cart.write_prg(0xA000, 0x04);
+    cart.write_prg(0xC000, 0x03);
+    cart.write_prg(0xA000, 0x05);
+    cart.write_prg(0xC000, 0x04);
+    cart.write_prg(0xA000, 0x06);
+    cart.write_prg(0xC000, 0x05);
+    cart.write_prg_ram(0x6001, 0x01);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 30);
+    assert_eq!(cart.read_prg(0xE000), 31);
+    assert_eq!(cart.read_chr(0x1000), 0x85);
+
+    cart.write_prg_ram(0x6000, 0x83);
+    assert_eq!(cart.read_prg(0x8000), 6);
+    assert_eq!(cart.read_prg(0xC000), 6);
+
+    cart.write_prg_ram(0x6000, 0xC2);
+    assert_eq!(cart.read_prg(0x8000), 4);
+    assert_eq!(cart.read_prg(0xC000), 6);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg_ram(0x6000, 0x00);
+    cart.write_prg_ram(0x6001, 0x00);
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_prg(0x8000), 4);
+    assert_eq!(cart.read_prg(0xC000), 6);
+    assert_eq!(cart.read_chr(0x1000), 0x85);
+}
+
+#[test]
+fn mapper_123_uses_scrambled_bank_select_and_5800_override() {
+    let mut cart = make_mapper123_cart();
+
+    cart.write_prg(0x8000, 0x04);
+    cart.write_prg(0x8001, 0x03);
+    cart.write_prg(0x8000, 0x05);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg(0x8000, 0x06);
+    cart.write_prg(0x8001, 0x05);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 30);
+    assert_eq!(cart.read_prg(0xE000), 31);
+    assert_eq!(cart.read_chr(0x1000), 0x65);
+
+    cart.write_prg(0x5800, 0x40);
+    assert_eq!(cart.read_prg(0x8000), 0);
+    assert_eq!(cart.read_prg(0xC000), 0);
+
+    cart.write_prg(0x5800, 0x42);
+    assert_eq!(cart.read_prg(0x8000), 0);
+    assert_eq!(cart.read_prg(0xC000), 2);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x5800, 0x00);
+    cart.restore_state(&snapshot);
+    assert_eq!(cart.read_prg(0x8000), 0);
+    assert_eq!(cart.read_prg(0xC000), 2);
+}
+
+#[test]
+fn mapper_182_aliases_114_and_uses_mmc3a_irq_behavior() {
+    let mut cart = make_mapper114_cart(182);
+
+    cart.write_prg(0xA001, 0x00);
+    cart.write_prg(0xC001, 0x00);
+    cart.write_prg(0xE001, 0x00);
+    cart.clock_irq_counter();
+    cart.clock_irq_counter();
+    assert!(!cart.irq_pending());
+
+    cart.write_prg(0xA001, 0x01);
+    cart.write_prg(0xC001, 0x00);
+    cart.write_prg(0xE001, 0x00);
+    cart.clock_irq_counter();
+    assert!(!cart.irq_pending());
+    cart.clock_irq_counter();
+    assert!(cart.irq_pending());
+
+    cart.write_prg(0xE000, 0x00);
+    assert!(!cart.irq_pending());
 }
 
 #[test]
@@ -177,7 +1405,7 @@ fn mapper_118_uses_chr_bank_bits_for_nametable_mapping() {
     assert_eq!(ppu.read_register(0x2007, Some(&cart)), 0x11);
 
     ppu.v = 0x2400;
-    ppu.write_register(0x2007, 0x77, Some(&cart));
+    ppu.write_register(0x2007, 0x77, Some(&mut cart));
     assert_eq!(ppu.nametable[1][0], 0x77);
     assert_eq!(ppu.nametable[0][0], 0x11);
 }
@@ -482,7 +1710,7 @@ fn mapper_207_uses_chr_bank_bits_for_nametable_mapping() {
     assert_eq!(ppu.read_register(0x2007, Some(&cart)), 0x11);
 
     ppu.v = 0x2400;
-    ppu.write_register(0x2007, 0x77, Some(&cart));
+    ppu.write_register(0x2007, 0x77, Some(&mut cart));
     assert_eq!(ppu.nametable[1][0], 0x77);
     assert_eq!(ppu.nametable[0][0], 0x11);
 }
@@ -740,6 +1968,261 @@ fn mapper_68_ppu_reads_chr_rom_nametables() {
     assert_eq!(rom_nt1, 0x83);
 
     ppu.v = 0x2000;
-    ppu.write_register(0x2007, 0x99, Some(&cart));
+    ppu.write_register(0x2007, 0x99, Some(&mut cart));
     assert_eq!(ppu.nametable[0][0], 0x11);
+}
+
+#[test]
+fn mapper_112_uses_hardwired_prg_layout_and_2k_chr_banks() {
+    let mut cart = make_namco108_cart(112, 8, 32);
+
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0xA000, 0x03);
+    cart.write_prg(0x8000, 0x01);
+    cart.write_prg(0xA000, 0x04);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0xA000, 0x05);
+    cart.write_prg(0x8000, 0x03);
+    cart.write_prg(0xA000, 0x06);
+    cart.write_prg(0x8000, 0x04);
+    cart.write_prg(0xA000, 0x07);
+    cart.write_prg(0x8000, 0x05);
+    cart.write_prg(0xA000, 0x08);
+    cart.write_prg(0x8000, 0x06);
+    cart.write_prg(0xA000, 0x09);
+    cart.write_prg(0x8000, 0x07);
+    cart.write_prg(0xA000, 0x0A);
+    cart.write_prg(0xE000, 0x01);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 6);
+    assert_eq!(cart.read_prg(0xE000), 7);
+    assert_eq!(cart.read_chr(0x0000), 0x2A);
+    assert_eq!(cart.read_chr(0x0400), 0x2B);
+    assert_eq!(cart.read_chr(0x0800), 0x2C);
+    assert_eq!(cart.read_chr(0x0C00), 0x2D);
+    assert_eq!(cart.read_chr(0x1000), 0x27);
+    assert_eq!(cart.read_chr(0x1400), 0x28);
+    assert_eq!(cart.read_chr(0x1800), 0x29);
+    assert_eq!(cart.read_chr(0x1C00), 0x2A);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0xA000, 0x00);
+    cart.write_prg(0xE000, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_chr(0x1000), 0x27);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+}
+
+#[test]
+fn mapper_115_supports_outer_chr_and_nrom_override_modes() {
+    let mut cart = make_mapper115_cart(115);
+
+    cart.write_prg(0x8000, 0x06);
+    cart.write_prg(0x8001, 0x03);
+    cart.write_prg(0x8000, 0x07);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x05);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+
+    cart.write_prg_ram(0x6001, 0x01);
+    assert_eq!(cart.read_chr(0x1000), 0x85);
+
+    cart.write_prg_ram(0x6000, 0x83);
+    assert_eq!(cart.read_prg(0x8000), 6);
+    assert_eq!(cart.read_prg(0xC000), 6);
+
+    cart.write_prg_ram(0x6000, 0xA2);
+    assert_eq!(cart.read_prg(0x8000), 4);
+    assert_eq!(cart.read_prg(0xC000), 6);
+    assert_eq!(cart.read_prg_ram(0x6002), 0);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg_ram(0x6000, 0x00);
+    cart.write_prg_ram(0x6001, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 4);
+    assert_eq!(cart.read_prg(0xC000), 6);
+    assert_eq!(cart.read_chr(0x1000), 0x85);
+}
+
+#[test]
+fn mapper_248_aliases_115_behavior() {
+    let mut cart = make_mapper115_cart(248);
+
+    cart.write_prg(0x8000, 0x06);
+    cart.write_prg(0x8001, 0x01);
+    cart.write_prg(0x8000, 0x07);
+    cart.write_prg(0x8001, 0x02);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg_ram(0x6001, 0x01);
+    cart.write_prg_ram(0x6000, 0x81);
+
+    assert_eq!(cart.read_prg(0x8000), 2);
+    assert_eq!(cart.read_prg(0xC000), 2);
+    assert_eq!(cart.read_chr(0x1000), 0x84);
+    assert_eq!(cart.read_prg_ram(0x6002), 0);
+}
+
+#[test]
+fn mapper_205_selects_outer_prg_chr_blocks_and_restores_state() {
+    let mut cart = make_mapper205_cart();
+
+    cart.write_prg(0x8000, 0x06);
+    cart.write_prg(0x8001, 0x13);
+    cart.write_prg(0x8000, 0x07);
+    cart.write_prg(0x8001, 0x14);
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0x8001, 0x86);
+    cart.write_prg(0x8000, 0x01);
+    cart.write_prg(0x8001, 0x88);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x8A);
+    cart.write_prg(0x8000, 0x03);
+    cart.write_prg(0x8001, 0x8B);
+    cart.write_prg(0x8000, 0x04);
+    cart.write_prg(0x8001, 0x8C);
+    cart.write_prg(0x8000, 0x05);
+    cart.write_prg(0x8001, 0x8D);
+
+    assert_eq!(cart.read_prg(0x8000), 19);
+    assert_eq!(cart.read_prg(0xA000), 20);
+    assert_eq!(cart.read_prg(0xC000), 30);
+    assert_eq!(cart.read_prg(0xE000), 31);
+    assert_eq!(cart.read_chr(0x0000), 0x46);
+    assert_eq!(cart.read_chr(0x0400), 0x47);
+    assert_eq!(cart.read_chr(0x0800), 0x48);
+    assert_eq!(cart.read_chr(0x1000), 0x4A);
+    assert_eq!(cart.read_chr(0x1C00), 0x4D);
+
+    cart.write_prg_ram(0x6000, 0x02);
+    assert_eq!(cart.read_prg(0x8000), 35);
+    assert_eq!(cart.read_prg(0xA000), 36);
+    assert_eq!(cart.read_prg(0xC000), 46);
+    assert_eq!(cart.read_prg(0xE000), 47);
+    assert_eq!(cart.read_chr(0x0000), 0x86);
+    assert_eq!(cart.read_chr(0x1000), 0x8A);
+    assert_eq!(cart.read_chr(0x1C00), 0x8D);
+
+    cart.write_prg_ram(0x6000, 0x03);
+    assert_eq!(cart.read_prg(0x8000), 51);
+    assert_eq!(cart.read_prg(0xA000), 52);
+    assert_eq!(cart.read_prg(0xC000), 62);
+    assert_eq!(cart.read_prg(0xE000), 63);
+    assert_eq!(cart.read_chr(0x0000), 0xC6);
+    assert_eq!(cart.read_chr(0x1000), 0xCA);
+    assert_eq!(cart.read_chr(0x1C00), 0xCD);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg_ram(0x6000, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 51);
+    assert_eq!(cart.read_chr(0x1000), 0xCA);
+}
+
+#[test]
+fn mapper_12_uses_split_outer_chr_bits_with_mmc3_prg_layout() {
+    let mut cart = make_mapper12_cart();
+
+    cart.write_prg(0x8000, 0x06);
+    cart.write_prg(0x8001, 0x03);
+    cart.write_prg(0x8000, 0x07);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg(0x8000, 0x01);
+    cart.write_prg(0x8001, 0x06);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x08);
+    cart.write_prg(0x8000, 0x03);
+    cart.write_prg(0x8001, 0x09);
+    cart.write_prg(0x8000, 0x04);
+    cart.write_prg(0x8001, 0x0A);
+    cart.write_prg(0x8000, 0x05);
+    cart.write_prg(0x8001, 0x0B);
+    cart.write_prg(0xA001, 0x11);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 30);
+    assert_eq!(cart.read_prg(0xE000), 31);
+    assert_eq!(cart.read_chr(0x0000), 0x84);
+    assert_eq!(cart.read_chr(0x0400), 0x85);
+    assert_eq!(cart.read_chr(0x0800), 0x86);
+    assert_eq!(cart.read_chr(0x0C00), 0x87);
+    assert_eq!(cart.read_chr(0x1000), 0x88);
+    assert_eq!(cart.read_chr(0x1C00), 0x8B);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0xA001, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_chr(0x0000), 0x84);
+    assert_eq!(cart.read_chr(0x1000), 0x88);
+}
+
+#[test]
+fn mapper_44_switches_outer_prg_chr_windows() {
+    let mut cart = make_mapper44_cart();
+
+    cart.write_prg(0x8000, 0x06);
+    cart.write_prg(0x8001, 0x03);
+    cart.write_prg(0x8000, 0x07);
+    cart.write_prg(0x8001, 0x04);
+    cart.write_prg(0x8000, 0x00);
+    cart.write_prg(0x8001, 0x06);
+    cart.write_prg(0x8000, 0x01);
+    cart.write_prg(0x8001, 0x08);
+    cart.write_prg(0x8000, 0x02);
+    cart.write_prg(0x8001, 0x0A);
+    cart.write_prg(0x8000, 0x03);
+    cart.write_prg(0x8001, 0x0B);
+    cart.write_prg(0x8000, 0x04);
+    cart.write_prg(0x8001, 0x0C);
+    cart.write_prg(0x8000, 0x05);
+    cart.write_prg(0x8001, 0x0D);
+    cart.write_prg(0xA000, 0x01);
+
+    assert_eq!(cart.read_prg(0x8000), 3);
+    assert_eq!(cart.read_prg(0xA000), 4);
+    assert_eq!(cart.read_prg(0xC000), 14);
+    assert_eq!(cart.read_prg(0xE000), 15);
+    assert_eq!(cart.read_chr(0x0000), 0x06);
+    assert_eq!(cart.read_chr(0x1000), 0x0A);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
+
+    cart.write_prg(0xA001, 0x02);
+    assert_eq!(cart.read_prg(0x8000), 35);
+    assert_eq!(cart.read_prg(0xA000), 36);
+    assert_eq!(cart.read_prg(0xC000), 46);
+    assert_eq!(cart.read_prg(0xE000), 47);
+    assert_eq!(cart.read_chr(0x0000), 0x46);
+    assert_eq!(cart.read_chr(0x1000), 0x4A);
+
+    cart.write_prg(0xA001, 0x07);
+    assert_eq!(cart.read_prg(0x8000), 115);
+    assert_eq!(cart.read_prg(0xA000), 116);
+    assert_eq!(cart.read_prg(0xC000), 126);
+    assert_eq!(cart.read_prg(0xE000), 127);
+    assert_eq!(cart.read_chr(0x0000), 0xE6);
+    assert_eq!(cart.read_chr(0x1000), 0xEA);
+
+    let snapshot = cart.snapshot_state();
+    cart.write_prg(0xA001, 0x00);
+    cart.restore_state(&snapshot);
+
+    assert_eq!(cart.read_prg(0x8000), 115);
+    assert_eq!(cart.read_chr(0x1000), 0xEA);
+    assert_eq!(cart.mirroring(), Mirroring::Horizontal);
 }

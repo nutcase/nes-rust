@@ -21,10 +21,13 @@ const MAPPER208_PROTECTION_LUT: [u8; 256] = [
     0x09, 0x19, 0x49, 0x59, 0x09, 0x19, 0x49, 0x59, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+const MAPPER114_INDEX_SCRAMBLE: [u8; 8] = [0, 3, 1, 5, 6, 7, 2, 4];
+
 #[derive(Debug, Clone)]
 pub(in crate::cartridge) struct Mmc3 {
     pub(in crate::cartridge) bank_select: u8,
     pub(in crate::cartridge) bank_registers: [u8; 8],
+    pub(in crate::cartridge) extra_bank_registers: [u8; 8],
     pub(in crate::cartridge) irq_latch: u8,
     pub(in crate::cartridge) irq_counter: u8,
     pub(in crate::cartridge) irq_reload: bool,
@@ -32,6 +35,9 @@ pub(in crate::cartridge) struct Mmc3 {
     pub(in crate::cartridge) irq_pending: Cell<bool>,
     pub(in crate::cartridge) prg_ram_enabled: bool,
     pub(in crate::cartridge) prg_ram_write_protect: bool,
+    pub(in crate::cartridge) irq_cycle_mode: bool,
+    pub(in crate::cartridge) irq_prescaler: u8,
+    pub(in crate::cartridge) irq_delay: u8,
 }
 
 impl Mmc3 {
@@ -39,6 +45,7 @@ impl Mmc3 {
         Mmc3 {
             bank_select: 0,
             bank_registers: [0; 8],
+            extra_bank_registers: [0; 8],
             irq_latch: 0,
             irq_counter: 0,
             irq_reload: false,
@@ -46,6 +53,9 @@ impl Mmc3 {
             irq_pending: Cell::new(false),
             prg_ram_enabled: true,
             prg_ram_write_protect: false,
+            irq_cycle_mode: false,
+            irq_prescaler: 4,
+            irq_delay: 0,
         }
     }
 
@@ -62,9 +72,295 @@ impl Mmc3 {
             self.irq_pending.set(true);
         }
     }
+
+    fn rambo1_register(&self, reg: usize) -> u8 {
+        if reg < 8 {
+            self.bank_registers[reg]
+        } else {
+            self.extra_bank_registers[reg - 8]
+        }
+    }
+
+    fn set_rambo1_register(&mut self, reg: usize, data: u8) {
+        if reg < 8 {
+            self.bank_registers[reg] = data;
+        } else {
+            self.extra_bank_registers[reg - 8] = data;
+        }
+    }
+
+    fn clock_irq_rambo1_mut(&mut self) {
+        if self.irq_reload {
+            self.irq_counter = if self.irq_latch == 0 {
+                0
+            } else {
+                self.irq_latch | 0x01
+            };
+            self.irq_reload = false;
+        } else if self.irq_counter == 0 {
+            self.irq_counter = self.irq_latch;
+        } else {
+            self.irq_counter = self.irq_counter.wrapping_sub(1);
+        }
+
+        if self.irq_counter == 0 && self.irq_enabled {
+            self.irq_delay = 4;
+        }
+    }
+
+    fn clock_irq_rambo1_cycle(&mut self) {
+        if self.irq_delay > 0 {
+            self.irq_delay -= 1;
+            if self.irq_delay == 0 {
+                self.irq_pending.set(true);
+            }
+        }
+
+        if self.irq_cycle_mode {
+            if self.irq_prescaler > 1 {
+                self.irq_prescaler -= 1;
+            } else {
+                self.irq_prescaler = 4;
+                self.clock_irq_rambo1_mut();
+            }
+        }
+    }
 }
 
 impl Cartridge {
+    fn resolve_chr_bank_raw_rambo1(&self, addr: u16, mmc3: &Mmc3) -> (usize, usize) {
+        let slot = ((addr >> 10) & 0x07) as usize;
+        let adjusted_slot = if (mmc3.bank_select & 0x80) != 0 {
+            slot ^ 4
+        } else {
+            slot
+        };
+        let full_chr_mode = (mmc3.bank_select & 0x20) != 0;
+
+        let bank_1k = match adjusted_slot {
+            0 => mmc3.rambo1_register(0) as usize,
+            1 => {
+                if full_chr_mode {
+                    mmc3.rambo1_register(8) as usize
+                } else {
+                    (mmc3.rambo1_register(0) as usize & !1) | 1
+                }
+            }
+            2 => mmc3.rambo1_register(1) as usize,
+            3 => {
+                if full_chr_mode {
+                    mmc3.rambo1_register(9) as usize
+                } else {
+                    (mmc3.rambo1_register(1) as usize & !1) | 1
+                }
+            }
+            4 => mmc3.rambo1_register(2) as usize,
+            5 => mmc3.rambo1_register(3) as usize,
+            6 => mmc3.rambo1_register(4) as usize,
+            7 => mmc3.rambo1_register(5) as usize,
+            _ => 0,
+        };
+
+        let local_offset = (addr & 0x03FF) as usize;
+        (bank_1k, local_offset)
+    }
+
+    pub(in crate::cartridge) fn read_prg_mapper64(&self, addr: u16) -> u8 {
+        if let Some(ref mmc3) = self.mmc3 {
+            let num_8k_banks = self.prg_rom.len() / 0x2000;
+            if num_8k_banks == 0 {
+                return 0;
+            }
+
+            let prg_mode = (mmc3.bank_select & 0x40) != 0;
+            let bank_6 = mmc3.rambo1_register(6) as usize % num_8k_banks;
+            let bank_7 = mmc3.rambo1_register(7) as usize % num_8k_banks;
+            let bank_f = mmc3.rambo1_register(0x0F) as usize % num_8k_banks;
+            let last = num_8k_banks - 1;
+
+            let (bank, offset) = match addr {
+                0x8000..=0x9FFF => {
+                    let bank = if prg_mode { bank_f } else { bank_6 };
+                    (bank, (addr - 0x8000) as usize)
+                }
+                0xA000..=0xBFFF => (bank_7, (addr - 0xA000) as usize),
+                0xC000..=0xDFFF => {
+                    let bank = if prg_mode { bank_6 } else { bank_f };
+                    (bank, (addr - 0xC000) as usize)
+                }
+                0xE000..=0xFFFF => (last, (addr - 0xE000) as usize),
+                _ => return 0,
+            };
+
+            let rom_addr = bank * 0x2000 + offset;
+            self.prg_rom.get(rom_addr).copied().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    pub(in crate::cartridge) fn write_prg_mapper64(&mut self, addr: u16, data: u8) {
+        if let Some(ref mut mmc3) = self.mmc3 {
+            let even = (addr & 1) == 0;
+            match addr {
+                0x8000..=0x9FFF => {
+                    if even {
+                        mmc3.bank_select = data;
+                    } else {
+                        let reg = (mmc3.bank_select & 0x0F) as usize;
+                        mmc3.set_rambo1_register(reg, data);
+                    }
+                }
+                0xA000..=0xBFFF => {
+                    if even {
+                        self.mirroring = if data & 0x01 != 0 {
+                            Mirroring::Horizontal
+                        } else {
+                            Mirroring::Vertical
+                        };
+                    }
+                }
+                0xC000..=0xDFFF => {
+                    if even {
+                        mmc3.irq_latch = data;
+                    } else {
+                        mmc3.irq_cycle_mode = (data & 0x01) != 0;
+                        mmc3.irq_reload = true;
+                        mmc3.irq_counter = 0;
+                        mmc3.irq_prescaler = 4;
+                    }
+                }
+                0xE000..=0xFFFF => {
+                    if even {
+                        mmc3.irq_enabled = false;
+                        mmc3.irq_pending.set(false);
+                        mmc3.irq_delay = 0;
+                    } else {
+                        mmc3.irq_enabled = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(in crate::cartridge) fn read_chr_mapper64(&self, addr: u16) -> u8 {
+        if let Some(ref mmc3) = self.mmc3 {
+            let chr_data = if !self.chr_ram.is_empty() {
+                &self.chr_ram
+            } else {
+                &self.chr_rom
+            };
+            if chr_data.is_empty() {
+                return 0;
+            }
+
+            let (bank_1k, local_offset) = self.resolve_chr_bank_raw_rambo1(addr, mmc3);
+            let bank_count = (chr_data.len() / 0x0400).max(1);
+            let chr_addr = (bank_1k % bank_count) * 0x0400 + local_offset;
+            chr_data[chr_addr % chr_data.len()]
+        } else {
+            0
+        }
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper64(&mut self, addr: u16, data: u8) {
+        if self.chr_ram.is_empty() {
+            return;
+        }
+
+        if let Some(ref mmc3) = self.mmc3 {
+            let (bank_1k, local_offset) = self.resolve_chr_bank_raw_rambo1(addr, mmc3);
+            let bank_count = (self.chr_ram.len() / 0x0400).max(1);
+            let chr_addr = (bank_1k % bank_count) * 0x0400 + local_offset;
+            let chr_len = self.chr_ram.len();
+            self.chr_ram[chr_addr % chr_len] = data;
+        }
+    }
+
+    fn clock_irq_mmc3a(&mut self) {
+        if let Some(ref mut mmc3) = self.mmc3 {
+            let counter_was_zero = mmc3.irq_counter == 0;
+            if counter_was_zero || mmc3.irq_reload {
+                mmc3.irq_counter = mmc3.irq_latch;
+                mmc3.irq_reload = false;
+            } else {
+                mmc3.irq_counter = mmc3.irq_counter.wrapping_sub(1);
+            }
+
+            if mmc3.irq_counter == 0 && mmc3.irq_enabled && mmc3.irq_latch != 0 {
+                mmc3.irq_pending.set(true);
+            }
+        }
+    }
+
+    fn mapper114_scramble_index(data: u8) -> u8 {
+        (data & !0x07) | MAPPER114_INDEX_SCRAMBLE[(data & 0x07) as usize]
+    }
+
+    fn translate_mapper114_addr(addr: u16) -> Option<u16> {
+        match addr & 0xE001 {
+            0x8000 => Some(0xA001),
+            0x8001 => Some(0xA000),
+            0xA000 => Some(0x8000),
+            0xA001 => Some(0xC000),
+            0xC000 => Some(0x8001),
+            0xC001 => Some(0xC001),
+            0xE000 => Some(0xE000),
+            0xE001 => Some(0xE001),
+            _ => None,
+        }
+    }
+
+    fn read_prg_nrom_override(
+        &self,
+        addr: u16,
+        bank_16k: usize,
+        replace_bit0_with_a14: bool,
+    ) -> u8 {
+        let bank_count = (self.prg_rom.len() / 0x4000).max(1);
+        let bank = if replace_bit0_with_a14 {
+            (bank_16k & !1) | (((addr as usize - 0x8000) >> 14) & 0x01)
+        } else {
+            bank_16k
+        } % bank_count;
+        let rom_addr = bank * 0x4000 + (addr as usize & 0x3FFF);
+        self.prg_rom.get(rom_addr).copied().unwrap_or(0)
+    }
+
+    fn mapper114_selected_16k_bank(&self) -> usize {
+        (self.mapper114_override as usize & 0x0F)
+            | (((self.mapper114_override as usize) & 0x20) >> 1)
+    }
+
+    fn mapper123_selected_16k_bank(&self) -> usize {
+        let data = self.mapper123_override as usize;
+        (data & 0x01) | ((data & 0x10) >> 3) | (data & 0x04) | ((data & 0x20) >> 2)
+    }
+
+    fn mapper115_selected_16k_bank(&self) -> usize {
+        (self.mapper115_override as usize & 0x0F)
+            | (((self.mapper115_override as usize) & 0x40) >> 2)
+    }
+
+    fn mapper205_prg_window(&self) -> (usize, usize) {
+        match self.mapper205_block & 0x03 {
+            0 => (0x00, 0x1F),
+            1 => (0x10, 0x1F),
+            2 => (0x20, 0x0F),
+            _ => (0x30, 0x0F),
+        }
+    }
+
+    fn mapper205_chr_window(&self) -> (usize, usize) {
+        match self.mapper205_block & 0x03 {
+            0 => (0x000, 0xFF),
+            1 => (0x080, 0xFF),
+            2 => (0x100, 0x7F),
+            _ => (0x180, 0x7F),
+        }
+    }
+
     fn mapper191_outer_bank_writable(&self) -> bool {
         self.chr_rom.len() > 0x20000
     }
@@ -240,6 +536,119 @@ impl Cartridge {
         ((high_bit_source >> 1) as usize & 0x01) << 5
     }
 
+    fn mmc3_prg_ram_writable(&self) -> bool {
+        self.mmc3
+            .as_ref()
+            .map(|mmc3| mmc3.prg_ram_enabled && !mmc3.prg_ram_write_protect)
+            .unwrap_or(false)
+    }
+
+    fn read_prg_windowed_mmc3(&self, addr: u16, base: usize, bank_mask: usize) -> u8 {
+        if let Some(ref mmc3) = self.mmc3 {
+            let num_8k_banks = self.prg_rom.len() / 0x2000;
+            if num_8k_banks == 0 {
+                return 0;
+            }
+
+            let prg_mode = (mmc3.bank_select >> 6) & 1;
+            let second_last = base + bank_mask.saturating_sub(1);
+            let last = base + bank_mask;
+
+            let (bank, offset) = match addr {
+                0x8000..=0x9FFF => {
+                    let bank = if prg_mode == 0 {
+                        base + ((mmc3.bank_registers[6] as usize) & bank_mask)
+                    } else {
+                        second_last
+                    };
+                    (bank % num_8k_banks, (addr - 0x8000) as usize)
+                }
+                0xA000..=0xBFFF => {
+                    let bank = base + ((mmc3.bank_registers[7] as usize) & bank_mask);
+                    (bank % num_8k_banks, (addr - 0xA000) as usize)
+                }
+                0xC000..=0xDFFF => {
+                    let bank = if prg_mode == 0 {
+                        second_last
+                    } else {
+                        base + ((mmc3.bank_registers[6] as usize) & bank_mask)
+                    };
+                    (bank % num_8k_banks, (addr - 0xC000) as usize)
+                }
+                0xE000..=0xFFFF => (last % num_8k_banks, (addr - 0xE000) as usize),
+                _ => return 0,
+            };
+
+            let rom_addr = bank * 0x2000 + offset;
+            self.prg_rom.get(rom_addr).copied().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn read_chr_windowed_mmc3(&self, addr: u16, base: usize, bank_mask: usize) -> u8 {
+        let chr_data = if !self.chr_ram.is_empty() {
+            &self.chr_ram
+        } else {
+            &self.chr_rom
+        };
+        if chr_data.is_empty() {
+            return 0;
+        }
+
+        if let Some(ref mmc3) = self.mmc3 {
+            let (raw_bank, local_offset) = self.resolve_chr_bank_raw_mmc3(addr, mmc3);
+            let bank_count = (chr_data.len() / 0x0400).max(1);
+            let bank = (base + (raw_bank & bank_mask)) % bank_count;
+            let chr_addr = bank * 0x0400 + local_offset;
+            chr_data[chr_addr % chr_data.len()]
+        } else {
+            0
+        }
+    }
+
+    fn write_chr_windowed_mmc3(&mut self, addr: u16, base: usize, bank_mask: usize, data: u8) {
+        if self.chr_ram.is_empty() {
+            return;
+        }
+
+        if let Some(ref mmc3) = self.mmc3 {
+            let (raw_bank, local_offset) = self.resolve_chr_bank_raw_mmc3(addr, mmc3);
+            let bank_count = (self.chr_ram.len() / 0x0400).max(1);
+            let bank = (base + (raw_bank & bank_mask)) % bank_count;
+            let chr_addr = bank * 0x0400 + local_offset;
+            let chr_len = self.chr_ram.len();
+            self.chr_ram[chr_addr % chr_len] = data;
+        }
+    }
+
+    fn mapper37_prg_window(&self) -> (usize, usize) {
+        match self.mapper37_outer_bank & 0x07 {
+            0..=2 => (0, 0x07),
+            3 => (8, 0x07),
+            4..=6 => (16, 0x0F),
+            _ => (24, 0x07),
+        }
+    }
+
+    fn mapper44_prg_window(&self) -> (usize, usize) {
+        let block = self.mapper44_outer_bank & 0x07;
+        if block < 6 {
+            ((block as usize) << 4, 0x0F)
+        } else {
+            (0x60 + (((block & 0x01) as usize) << 4), 0x0F)
+        }
+    }
+
+    fn mapper44_chr_window(&self) -> (usize, usize) {
+        let block = self.mapper44_outer_bank & 0x07;
+        if block < 6 {
+            ((block as usize) << 7, 0x7F)
+        } else {
+            (0x300 + (((block & 0x01) as usize) << 7), 0x7F)
+        }
+    }
+
     fn mapper208_apply_prg_and_mirroring(&mut self, data: u8) {
         let bank_count = (self.prg_rom.len() / 0x8000).max(1);
         let bank = ((((data >> 4) & 0x01) << 1) | (data & 0x01)) as usize;
@@ -267,6 +676,59 @@ impl Cartridge {
             0x5800..=0x5FFF => self.mapper208_protection_regs[(addr as usize) & 0x03],
             _ => 0,
         }
+    }
+
+    pub(in crate::cartridge) fn read_prg_mapper37(&self, addr: u16) -> u8 {
+        let (base, bank_mask) = self.mapper37_prg_window();
+        self.read_prg_windowed_mmc3(addr, base, bank_mask)
+    }
+
+    pub(in crate::cartridge) fn read_prg_mapper47(&self, addr: u16) -> u8 {
+        let base = ((self.mapper47_outer_bank & 0x01) as usize) << 4;
+        self.read_prg_windowed_mmc3(addr, base, 0x0F)
+    }
+
+    pub(in crate::cartridge) fn read_prg_mapper44(&self, addr: u16) -> u8 {
+        let (base, bank_mask) = self.mapper44_prg_window();
+        self.read_prg_windowed_mmc3(addr, base, bank_mask)
+    }
+
+    pub(in crate::cartridge) fn read_prg_mapper114(&self, addr: u16) -> u8 {
+        if self.mapper114_override & 0x80 != 0 {
+            return self.read_prg_nrom_override(
+                addr,
+                self.mapper114_selected_16k_bank(),
+                self.mapper114_override & 0x40 != 0,
+            );
+        }
+        self.read_prg_mmc3(addr)
+    }
+
+    pub(in crate::cartridge) fn read_prg_mapper123(&self, addr: u16) -> u8 {
+        if self.mapper123_override & 0x40 != 0 {
+            return self.read_prg_nrom_override(
+                addr,
+                self.mapper123_selected_16k_bank(),
+                self.mapper123_override & 0x02 != 0,
+            );
+        }
+        self.read_prg_mmc3(addr)
+    }
+
+    pub(in crate::cartridge) fn read_prg_mapper115(&self, addr: u16) -> u8 {
+        if self.mapper115_override & 0x80 != 0 {
+            return self.read_prg_nrom_override(
+                addr,
+                self.mapper115_selected_16k_bank(),
+                self.mapper115_override & 0x20 != 0,
+            );
+        }
+        self.read_prg_mmc3(addr)
+    }
+
+    pub(in crate::cartridge) fn read_prg_mapper205(&self, addr: u16) -> u8 {
+        let (base, bank_mask) = self.mapper205_prg_window();
+        self.read_prg_windowed_mmc3(addr, base, bank_mask)
     }
 
     pub(in crate::cartridge) fn read_prg_mmc3(&self, addr: u16) -> u8 {
@@ -369,6 +831,25 @@ impl Cartridge {
         }
 
         self.write_prg_mmc3(addr, data);
+    }
+
+    pub(in crate::cartridge) fn write_prg_mapper189(&mut self, addr: u16, data: u8) {
+        if addr < 0x8000 {
+            let bank_count = (self.prg_rom.len() / 0x8000).max(1);
+            let bank = (((data >> 4) | (data & 0x0F)) as usize) % bank_count;
+            self.mapper189_prg_bank = bank as u8;
+            self.prg_bank = bank as u8;
+            return;
+        }
+
+        self.write_prg_mmc3(addr, data);
+    }
+
+    pub(in crate::cartridge) fn write_prg_ram_mapper189(&mut self, data: u8) {
+        let bank_count = (self.prg_rom.len() / 0x8000).max(1);
+        let bank = (((data >> 4) | (data & 0x0F)) as usize) % bank_count;
+        self.mapper189_prg_bank = bank as u8;
+        self.prg_bank = bank as u8;
     }
 
     /// Mapper 245: MMC3-like PRG layout with an extra PRG bank bit borrowed
@@ -480,6 +961,51 @@ impl Cartridge {
         self.write_prg_mmc3(synthetic_addr, synthetic_data);
     }
 
+    pub(in crate::cartridge) fn write_prg_mapper114(&mut self, addr: u16, data: u8) {
+        if let Some(synthetic_addr) = Self::translate_mapper114_addr(addr) {
+            let synthetic_data = if synthetic_addr == 0x8000 {
+                Self::mapper114_scramble_index(data)
+            } else {
+                data
+            };
+            self.write_prg_mmc3(synthetic_addr, synthetic_data);
+        }
+    }
+
+    pub(in crate::cartridge) fn write_prg_mapper123(&mut self, addr: u16, data: u8) {
+        if (addr & 0xF800) == 0x5800 {
+            self.mapper123_override = data;
+            return;
+        }
+
+        if (0x8000..=0xFFFF).contains(&addr) {
+            let synthetic_data = if (addr & 0xE001) == 0x8000 {
+                Self::mapper114_scramble_index(data)
+            } else {
+                data
+            };
+            self.write_prg_mmc3(addr, synthetic_data);
+        }
+    }
+
+    pub(in crate::cartridge) fn write_prg_mapper12(&mut self, addr: u16, data: u8) {
+        if (addr & 0xE001) == 0xA001 {
+            self.mapper12_chr_outer = data & 0x11;
+            return;
+        }
+
+        self.write_prg_mmc3(addr, data);
+    }
+
+    pub(in crate::cartridge) fn write_prg_mapper44(&mut self, addr: u16, data: u8) {
+        if (addr & 0xE001) == 0xA001 {
+            self.mapper44_outer_bank = data & 0x07;
+            return;
+        }
+
+        self.write_prg_mmc3(addr, data);
+    }
+
     pub(in crate::cartridge) fn write_prg_mapper208(&mut self, addr: u16, data: u8) {
         match addr {
             0x4800..=0x4FFF => self.mapper208_apply_prg_and_mirroring(data),
@@ -499,6 +1025,39 @@ impl Cartridge {
         if (0x6800..=0x6FFF).contains(&addr) {
             self.mapper208_apply_prg_and_mirroring(data);
         }
+    }
+
+    pub(in crate::cartridge) fn write_prg_ram_mapper37(&mut self, _addr: u16, data: u8) {
+        if self.mmc3_prg_ram_writable() {
+            self.mapper37_outer_bank = data & 0x07;
+        }
+    }
+
+    pub(in crate::cartridge) fn write_prg_ram_mapper47(&mut self, _addr: u16, data: u8) {
+        if self.mmc3_prg_ram_writable() {
+            self.mapper47_outer_bank = data & 0x01;
+        }
+    }
+
+    pub(in crate::cartridge) fn write_prg_ram_mapper114(&mut self, addr: u16, data: u8) {
+        match addr {
+            0x6000 => self.mapper114_override = data,
+            0x6001 => self.mapper114_chr_outer_bank = data & 0x01,
+            _ => {}
+        }
+    }
+
+    pub(in crate::cartridge) fn write_prg_ram_mapper115(&mut self, addr: u16, data: u8) {
+        match addr {
+            0x6000 => self.mapper115_override = data,
+            0x6001 => self.mapper115_chr_outer_bank = data & 0x01,
+            0x6002 => {}
+            _ => self.write_prg_ram_mmc3(addr, data),
+        }
+    }
+
+    pub(in crate::cartridge) fn write_prg_ram_mapper205(&mut self, _addr: u16, data: u8) {
+        self.mapper205_block = data & 0x03;
     }
 
     pub(in crate::cartridge) fn read_chr_mmc3(&self, addr: u16) -> u8 {
@@ -580,6 +1139,92 @@ impl Cartridge {
 
     pub(in crate::cartridge) fn write_chr_mapper195(&mut self, addr: u16, data: u8) {
         self.write_chr_mixed_mmc3(addr, data)
+    }
+
+    pub(in crate::cartridge) fn read_chr_mapper37(&self, addr: u16) -> u8 {
+        let chr_base = if self.mapper37_outer_bank & 0x04 != 0 {
+            0x80
+        } else {
+            0
+        };
+        self.read_chr_windowed_mmc3(addr, chr_base, 0x7F)
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper37(&mut self, addr: u16, data: u8) {
+        let chr_base = if self.mapper37_outer_bank & 0x04 != 0 {
+            0x80
+        } else {
+            0
+        };
+        self.write_chr_windowed_mmc3(addr, chr_base, 0x7F, data);
+    }
+
+    pub(in crate::cartridge) fn read_chr_mapper47(&self, addr: u16) -> u8 {
+        let chr_base = ((self.mapper47_outer_bank & 0x01) as usize) << 7;
+        self.read_chr_windowed_mmc3(addr, chr_base, 0x7F)
+    }
+
+    pub(in crate::cartridge) fn read_chr_mapper12(&self, addr: u16) -> u8 {
+        let chr_base = if addr < 0x1000 {
+            ((self.mapper12_chr_outer & 0x01) as usize) << 8
+        } else {
+            (((self.mapper12_chr_outer >> 4) & 0x01) as usize) << 8
+        };
+        self.read_chr_windowed_mmc3(addr, chr_base, 0xFF)
+    }
+
+    pub(in crate::cartridge) fn read_chr_mapper44(&self, addr: u16) -> u8 {
+        let (base, bank_mask) = self.mapper44_chr_window();
+        self.read_chr_windowed_mmc3(addr, base, bank_mask)
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper47(&mut self, addr: u16, data: u8) {
+        let chr_base = ((self.mapper47_outer_bank & 0x01) as usize) << 7;
+        self.write_chr_windowed_mmc3(addr, chr_base, 0x7F, data);
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper12(&mut self, addr: u16, data: u8) {
+        let chr_base = if addr < 0x1000 {
+            ((self.mapper12_chr_outer & 0x01) as usize) << 8
+        } else {
+            (((self.mapper12_chr_outer >> 4) & 0x01) as usize) << 8
+        };
+        self.write_chr_windowed_mmc3(addr, chr_base, 0xFF, data);
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper44(&mut self, addr: u16, data: u8) {
+        let (base, bank_mask) = self.mapper44_chr_window();
+        self.write_chr_windowed_mmc3(addr, base, bank_mask, data);
+    }
+
+    pub(in crate::cartridge) fn read_chr_mapper114(&self, addr: u16) -> u8 {
+        let chr_base = ((self.mapper114_chr_outer_bank & 0x01) as usize) << 8;
+        self.read_chr_windowed_mmc3(addr, chr_base, 0xFF)
+    }
+
+    pub(in crate::cartridge) fn read_chr_mapper115(&self, addr: u16) -> u8 {
+        let chr_base = ((self.mapper115_chr_outer_bank & 0x01) as usize) << 8;
+        self.read_chr_windowed_mmc3(addr, chr_base, 0xFF)
+    }
+
+    pub(in crate::cartridge) fn read_chr_mapper205(&self, addr: u16) -> u8 {
+        let (base, bank_mask) = self.mapper205_chr_window();
+        self.read_chr_windowed_mmc3(addr, base, bank_mask)
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper114(&mut self, addr: u16, data: u8) {
+        let chr_base = ((self.mapper114_chr_outer_bank & 0x01) as usize) << 8;
+        self.write_chr_windowed_mmc3(addr, chr_base, 0xFF, data);
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper115(&mut self, addr: u16, data: u8) {
+        let chr_base = ((self.mapper115_chr_outer_bank & 0x01) as usize) << 8;
+        self.write_chr_windowed_mmc3(addr, chr_base, 0xFF, data);
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper205(&mut self, addr: u16, data: u8) {
+        let (base, bank_mask) = self.mapper205_chr_window();
+        self.write_chr_windowed_mmc3(addr, base, bank_mask, data);
     }
 
     pub(in crate::cartridge) fn write_chr_mmc3(&mut self, addr: u16, data: u8) {
@@ -678,6 +1323,13 @@ impl Cartridge {
         }
     }
 
+    pub(in crate::cartridge) fn read_prg_ram_mapper115(&self, addr: u16) -> u8 {
+        match addr {
+            0x6002 => 0,
+            _ => self.read_prg_ram_mmc3(addr),
+        }
+    }
+
     pub(in crate::cartridge) fn write_prg_ram_mmc3(&mut self, addr: u16, data: u8) {
         if let Some(ref mmc3) = self.mmc3 {
             if !mmc3.prg_ram_enabled || mmc3.prg_ram_write_protect {
@@ -693,12 +1345,42 @@ impl Cartridge {
     }
 
     pub fn clock_irq_counter(&mut self) {
-        if let Some(ref mut mmc3) = self.mmc3 {
-            mmc3.clock_irq_mut();
+        if self.mmc3.is_some() {
+            if self.mapper == 64 {
+                if let Some(ref mut mmc3) = self.mmc3 {
+                    if !mmc3.irq_cycle_mode {
+                        mmc3.clock_irq_rambo1_mut();
+                    }
+                }
+            } else if matches!(self.mapper, 114 | 182) {
+                self.clock_irq_mmc3a();
+            } else if let Some(ref mut mmc3) = self.mmc3 {
+                mmc3.clock_irq_mut();
+            }
+        }
+        if self.mapper == 48 {
+            if let Some(ref mut taito) = self.taito_tc0190 {
+                taito.clock_irq_mut();
+            }
         }
     }
 
     pub fn irq_pending(&self) -> bool {
+        if let Some(ref mapper18) = self.jaleco_ss88006 {
+            if mapper18.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref namco163) = self.namco163 {
+            if namco163.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref mmc5) = self.mmc5 {
+            if mmc5.irq_pending.get() {
+                return true;
+            }
+        }
         if let Some(ref mmc3) = self.mmc3 {
             if mmc3.irq_pending.get() {
                 return true;
@@ -714,10 +1396,68 @@ impl Cartridge {
                 return true;
             }
         }
+        if let Some(ref mapper40) = self.mapper40 {
+            if mapper40.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref mapper42) = self.mapper42 {
+            if mapper42.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref mapper43) = self.mapper43 {
+            if mapper43.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref mapper50) = self.mapper50 {
+            if mapper50.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref sunsoft3) = self.sunsoft3 {
+            if sunsoft3.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref h3001) = self.irem_h3001 {
+            if h3001.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref vrc3) = self.vrc3 {
+            if vrc3.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref vrc2_vrc4) = self.vrc2_vrc4 {
+            if vrc2_vrc4.irq_pending.get() {
+                return true;
+            }
+        }
+        if let Some(ref vrc6) = self.vrc6 {
+            if vrc6.irq_pending.get() {
+                return true;
+            }
+        }
+        if self.mapper == 48 {
+            if let Some(ref taito) = self.taito_tc0190 {
+                if taito.irq_pending.get() {
+                    return true;
+                }
+            }
+        }
         false
     }
 
     pub fn acknowledge_irq(&self) {
+        if let Some(ref mapper18) = self.jaleco_ss88006 {
+            mapper18.irq_pending.set(false);
+        }
+        if let Some(ref namco163) = self.namco163 {
+            namco163.irq_pending.set(false);
+        }
         if let Some(ref mmc3) = self.mmc3 {
             mmc3.irq_pending.set(false);
         }
@@ -727,9 +1467,54 @@ impl Cartridge {
         if let Some(ref bandai) = self.bandai_fcg {
             bandai.irq_pending.set(false);
         }
+        if let Some(ref mapper40) = self.mapper40 {
+            mapper40.irq_pending.set(false);
+        }
+        if let Some(ref mapper42) = self.mapper42 {
+            mapper42.irq_pending.set(false);
+        }
+        if let Some(ref mapper43) = self.mapper43 {
+            mapper43.irq_pending.set(false);
+        }
+        if let Some(ref mapper50) = self.mapper50 {
+            mapper50.irq_pending.set(false);
+        }
+        if let Some(ref sunsoft3) = self.sunsoft3 {
+            sunsoft3.irq_pending.set(false);
+        }
+        if let Some(ref h3001) = self.irem_h3001 {
+            h3001.irq_pending.set(false);
+        }
+        if let Some(ref vrc3) = self.vrc3 {
+            vrc3.irq_pending.set(false);
+        }
+        if let Some(ref vrc2_vrc4) = self.vrc2_vrc4 {
+            vrc2_vrc4.irq_pending.set(false);
+        }
+        if let Some(ref vrc6) = self.vrc6 {
+            vrc6.irq_pending.set(false);
+        }
+        if self.mapper == 48 {
+            if let Some(ref taito) = self.taito_tc0190 {
+                taito.irq_pending.set(false);
+            }
+        }
     }
 
     pub fn clock_irq_counter_cycles(&mut self, cycles: u32) {
+        if self.mapper == 64 {
+            if let Some(ref mut mmc3) = self.mmc3 {
+                for _ in 0..cycles {
+                    mmc3.clock_irq_rambo1_cycle();
+                }
+            }
+        }
+        if self.mapper == 18 {
+            self.clock_irq_mapper18(cycles);
+        }
+        if self.mapper == 19 {
+            self.clock_irq_namco163(cycles);
+        }
         if let Some(ref mut fme7) = self.fme7 {
             for _ in 0..cycles {
                 fme7.clock_irq_mut();
@@ -740,12 +1525,54 @@ impl Cartridge {
                 bandai.clock_irq_mut();
             }
         }
+        if let Some(ref mut mapper40) = self.mapper40 {
+            mapper40.clock_irq_mut(cycles);
+        }
+        if let Some(ref mut mapper42) = self.mapper42 {
+            mapper42.clock_irq_mut(cycles);
+        }
+        if let Some(ref mut mapper43) = self.mapper43 {
+            mapper43.clock_irq_mut(cycles);
+        }
+        if let Some(ref mut mapper50) = self.mapper50 {
+            mapper50.clock_irq_mut(cycles);
+        }
+        if let Some(ref mut sunsoft3) = self.sunsoft3 {
+            sunsoft3.clock_irq_mut(cycles);
+        }
+        if let Some(ref mut h3001) = self.irem_h3001 {
+            h3001.clock_irq_mut(cycles);
+        }
+        if let Some(ref mut vrc3) = self.vrc3 {
+            vrc3.clock_irq_mut(cycles);
+        }
+        if self.mapper == 21 {
+            self.clock_irq_mapper21(cycles);
+        }
+        if self.mapper == 23 {
+            self.clock_irq_mapper23(cycles);
+        }
+        if self.mapper == 25 {
+            self.clock_irq_mapper25(cycles);
+        }
+        if matches!(self.mapper, 24 | 26) {
+            self.clock_irq_vrc6(cycles);
+        }
+        if self.mapper == 48 {
+            if let Some(ref mut taito) = self.taito_tc0190 {
+                taito.clock_irq_delay_mut(cycles);
+            }
+        }
     }
 
-    /// Clock Sunsoft 5B expansion audio one CPU cycle and return output sample.
+    /// Clock mapper expansion audio one CPU cycle and return output sample.
     pub fn clock_expansion_audio(&mut self) -> f32 {
         if let Some(ref mut fme7) = self.fme7 {
             fme7.audio.clock()
+        } else if matches!(self.mapper, 24 | 26) {
+            self.clock_audio_vrc6()
+        } else if self.mapper == 19 {
+            self.clock_audio_namco163()
         } else {
             0.0
         }

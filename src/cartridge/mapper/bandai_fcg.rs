@@ -22,6 +22,13 @@ enum BandaiEepromPhase {
     WaitAck,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BandaiEepromKind {
+    None,
+    C24C02,
+    X24C01,
+}
+
 /// Bandai FCG / LZ93D50 (Mapper 16).
 /// Used by Dragon Ball Z series and other Bandai games.
 /// Features: 8x1KB CHR banking, 16KB PRG banking, CPU-cycle IRQ counter.
@@ -29,10 +36,13 @@ enum BandaiEepromPhase {
 pub(in crate::cartridge) struct BandaiFcg {
     pub(in crate::cartridge) chr_banks: [u8; 8],
     pub(in crate::cartridge) prg_bank: u8,
+    pub(in crate::cartridge) outer_prg_bank: u8,
     pub(in crate::cartridge) irq_counter: u16,
     pub(in crate::cartridge) irq_latch: u16,
     pub(in crate::cartridge) irq_enabled: bool,
     pub(in crate::cartridge) irq_pending: Cell<bool>,
+    pub(in crate::cartridge) prg_ram_enabled: bool,
+    eeprom_kind: BandaiEepromKind,
     eeprom_phase: BandaiEepromPhase,
     eeprom_address: u8,
     eeprom_shift: u8,
@@ -47,10 +57,13 @@ impl BandaiFcg {
         BandaiFcg {
             chr_banks: [0; 8],
             prg_bank: 0,
+            outer_prg_bank: 0,
             irq_counter: 0,
             irq_latch: 0,
             irq_enabled: false,
             irq_pending: Cell::new(false),
+            prg_ram_enabled: false,
+            eeprom_kind: BandaiEepromKind::C24C02,
             eeprom_phase: BandaiEepromPhase::Idle,
             eeprom_address: 0,
             eeprom_shift: 0,
@@ -72,7 +85,20 @@ impl BandaiFcg {
         }
     }
 
+    pub(in crate::cartridge) fn configure_mapper(&mut self, mapper: u8, has_battery: bool) {
+        self.eeprom_kind = if mapper == 159 {
+            BandaiEepromKind::X24C01
+        } else if mapper == 16 && has_battery {
+            BandaiEepromKind::C24C02
+        } else {
+            BandaiEepromKind::None
+        };
+    }
+
     fn eeprom_start(&mut self) {
+        if self.eeprom_kind == BandaiEepromKind::None {
+            return;
+        }
         self.eeprom_phase = BandaiEepromPhase::ReceivingControl;
         self.eeprom_shift = 0;
         self.eeprom_bits = 0;
@@ -80,6 +106,9 @@ impl BandaiFcg {
     }
 
     fn eeprom_stop(&mut self) {
+        if self.eeprom_kind == BandaiEepromKind::None {
+            return;
+        }
         self.eeprom_phase = BandaiEepromPhase::Idle;
         self.eeprom_data_out = true;
         self.eeprom_shift = 0;
@@ -114,16 +143,32 @@ impl BandaiFcg {
     fn eeprom_process_received_byte(&mut self, byte: u8, storage: &mut [u8], dirty: &mut bool) {
         match self.eeprom_phase {
             BandaiEepromPhase::ReceivingControl => {
-                // 24C02 fixed device address 1010_000x.
-                if (byte >> 1) == 0x50 {
-                    let next = if byte & 0x01 == 0 {
-                        BandaiEepromNext::ReceiveAddress
-                    } else {
-                        BandaiEepromNext::SendData
-                    };
-                    self.eeprom_phase = BandaiEepromPhase::AckPending(next);
-                } else {
-                    self.eeprom_phase = BandaiEepromPhase::Idle;
+                match self.eeprom_kind {
+                    BandaiEepromKind::C24C02 => {
+                        // 24C02 fixed device address 1010_000x.
+                        if (byte >> 1) == 0x50 {
+                            let next = if byte & 0x01 == 0 {
+                                BandaiEepromNext::ReceiveAddress
+                            } else {
+                                BandaiEepromNext::SendData
+                            };
+                            self.eeprom_phase = BandaiEepromPhase::AckPending(next);
+                        } else {
+                            self.eeprom_phase = BandaiEepromPhase::Idle;
+                        }
+                    }
+                    BandaiEepromKind::X24C01 => {
+                        self.eeprom_address = byte >> 1;
+                        let next = if byte & 0x01 == 0 {
+                            BandaiEepromNext::ReceiveData
+                        } else {
+                            BandaiEepromNext::SendData
+                        };
+                        self.eeprom_phase = BandaiEepromPhase::AckPending(next);
+                    }
+                    BandaiEepromKind::None => {
+                        self.eeprom_phase = BandaiEepromPhase::Idle;
+                    }
                 }
             }
             BandaiEepromPhase::ReceivingAddress => {
@@ -144,7 +189,7 @@ impl BandaiFcg {
     }
 
     fn eeprom_clock_control(&mut self, control: u8, storage: &mut [u8], dirty: &mut bool) {
-        if storage.is_empty() {
+        if self.eeprom_kind == BandaiEepromKind::None || storage.is_empty() {
             self.eeprom_data_out = true;
             return;
         }
@@ -241,11 +286,21 @@ impl Cartridge {
 
             let (bank, offset) = match addr {
                 0x8000..=0xBFFF => {
-                    let bank = (bandai.prg_bank as usize) % num_16k_banks;
+                    let bank = if self.mapper == 153 {
+                        let outer = (bandai.outer_prg_bank as usize & 0x01) << 4;
+                        (outer | bandai.prg_bank as usize) % num_16k_banks
+                    } else {
+                        (bandai.prg_bank as usize) % num_16k_banks
+                    };
                     (bank, (addr - 0x8000) as usize)
                 }
                 0xC000..=0xFFFF => {
-                    let bank = num_16k_banks - 1;
+                    let bank = if self.mapper == 153 {
+                        let outer = (bandai.outer_prg_bank as usize & 0x01) << 4;
+                        (outer | 0x0F) % num_16k_banks
+                    } else {
+                        num_16k_banks - 1
+                    };
                     (bank, (addr - 0xC000) as usize)
                 }
                 _ => return 0,
@@ -273,8 +328,13 @@ impl Cartridge {
         if let Some(ref mut bandai) = bandai_fcg {
             let reg = addr & 0x0F;
             match reg {
+                0x00..=0x03 if self.mapper == 153 => {
+                    bandai.outer_prg_bank = data & 0x01;
+                }
                 0x00..=0x07 => {
-                    bandai.chr_banks[reg as usize] = data;
+                    if self.mapper != 153 {
+                        bandai.chr_banks[reg as usize] = data;
+                    }
                 }
                 0x08 => {
                     bandai.prg_bank = data & 0x0F;
@@ -300,7 +360,11 @@ impl Cartridge {
                     bandai.irq_latch = (bandai.irq_latch & 0x00FF) | ((data as u16) << 8);
                 }
                 0x0D => {
-                    bandai.eeprom_clock_control(data, prg_ram, has_valid_save_data);
+                    if self.mapper == 153 {
+                        bandai.prg_ram_enabled = data & 0x40 != 0;
+                    } else {
+                        bandai.eeprom_clock_control(data, prg_ram, has_valid_save_data);
+                    }
                 }
                 _ => {}
             }
@@ -308,6 +372,11 @@ impl Cartridge {
     }
 
     pub(in crate::cartridge) fn read_chr_bandai(&self, addr: u16) -> u8 {
+        if self.mapper == 153 {
+            let chr_addr = (addr & 0x1FFF) as usize;
+            return self.chr_ram.get(chr_addr).copied().unwrap_or(0);
+        }
+
         if let Some(ref bandai) = self.bandai_fcg {
             let slot = ((addr >> 10) & 7) as usize;
             let bank = bandai.chr_banks[slot] as usize;
@@ -327,12 +396,30 @@ impl Cartridge {
         }
     }
 
-    pub(in crate::cartridge) fn write_chr_bandai(&mut self, addr: u16, _data: u8) {
+    pub(in crate::cartridge) fn write_chr_bandai(&mut self, addr: u16, data: u8) {
+        if self.mapper == 153 {
+            let chr_addr = (addr & 0x1FFF) as usize;
+            if chr_addr < self.chr_ram.len() {
+                self.chr_ram[chr_addr] = data;
+            }
+            return;
+        }
+
         // CHR-ROM is read-only for Bandai FCG
         let _ = addr;
     }
 
     pub(in crate::cartridge) fn read_prg_ram_bandai(&self, addr: u16) -> u8 {
+        if self.mapper == 153 {
+            if let Some(ref bandai) = self.bandai_fcg {
+                if !bandai.prg_ram_enabled {
+                    return 0;
+                }
+            }
+            let ram_addr = (addr - 0x6000) as usize;
+            return self.prg_ram.get(ram_addr).copied().unwrap_or(0);
+        }
+
         if let Some(ref bandai) = self.bandai_fcg {
             if self.has_battery {
                 return if bandai.eeprom_data_out { 0x10 } else { 0 };
@@ -348,6 +435,19 @@ impl Cartridge {
     }
 
     pub(in crate::cartridge) fn write_prg_ram_bandai(&mut self, addr: u16, data: u8) {
+        if self.mapper == 153 {
+            if let Some(ref bandai) = self.bandai_fcg {
+                if !bandai.prg_ram_enabled {
+                    return;
+                }
+            }
+            let ram_addr = (addr - 0x6000) as usize;
+            if ram_addr < self.prg_ram.len() {
+                self.prg_ram[ram_addr] = data;
+            }
+            return;
+        }
+
         if self.has_battery {
             return;
         }
@@ -361,19 +461,20 @@ impl Cartridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     const EEPROM_READ: u8 = 0x80;
     const EEPROM_SDA: u8 = 0x40;
     const EEPROM_SCL: u8 = 0x20;
 
-    fn make_bandai_eeprom_cart() -> Cartridge {
-        Cartridge {
+    fn make_bandai_eeprom_cart(mapper: u8, size: usize) -> Cartridge {
+        let mut cart = Cartridge {
             prg_rom: vec![0; 0x8000],
             chr_rom: vec![0; 0x2000],
             chr_ram: vec![],
-            prg_ram: vec![0xFF; 256],
+            prg_ram: vec![0xFF; size],
             has_valid_save_data: false,
-            mapper: 16,
+            mapper,
             mirroring: Mirroring::Horizontal,
             has_battery: true,
             chr_bank: 0,
@@ -383,14 +484,37 @@ mod tests {
             mapper93_chr_ram_enabled: true,
             mapper78_hv_mirroring: false,
             mapper58_nrom128: false,
+            mapper59_latch: 0,
+            mapper59_locked: false,
+            mapper60_game_select: 0,
+            mapper61_latch: 0,
+            mapper63_latch: 0,
+            mapper142_bank_select: 0,
+            mapper142_prg_banks: [0; 4],
+            mapper137_index: 0,
+            mapper137_registers: [0; 8],
+            mapper150_index: 0,
+            mapper150_registers: [0; 8],
             mapper225_nrom128: false,
             mapper232_outer_bank: 0,
+            mapper41_inner_bank: 0,
             mapper233_nrom128: false,
             mapper234_reg0: 0,
             mapper234_reg1: 0,
             mapper235_nrom128: false,
             mapper202_32k_mode: false,
+            mapper37_outer_bank: 0,
+            mapper44_outer_bank: 0,
+            mapper103_prg_ram_disabled: false,
             mapper212_32k_mode: false,
+            mapper47_outer_bank: 0,
+            mapper12_chr_outer: 0,
+            mapper114_override: 0,
+            mapper114_chr_outer_bank: 0,
+            mapper115_override: 0,
+            mapper115_chr_outer_bank: 0,
+            mapper123_override: 0,
+            mapper205_block: 0,
             mapper226_nrom128: false,
             mapper230_contra_mode: false,
             mapper230_nrom128: false,
@@ -406,13 +530,29 @@ mod tests {
             mapper195_mode: 0x80,
             mapper208_protection_index: 0,
             mapper208_protection_regs: [0; 4],
+            mapper189_prg_bank: 0,
+            mapper185_disabled_reads: Cell::new(0),
             mmc1: None,
             mmc2: None,
             mmc3: None,
+            mmc5: None,
+            namco163: None,
+            namco210: None,
+            jaleco_ss88006: None,
+            vrc2_vrc4: None,
+            mapper40: None,
+            mapper42: None,
+            mapper43: None,
+            mapper50: None,
             fme7: None,
             bandai_fcg: Some(BandaiFcg::new()),
+            irem_g101: None,
+            irem_h3001: None,
             vrc1: None,
+            vrc3: None,
+            vrc6: None,
             mapper15: None,
+            sunsoft3: None,
             sunsoft4: None,
             taito_tc0190: None,
             taito_x1005: None,
@@ -422,7 +562,11 @@ mod tests {
             mapper236_mode: 0,
             mapper236_outer_bank: 0,
             mapper236_chr_ram: false,
+        };
+        if let Some(ref mut bandai) = cart.bandai_fcg {
+            bandai.configure_mapper(mapper, true);
         }
+        cart
     }
 
     fn drive(cart: &mut Cartridge, read: bool, sda: bool, scl: bool) {
@@ -483,9 +627,25 @@ mod tests {
         byte
     }
 
+    fn write_byte_lsb(cart: &mut Cartridge, byte: u8) -> bool {
+        for shift in 0..8 {
+            write_bit(cart, ((byte >> shift) & 1) != 0);
+        }
+        !read_bit(cart)
+    }
+
+    fn read_byte_lsb(cart: &mut Cartridge, ack: bool) -> u8 {
+        let mut byte = 0;
+        for shift in 0..8 {
+            byte |= u8::from(read_bit(cart)) << shift;
+        }
+        write_bit(cart, !ack);
+        byte
+    }
+
     #[test]
     fn bandai_eeprom_round_trips_a_byte() {
-        let mut cart = make_bandai_eeprom_cart();
+        let mut cart = make_bandai_eeprom_cart(16, 256);
 
         start(&mut cart);
         assert!(write_byte(&mut cart, 0xA0));
@@ -508,8 +668,45 @@ mod tests {
 
     #[test]
     fn bandai_eeprom_idle_line_reads_high() {
-        let mut cart = make_bandai_eeprom_cart();
+        let mut cart = make_bandai_eeprom_cart(16, 256);
         drive(&mut cart, true, true, true);
         assert_eq!(cart.read_prg_ram_bandai(0x6000) & 0x10, 0x10);
+    }
+
+    #[test]
+    fn bandai_x24c01_round_trips_a_byte() {
+        let mut cart = make_bandai_eeprom_cart(159, 128);
+
+        start(&mut cart);
+        assert!(write_byte(&mut cart, 0x54));
+        assert!(write_byte(&mut cart, 0x5C));
+        stop(&mut cart);
+
+        start(&mut cart);
+        assert!(write_byte(&mut cart, 0x55));
+        let value = read_byte(&mut cart, false);
+        stop(&mut cart);
+
+        assert_eq!(value, 0x5C);
+        assert_eq!(cart.prg_ram[0x2A], 0x5C);
+        assert!(cart.has_valid_save_data);
+    }
+
+    #[test]
+    fn bandai_x24c01_does_not_follow_lsb_first_assumption() {
+        let mut cart = make_bandai_eeprom_cart(159, 128);
+
+        start(&mut cart);
+        assert!(write_byte_lsb(&mut cart, 0x54));
+        assert!(write_byte_lsb(&mut cart, 0x5C));
+        stop(&mut cart);
+
+        start(&mut cart);
+        assert!(write_byte_lsb(&mut cart, 0x55));
+        let value = read_byte_lsb(&mut cart, false);
+        stop(&mut cart);
+
+        assert_ne!(value, 0x5C);
+        assert!(cart.has_valid_save_data);
     }
 }

@@ -1,8 +1,7 @@
 use super::super::{Cartridge, Mirroring};
 
 impl Cartridge {
-    /// Mapper 76/88/95/154/206: Namco 108 family with two switchable 8KB PRG
-    /// banks and the last two 8KB banks fixed.
+    /// Mapper 76/88/95/154/206 and 112: Namco 108 family variants.
     pub(in crate::cartridge) fn read_prg_namco108(&self, addr: u16) -> u8 {
         if let Some(ref mmc3) = self.mmc3 {
             let num_8k_banks = self.prg_rom.len() / 0x2000;
@@ -14,8 +13,14 @@ impl Cartridge {
             let last = (num_8k_banks - 1) & bank_mask;
 
             let (bank, offset) = match addr {
-                0x8000..=0x9FFF => ((mmc3.bank_registers[6] as usize) & bank_mask, 0x8000),
-                0xA000..=0xBFFF => ((mmc3.bank_registers[7] as usize) & bank_mask, 0xA000),
+                0x8000..=0x9FFF => {
+                    let reg = if self.mapper == 112 { 0 } else { 6 };
+                    ((mmc3.bank_registers[reg] as usize) & bank_mask, 0x8000)
+                }
+                0xA000..=0xBFFF => {
+                    let reg = if self.mapper == 112 { 1 } else { 7 };
+                    ((mmc3.bank_registers[reg] as usize) & bank_mask, 0xA000)
+                }
                 0xC000..=0xDFFF => (second_last, 0xC000),
                 0xE000..=0xFFFF => (last, 0xE000),
                 _ => return 0,
@@ -33,6 +38,27 @@ impl Cartridge {
     }
 
     pub(in crate::cartridge) fn write_prg_namco108(&mut self, addr: u16, data: u8) {
+        if self.mapper == 112 {
+            if let Some(ref mut mmc3) = self.mmc3 {
+                match addr {
+                    0x8000..=0x9FFF => mmc3.bank_select = data & 0x07,
+                    0xA000..=0xBFFF => {
+                        let reg = (mmc3.bank_select & 0x07) as usize;
+                        mmc3.bank_registers[reg] = data;
+                    }
+                    0xE000..=0xFFFF => {
+                        self.mirroring = if data & 0x01 != 0 {
+                            Mirroring::Horizontal
+                        } else {
+                            Mirroring::Vertical
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+
         if self.mapper == 154 && addr >= 0x8000 {
             self.mirroring = if data & 0x40 != 0 {
                 Mirroring::OneScreenUpper
@@ -161,6 +187,15 @@ impl Cartridge {
         let slot = ((addr >> 10) & 0x07) as usize;
 
         match self.mapper {
+            112 => match slot {
+                0 | 1 => (((bank_registers[2] as usize) << 1) | (slot & 1)) & bank_mask,
+                2 | 3 => (((bank_registers[3] as usize) << 1) | (slot & 1)) & bank_mask,
+                4 => (bank_registers[4] as usize) & bank_mask,
+                5 => (bank_registers[5] as usize) & bank_mask,
+                6 => (bank_registers[6] as usize) & bank_mask,
+                7 => (bank_registers[7] as usize) & bank_mask,
+                _ => 0,
+            },
             76 => {
                 let bank_2k = bank_registers[2 + (slot / 2)] as usize;
                 ((bank_2k << 1) | (slot & 1)) & bank_mask

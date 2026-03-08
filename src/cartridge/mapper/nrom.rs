@@ -101,6 +101,221 @@ impl Cartridge {
         }
     }
 
+    pub(in crate::cartridge) fn sync_mapper61_latch(&mut self) {
+        let prg_bank_count = (self.prg_rom.len() / 0x4000).max(1);
+        let chr_bank_count = (self.chr_rom.len() / 0x2000).max(1);
+        let prg_bank = ((((self.mapper61_latch as usize) & 0x000F) << 1)
+            | (((self.mapper61_latch as usize) >> 5) & 0x01))
+            % prg_bank_count;
+        let chr_bank = if self.chr_rom.len() > 0x20000 {
+            ((((self.mapper61_latch as usize) >> 8) & 0x0F) << 1)
+                | (((self.mapper61_latch as usize) >> 6) & 0x01)
+        } else {
+            ((self.mapper61_latch as usize) >> 8) & 0x0F
+        } % chr_bank_count;
+
+        self.prg_bank = prg_bank as u8;
+        self.chr_bank = chr_bank as u8;
+        self.mirroring = if self.mapper61_latch & 0x0080 != 0 {
+            Mirroring::Horizontal
+        } else {
+            Mirroring::Vertical
+        };
+    }
+
+    fn mapper63_chr_write_protected(&self) -> bool {
+        self.mapper63_latch & 0x0400 != 0
+    }
+
+    /// Mapper 63: writes use the complemented CPU address as a latch. Bits
+    /// 9-2 choose a 16KB PRG page, bit 1 selects NROM-128 vs NROM-256 mode,
+    /// bit 0 selects mirroring, and bit 10 write-protects the 8KB CHR-RAM.
+    /// This matches the common submapper-0 wiring.
+    pub(in crate::cartridge) fn read_prg_mapper63(&self, addr: u16) -> u8 {
+        if self.prg_rom.is_empty() || addr < 0x8000 {
+            return 0xFF;
+        }
+
+        let bank16 = ((self.mapper63_latch as usize) >> 2) & 0x00FF;
+        let bank_count = (self.prg_rom.len() / 0x4000).max(1);
+        let bank = if self.mapper63_latch & 0x0002 != 0 {
+            (bank16 & !1) | usize::from(addr >= 0xC000)
+        } else {
+            bank16
+        };
+
+        if bank >= bank_count {
+            return 0xFF;
+        }
+
+        let offset = bank * 0x4000 + ((addr - 0x8000) as usize & 0x3FFF);
+        self.prg_rom[offset]
+    }
+
+    pub(in crate::cartridge) fn write_prg_mapper63(&mut self, addr: u16) {
+        if addr < 0x8000 {
+            return;
+        }
+
+        self.mapper63_latch = !addr;
+        self.prg_bank =
+            (((self.mapper63_latch as usize) >> 2) % (self.prg_rom.len() / 0x4000).max(1)) as u8;
+        self.mirroring = if self.mapper63_latch & 0x0001 != 0 {
+            Mirroring::Horizontal
+        } else {
+            Mirroring::Vertical
+        };
+    }
+
+    /// Mapper 61: address-latched NROM multicart with a 5-bit 16KB PRG bank,
+    /// 4/5-bit 8KB CHR bank, and a 16KB/32KB PRG mode bit.
+    pub(in crate::cartridge) fn read_prg_mapper61(&self, addr: u16) -> u8 {
+        if self.prg_rom.is_empty() || addr < 0x8000 {
+            return 0;
+        }
+
+        let bank_count = (self.prg_rom.len() / 0x4000).max(1);
+        let bank16 = (self.prg_bank as usize) % bank_count;
+        let bank = if self.mapper61_latch & 0x0010 != 0 {
+            bank16
+        } else {
+            (bank16 & !1) | usize::from(addr >= 0xC000)
+        };
+        let rom_addr = bank * 0x4000 + ((addr - 0x8000) as usize & 0x3FFF);
+        self.prg_rom[rom_addr % self.prg_rom.len()]
+    }
+
+    /// Mapper 99 (Vs. System): fixed 24KB PRG at $A000-$FFFF plus a single
+    /// selectable 8KB page at $8000-$9FFF. Missing pages float open bus.
+    pub(in crate::cartridge) fn read_prg_mapper99(&self, addr: u16) -> u8 {
+        if self.prg_rom.is_empty() || addr < 0x8000 {
+            return 0xFF;
+        }
+
+        let bank = match addr {
+            0x8000..=0x9FFF => self.prg_bank as usize,
+            0xA000..=0xBFFF => 1,
+            0xC000..=0xDFFF => 2,
+            _ => 3,
+        };
+        let offset = bank * 0x2000 + ((addr - 0x8000) as usize & 0x1FFF);
+        self.prg_rom.get(offset).copied().unwrap_or(0xFF)
+    }
+
+    pub(in crate::cartridge) fn write_prg_low_mapper99(&mut self, addr: u16, data: u8) {
+        if addr != 0x4016 {
+            return;
+        }
+
+        let high_bank = data & 0x04 != 0;
+        self.prg_bank = if high_bank { 4 } else { 0 };
+        self.chr_bank = if high_bank { 1 } else { 0 };
+    }
+
+    pub(in crate::cartridge) fn read_prg_ram_mapper99(&self, addr: u16) -> u8 {
+        if self.prg_ram.is_empty() || !(0x6000..=0x7FFF).contains(&addr) {
+            return 0;
+        }
+
+        let offset = (addr as usize - 0x6000) & 0x07FF;
+        self.prg_ram[offset]
+    }
+
+    pub(in crate::cartridge) fn write_prg_ram_mapper99(&mut self, addr: u16, data: u8) {
+        if self.prg_ram.is_empty() || !(0x6000..=0x7FFF).contains(&addr) {
+            return;
+        }
+
+        let offset = (addr as usize - 0x6000) & 0x07FF;
+        self.prg_ram[offset] = data;
+    }
+
+    pub(in crate::cartridge) fn write_prg_mapper61(&mut self, addr: u16) {
+        if addr < 0x8000 {
+            return;
+        }
+
+        self.mapper61_latch = addr & 0x0FFF;
+        self.sync_mapper61_latch();
+    }
+
+    pub(in crate::cartridge) fn sync_mapper59_latch(&mut self) {
+        let prg_bank_count = (self.prg_rom.len() / 0x4000).max(1);
+        let chr_bank_count = (self.chr_rom.len() / 0x2000).max(1);
+
+        self.prg_bank = (((self.mapper59_latch as usize >> 4) & 0x07) % prg_bank_count) as u8;
+        self.chr_bank = ((self.mapper59_latch as usize & 0x07) % chr_bank_count) as u8;
+        self.mirroring = if self.mapper59_latch & 0x0008 != 0 {
+            Mirroring::Horizontal
+        } else {
+            Mirroring::Vertical
+        };
+    }
+
+    /// Mapper 59: address-latched 16KB/32KB PRG selector with an optional
+    /// "jumper read" mode that replaces ROM data with open bus / strap bits.
+    pub(in crate::cartridge) fn read_prg_mapper59(&self, addr: u16) -> u8 {
+        if self.prg_rom.is_empty() || addr < 0x8000 {
+            return 0;
+        }
+
+        if self.mapper59_latch & 0x0100 != 0 {
+            return 0;
+        }
+
+        let bank_count = (self.prg_rom.len() / 0x4000).max(1);
+        let bank16 = (self.prg_bank as usize) % bank_count;
+        let bank = if self.mapper59_latch & 0x0080 != 0 {
+            bank16
+        } else {
+            (bank16 & !1) | usize::from(addr >= 0xC000)
+        };
+        let rom_addr = bank * 0x4000 + ((addr - 0x8000) as usize & 0x3FFF);
+        self.prg_rom[rom_addr % self.prg_rom.len()]
+    }
+
+    pub(in crate::cartridge) fn write_prg_mapper59(&mut self, addr: u16) {
+        if addr < 0x8000 || self.mapper59_locked {
+            return;
+        }
+
+        self.mapper59_latch = addr & 0x03FF;
+        self.mapper59_locked = (addr & 0x0200) != 0;
+        self.sync_mapper59_latch();
+    }
+
+    pub(in crate::cartridge) fn sync_mapper60_game(&mut self) {
+        let prg_bank_count = (self.prg_rom.len() / 0x4000).max(1);
+        let chr_bank_count = (self.chr_rom.len() / 0x2000).max(1);
+        let selected_prg = (self.mapper60_game_select as usize) % prg_bank_count;
+        let selected_chr = (self.mapper60_game_select as usize) % chr_bank_count;
+
+        self.prg_bank = selected_prg as u8;
+        self.chr_bank = selected_chr as u8;
+    }
+
+    pub(in crate::cartridge) fn advance_mapper60_game(&mut self) {
+        let prg_game_count = (self.prg_rom.len() / 0x4000).max(1);
+        let chr_game_count = (self.chr_rom.len() / 0x2000).max(1);
+        let game_count = prg_game_count.min(chr_game_count).clamp(1, 4);
+
+        self.mapper60_game_select = ((self.mapper60_game_select as usize + 1) % game_count) as u8;
+        self.sync_mapper60_game();
+    }
+
+    /// Mapper 60: reset-cycled 4-in-1 board selecting one mirrored 16KB PRG
+    /// bank and one 8KB CHR bank per game.
+    pub(in crate::cartridge) fn read_prg_mapper60(&self, addr: u16) -> u8 {
+        if self.prg_rom.is_empty() || addr < 0x8000 {
+            return 0;
+        }
+
+        let bank_count = (self.prg_rom.len() / 0x4000).max(1);
+        let bank = (self.prg_bank as usize) % bank_count;
+        let rom_addr = bank * 0x4000 + ((addr - 0x8000) as usize & 0x3FFF);
+        self.prg_rom[rom_addr % self.prg_rom.len()]
+    }
+
     /// Mapper 200: switchable 16KB PRG bank mirrored into both CPU halves.
     pub(in crate::cartridge) fn read_prg_mapper200(&self, addr: u16) -> u8 {
         if self.prg_rom.is_empty() {
@@ -464,11 +679,32 @@ impl Cartridge {
         }
     }
 
+    pub(in crate::cartridge) fn read_chr_mapper99(&self, addr: u16) -> u8 {
+        let offset = (self.chr_bank as usize) * 0x2000 + (addr as usize & 0x1FFF);
+        self.chr_rom.get(offset).copied().unwrap_or(0xFF)
+    }
+
     /// NROM CHR write
     pub(in crate::cartridge) fn write_chr_nrom(&mut self, addr: u16, data: u8) {
         let chr_addr = (addr & 0x1FFF) as usize;
         if chr_addr < self.chr_rom.len() {
             self.chr_rom[chr_addr] = data;
+        }
+    }
+
+    pub(in crate::cartridge) fn read_chr_mapper63(&self, addr: u16) -> u8 {
+        let chr_addr = (addr & 0x1FFF) as usize;
+        self.chr_ram.get(chr_addr).copied().unwrap_or(0)
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper63(&mut self, addr: u16, data: u8) {
+        if self.mapper63_chr_write_protected() {
+            return;
+        }
+
+        let chr_addr = (addr & 0x1FFF) as usize;
+        if let Some(slot) = self.chr_ram.get_mut(chr_addr) {
+            *slot = data;
         }
     }
 

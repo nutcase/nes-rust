@@ -43,6 +43,22 @@ impl Cartridge {
         }
     }
 
+    /// Mapper 185: CNROM variant with CHR output disabled during startup
+    /// probes when the exact chip-select wiring is not available.
+    pub(in crate::cartridge) fn read_chr_mapper185(&self, addr: u16) -> u8 {
+        let remaining = self.mapper185_disabled_reads.get();
+        if remaining > 0 {
+            self.mapper185_disabled_reads.set(remaining - 1);
+            return 0;
+        }
+
+        self.read_chr_cnrom(addr)
+    }
+
+    pub(in crate::cartridge) fn write_chr_mapper185(&mut self, addr: u16, data: u8) {
+        self.write_chr_cnrom(addr, data);
+    }
+
     /// Mapper 184 (Sunsoft-1): bits 0-2 select the lower 4KB CHR bank and
     /// bits 4-5 select the upper bank, which always maps into banks 4-7.
     pub(in crate::cartridge) fn write_prg_mapper184(&mut self, addr: u16, data: u8) {

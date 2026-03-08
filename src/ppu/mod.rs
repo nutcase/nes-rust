@@ -385,6 +385,14 @@ impl Ppu {
                     self.evaluate_scanline_sprites(cartridge);
                 }
 
+                if self.cycle == 4 && self.rendering_enabled {
+                    if let Some(cart) = cartridge {
+                        if cart.mapper_number() == 5 {
+                            cart.mmc5_scanline_tick();
+                        }
+                    }
+                }
+
                 if self.cycle >= 1 && self.cycle <= 256 {
                     self.render_pixel(cartridge);
 
@@ -437,6 +445,13 @@ impl Ppu {
             240 => {
                 // Post-render scanline - no sprite evaluation needed here anymore
                 // Sprite evaluation is now done at the start of each visible scanline
+                if self.cycle == 0 {
+                    if let Some(cart) = cartridge {
+                        if cart.mapper_number() == 5 {
+                            cart.mmc5_end_frame();
+                        }
+                    }
+                }
             }
             241 => {
                 if self.cycle == 1 {
@@ -732,14 +747,31 @@ impl Ppu {
 
         // Cache nametable mirroring map
         if let Some(cart) = _cartridge {
-            match cart.mirroring() {
-                crate::cartridge::Mirroring::Vertical => self.cached_nt_map = [0, 1, 0, 1],
-                crate::cartridge::Mirroring::Horizontal => self.cached_nt_map = [0, 0, 1, 1],
-                crate::cartridge::Mirroring::HorizontalSwapped => self.cached_nt_map = [1, 1, 0, 0],
-                crate::cartridge::Mirroring::ThreeScreenLower => self.cached_nt_map = [0, 0, 0, 1],
-                crate::cartridge::Mirroring::FourScreen => self.cached_nt_map = [0, 1, 0, 1],
-                crate::cartridge::Mirroring::OneScreenLower => self.cached_nt_map = [0, 0, 0, 0],
-                crate::cartridge::Mirroring::OneScreenUpper => self.cached_nt_map = [1, 1, 1, 1],
+            if let Some(mapped0) = cart.resolve_nametable(0) {
+                self.cached_nt_map = [
+                    mapped0 as u8,
+                    cart.resolve_nametable(1).unwrap_or(1) as u8,
+                    cart.resolve_nametable(2).unwrap_or(0) as u8,
+                    cart.resolve_nametable(3).unwrap_or(1) as u8,
+                ];
+            } else {
+                match cart.mirroring() {
+                    crate::cartridge::Mirroring::Vertical => self.cached_nt_map = [0, 1, 0, 1],
+                    crate::cartridge::Mirroring::Horizontal => self.cached_nt_map = [0, 0, 1, 1],
+                    crate::cartridge::Mirroring::HorizontalSwapped => {
+                        self.cached_nt_map = [1, 1, 0, 0]
+                    }
+                    crate::cartridge::Mirroring::ThreeScreenLower => {
+                        self.cached_nt_map = [0, 0, 0, 1]
+                    }
+                    crate::cartridge::Mirroring::FourScreen => self.cached_nt_map = [0, 1, 0, 1],
+                    crate::cartridge::Mirroring::OneScreenLower => {
+                        self.cached_nt_map = [0, 0, 0, 0]
+                    }
+                    crate::cartridge::Mirroring::OneScreenUpper => {
+                        self.cached_nt_map = [1, 1, 1, 1]
+                    }
+                }
             }
         }
 
@@ -834,8 +866,8 @@ impl Ppu {
 
                 // Read pattern data
                 if tile_addr + 8 < 0x2000 {
-                    let low_byte = cart.read_chr(tile_addr);
-                    let high_byte = cart.read_chr(tile_addr + 8);
+                    let low_byte = cart.read_chr_sprite(tile_addr, sprite_y);
+                    let high_byte = cart.read_chr_sprite(tile_addr + 8, sprite_y);
                     let pixel_bit = 7 - pixel_x;
                     let low_bit = (low_byte >> pixel_bit) & 1;
                     let high_bit = (high_byte >> pixel_bit) & 1;
@@ -1041,12 +1073,15 @@ impl Ppu {
         &mut self,
         addr: u16,
         data: u8,
-        cartridge: Option<&crate::cartridge::Cartridge>,
-    ) -> Option<(u16, u8)> {
+        cartridge: Option<&mut crate::cartridge::Cartridge>,
+    ) {
         match addr {
             0x2000 => {
                 let old_nmi_enable = self.control.contains(PpuControl::NMI_ENABLE);
                 self.control = PpuControl::from_bits_truncate(data);
+                if let Some(cart) = cartridge {
+                    cart.notify_ppuctrl_mmc5(data);
+                }
 
                 // Update nametable select bits in t register
                 self.t = (self.t & 0xF3FF) | ((data as u16 & 0x03) << 10);
@@ -1061,6 +1096,9 @@ impl Ppu {
                 self.mask = PpuMask::from_bits_truncate(data);
                 self.rendering_enabled = self.mask.contains(PpuMask::BG_ENABLE)
                     || self.mask.contains(PpuMask::SPRITE_ENABLE);
+                if let Some(cart) = cartridge {
+                    cart.notify_ppumask_mmc5(data);
+                }
             }
             0x2003 => {
                 self.oam_addr = data;
@@ -1115,25 +1153,31 @@ impl Ppu {
                     let offset = addr & 0x3FF;
 
                     if offset < 1024 {
-                        let physical_nt = self.resolve_nametable(nt_index, cartridge);
+                        let physical_nt = self.resolve_nametable(nt_index, cartridge.as_deref());
 
-                        if cartridge
-                            .map(|cart| cart.nametable_writes_to_internal_vram())
-                            .unwrap_or(true)
-                        {
-                            self.nametable[physical_nt][offset] = data;
+                        if let Some(cart) = cartridge {
+                            cart.write_nametable_byte(
+                                physical_nt,
+                                offset,
+                                &mut self.nametable,
+                                data,
+                            );
+                        } else {
+                            self.nametable[physical_nt & 1][offset] = data;
                         }
                     }
                 } else if write_v < 0x2000 {
                     // CHR write (for CHR RAM)
-                    let chr_addr = write_v;
+                    if let Some(cart) = cartridge {
+                        cart.write_chr(write_v, data);
+                    }
                     let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) {
                         32
                     } else {
                         1
                     };
                     self.v = self.v.wrapping_add(increment) & 0x3FFF;
-                    return Some((chr_addr, data));
+                    return;
                 }
 
                 let increment = if self.control.contains(PpuControl::VRAM_INCREMENT) {
@@ -1145,7 +1189,6 @@ impl Ppu {
             }
             _ => {}
         }
-        None
     }
 
     pub fn get_buffer(&self) -> &[u8] {
