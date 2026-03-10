@@ -1,7 +1,13 @@
-[target.'cfg(target_os = "macos")']
+[target.aarch64-apple-darwin]
 rustflags = [
     "-L",
     "native=/opt/homebrew/lib",
+    "-C",
+    "target-cpu=native",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
     "-L",
     "native=/usr/local/lib",
 ]

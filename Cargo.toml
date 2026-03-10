@@ -3,6 +3,10 @@ name = "nes-emulator"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [features]
 default = []
 cheat-ui = ["egui", "egui_sdl2_gl", "serde_json"]

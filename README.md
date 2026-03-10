@@ -48,7 +48,9 @@ Cheat UI (`./run.sh` or `cargo run --example nes_emulator --features cheat-ui`):
 
 ## Build Notes
 - SDL2 is required.
-- On macOS, `.cargo/config.toml` adds Homebrew library search paths for `/opt/homebrew/lib` and `/usr/local/lib`.
+- On macOS, `.cargo/config.toml` now splits Apple Silicon and Intel builds:
+  - `aarch64-apple-darwin`: `/opt/homebrew/lib` + `target-cpu=native`
+  - `x86_64-apple-darwin`: `/usr/local/lib`
 - `run.sh` also exports Homebrew include/library paths and builds the `cheat-ui` example before launch.
 
 Install SDL2:
