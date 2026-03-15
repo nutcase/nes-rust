@@ -48,6 +48,35 @@ fn default_mmc3_irq_prescaler() -> u8 {
     4
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Mmc5PulseState {
+    pub duty: u8,
+    pub length_counter: u8,
+    pub envelope_divider: u8,
+    pub envelope_decay: u8,
+    pub envelope_disable: bool,
+    pub envelope_start: bool,
+    pub volume: u8,
+    pub timer: u16,
+    pub timer_reload: u16,
+    pub duty_counter: u8,
+    pub length_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Mmc5AudioState {
+    pub pulse1: Mmc5PulseState,
+    pub pulse2: Mmc5PulseState,
+    pub pulse1_enabled: bool,
+    pub pulse2_enabled: bool,
+    pub pcm_irq_enabled: bool,
+    pub pcm_read_mode: bool,
+    pub pcm_irq_pending: bool,
+    pub pcm_dac: u8,
+    pub audio_frame_accum: u32,
+    pub audio_even_cycle: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mmc5State {
     pub prg_mode: u8,
@@ -80,6 +109,10 @@ pub struct Mmc5State {
     pub cached_tile_y: u8,
     pub cached_ext_palette: u8,
     pub cached_ext_bank: u8,
+    #[serde(default)]
+    pub ppu_data_uses_bg_banks: bool,
+    #[serde(default)]
+    pub audio: Mmc5AudioState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -774,6 +807,43 @@ impl Cartridge {
             cached_tile_y: m.cached_tile_y.get(),
             cached_ext_palette: m.cached_ext_palette.get(),
             cached_ext_bank: m.cached_ext_bank.get(),
+            ppu_data_uses_bg_banks: m.ppu_data_uses_bg_banks,
+            audio: Mmc5AudioState {
+                pulse1: Mmc5PulseState {
+                    duty: m.pulse1.duty,
+                    length_counter: m.pulse1.length_counter,
+                    envelope_divider: m.pulse1.envelope_divider,
+                    envelope_decay: m.pulse1.envelope_decay,
+                    envelope_disable: m.pulse1.envelope_disable,
+                    envelope_start: m.pulse1.envelope_start,
+                    volume: m.pulse1.volume,
+                    timer: m.pulse1.timer,
+                    timer_reload: m.pulse1.timer_reload,
+                    duty_counter: m.pulse1.duty_counter,
+                    length_enabled: m.pulse1.length_enabled,
+                },
+                pulse2: Mmc5PulseState {
+                    duty: m.pulse2.duty,
+                    length_counter: m.pulse2.length_counter,
+                    envelope_divider: m.pulse2.envelope_divider,
+                    envelope_decay: m.pulse2.envelope_decay,
+                    envelope_disable: m.pulse2.envelope_disable,
+                    envelope_start: m.pulse2.envelope_start,
+                    volume: m.pulse2.volume,
+                    timer: m.pulse2.timer,
+                    timer_reload: m.pulse2.timer_reload,
+                    duty_counter: m.pulse2.duty_counter,
+                    length_enabled: m.pulse2.length_enabled,
+                },
+                pulse1_enabled: m.pulse1_enabled,
+                pulse2_enabled: m.pulse2_enabled,
+                pcm_irq_enabled: m.pcm_irq_enabled,
+                pcm_read_mode: m.pcm_read_mode,
+                pcm_irq_pending: m.pcm_irq_pending.get(),
+                pcm_dac: m.pcm_dac,
+                audio_frame_accum: m.audio_frame_accum,
+                audio_even_cycle: m.audio_even_cycle,
+            },
         });
 
         let namco163 = self.namco163.as_ref().map(|n| Namco163State {
@@ -1479,6 +1549,37 @@ impl Cartridge {
             mmc5.cached_tile_y.set(saved.cached_tile_y);
             mmc5.cached_ext_palette.set(saved.cached_ext_palette);
             mmc5.cached_ext_bank.set(saved.cached_ext_bank);
+            mmc5.ppu_data_uses_bg_banks = saved.ppu_data_uses_bg_banks;
+            mmc5.pulse1.duty = saved.audio.pulse1.duty;
+            mmc5.pulse1.length_counter = saved.audio.pulse1.length_counter;
+            mmc5.pulse1.envelope_divider = saved.audio.pulse1.envelope_divider;
+            mmc5.pulse1.envelope_decay = saved.audio.pulse1.envelope_decay;
+            mmc5.pulse1.envelope_disable = saved.audio.pulse1.envelope_disable;
+            mmc5.pulse1.envelope_start = saved.audio.pulse1.envelope_start;
+            mmc5.pulse1.volume = saved.audio.pulse1.volume;
+            mmc5.pulse1.timer = saved.audio.pulse1.timer;
+            mmc5.pulse1.timer_reload = saved.audio.pulse1.timer_reload;
+            mmc5.pulse1.duty_counter = saved.audio.pulse1.duty_counter;
+            mmc5.pulse1.length_enabled = saved.audio.pulse1.length_enabled;
+            mmc5.pulse2.duty = saved.audio.pulse2.duty;
+            mmc5.pulse2.length_counter = saved.audio.pulse2.length_counter;
+            mmc5.pulse2.envelope_divider = saved.audio.pulse2.envelope_divider;
+            mmc5.pulse2.envelope_decay = saved.audio.pulse2.envelope_decay;
+            mmc5.pulse2.envelope_disable = saved.audio.pulse2.envelope_disable;
+            mmc5.pulse2.envelope_start = saved.audio.pulse2.envelope_start;
+            mmc5.pulse2.volume = saved.audio.pulse2.volume;
+            mmc5.pulse2.timer = saved.audio.pulse2.timer;
+            mmc5.pulse2.timer_reload = saved.audio.pulse2.timer_reload;
+            mmc5.pulse2.duty_counter = saved.audio.pulse2.duty_counter;
+            mmc5.pulse2.length_enabled = saved.audio.pulse2.length_enabled;
+            mmc5.pulse1_enabled = saved.audio.pulse1_enabled;
+            mmc5.pulse2_enabled = saved.audio.pulse2_enabled;
+            mmc5.pcm_irq_enabled = saved.audio.pcm_irq_enabled;
+            mmc5.pcm_read_mode = saved.audio.pcm_read_mode;
+            mmc5.pcm_irq_pending.set(saved.audio.pcm_irq_pending);
+            mmc5.pcm_dac = saved.audio.pcm_dac;
+            mmc5.audio_frame_accum = saved.audio.audio_frame_accum;
+            mmc5.audio_even_cycle = saved.audio.audio_even_cycle;
         }
 
         if let (Some(ref mut namco163), Some(saved)) =

@@ -109,6 +109,36 @@ fn mapper_5_switches_prg_chr_wram_and_multiplier() {
 }
 
 #[test]
+fn mapper_5_tracks_ppudata_chr_source_and_audio_status() {
+    let mut cart = make_mmc5_cart();
+
+    cart.write_prg(0x5101, 0x03);
+    cart.write_prg(0x5128, 0x11);
+    assert_eq!(cart.read_chr(0x0000), 0x91);
+
+    cart.write_prg(0x5120, 0x03);
+    assert_eq!(cart.read_chr(0x0000), 0x83);
+
+    cart.write_prg(0x5015, 0x03);
+    cart.write_prg(0x5000, 0xDF);
+    cart.write_prg(0x5002, 0x08);
+    cart.write_prg(0x5003, 0x18);
+    assert_eq!(cart.read_prg_low(0x5015) & 0x01, 0x01);
+
+    let mut non_zero = false;
+    for _ in 0..64 {
+        if cart.clock_expansion_audio().abs() > f32::EPSILON {
+            non_zero = true;
+            break;
+        }
+    }
+    assert!(non_zero);
+
+    cart.write_prg(0x5015, 0x00);
+    assert_eq!(cart.read_prg_low(0x5015) & 0x03, 0x00);
+}
+
+#[test]
 fn mapper_19_switches_prg_chr_and_chip_ram_port() {
     let mut cart = make_mapper19_cart();
 

@@ -1377,7 +1377,7 @@ impl Cartridge {
             }
         }
         if let Some(ref mmc5) = self.mmc5 {
-            if mmc5.irq_pending.get() {
+            if mmc5.combined_irq_pending() {
                 return true;
             }
         }
@@ -1567,7 +1567,9 @@ impl Cartridge {
 
     /// Clock mapper expansion audio one CPU cycle and return output sample.
     pub fn clock_expansion_audio(&mut self) -> f32 {
-        if let Some(ref mut fme7) = self.fme7 {
+        if self.mapper == 5 {
+            self.clock_audio_mmc5()
+        } else if let Some(ref mut fme7) = self.fme7 {
             fme7.audio.clock()
         } else if matches!(self.mapper, 24 | 26) {
             self.clock_audio_vrc6()

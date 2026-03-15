@@ -209,6 +209,9 @@ impl Cartridge {
 
     pub fn read_prg_cpu(&mut self, addr: u16) -> u8 {
         let value = self.read_prg(addr);
+        if self.mapper == 5 {
+            self.mmc5_cpu_read_side_effects(addr, value);
+        }
         if self.mapper == 234 {
             self.apply_mapper234_value(addr, value);
         }
